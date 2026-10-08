@@ -1,0 +1,48 @@
+# Built-in team templates: which roles make up each project type at each size.
+# Role ids are language-independent; names and texts live in fr.toml and en.toml.
+# Order matters: it is the order of the tabs and panes.
+
+sizes = ["small", "medium", "large"]
+
+# The roles the user talks to; the others are working agents.
+contacts = ["coordinator"]
+
+[types.personal]
+small = ["coordinator", "developer", "designer"]
+medium = ["coordinator", "developer", "designer", "reviewer", "tester"]
+large = ["coordinator", "planner", "reviewer", "writer", "backend", "frontend", "designer", "tester"]
+
+[types.web]
+small = ["coordinator", "backend", "frontend"]
+medium = ["coordinator", "reviewer", "backend", "frontend", "designer"]
+large = ["coordinator", "planner", "reviewer", "security", "devops", "backend", "frontend", "designer"]
+
+[types.mobile]
+small = ["coordinator", "mobile", "designer"]
+medium = ["coordinator", "reviewer", "mobile", "backend", "designer"]
+large = ["coordinator", "planner", "reviewer", "devops", "mobile", "backend", "designer", "tester"]
+
+[types.api]
+small = ["coordinator", "backend", "tester"]
+medium = ["coordinator", "reviewer", "devops", "backend", "tester"]
+large = ["coordinator", "planner", "reviewer", "security", "devops", "writer", "backend", "tester"]
+
+[types.library]
+small = ["coordinator", "developer", "tester"]
+medium = ["coordinator", "reviewer", "writer", "developer", "tester"]
+large = ["coordinator", "planner", "reviewer", "writer", "devops", "developer", "tester", "performance"]
+
+[types.data]
+small = ["coordinator", "data", "developer"]
+medium = ["coordinator", "reviewer", "data", "developer", "tester"]
+large = ["coordinator", "planner", "reviewer", "devops", "writer", "data", "developer", "tester"]
+
+[types.game]
+small = ["coordinator", "gameplay", "designer"]
+medium = ["coordinator", "gameplay", "graphics", "designer", "tester"]
+large = ["coordinator", "planner", "reviewer", "gameplay", "graphics", "designer", "tester", "performance"]
+
+[types.infra]
+small = ["coordinator", "devops", "security"]
+medium = ["coordinator", "reviewer", "writer", "devops", "security"]
+large = ["coordinator", "planner", "reviewer", "security", "writer", "devops", "performance", "tester"]

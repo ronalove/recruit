@@ -1,0 +1,14 @@
+{
+  "name": "shorty",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/server.ts",
+    "start": "bun src/server.ts",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.0"
+  }
+}

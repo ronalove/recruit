@@ -1,0 +1,37 @@
+[package]
+name = "recruit"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Launch a team of Claude Code agents in tmux, each one knowing its role and its teammates"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/ronalove/recruit"
+readme = "README.md"
+keywords = ["claude", "agents", "tmux", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+include = ["src/**", "templates/**", "mod/**", "README.md", "LICENSE"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+crossterm = "0.29.0"
+indexmap = { version = "2.14.2", features = ["serde"] }
+inquire = "0.9.4"
+libc = "0.2.190"
+memchr = "2.8.3"
+memmap2 = "0.9.11"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+shlex = "2.0.1"
+sys-locale = "0.3.2"
+toml = { version = "1.1.6", features = ["preserve_order"] }
+toml_edit = "0.25.15"
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

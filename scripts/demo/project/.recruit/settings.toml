@@ -1,0 +1,109 @@
+# Demo teams for recruit's screenshots (scripts/demo/shoot.sh): "demo" in English, "demo-fr" in French.
+# Same members, same areas; a bare `recruit` launches "demo".
+
+default = "demo"
+
+# A test tmux server, never the user's `-L recruit`, and none of their tmux configuration.
+[tmux]
+socket = "rtest-shots"
+user_config = false
+# A quiet status line: without a user configuration, tmux draws it bright green.
+options = ["set -g status-style 'bg=#303030,fg=#bcbcbc'"]
+
+[teams.demo]
+description = "shorty: a tiny link shortener in TypeScript on Bun. Two contacts (lead, product) and four agents."
+lang = "en"
+model = "haiku"
+permission_mode = "acceptEdits"
+instructions = """
+- lead is the user's entry point: they break the work down, hand it out and check what comes back. product answers questions about what to build.
+- Only change your own area; anything else goes through lead.
+- Keep messages short: name the files and say what you expect back.
+- Nobody commits unless the user asks.
+- Run `bun test` before handing work back, and say what you did not check."""
+
+[teams.demo.members.lead]
+role = "Point of contact: breaks the work down, hands it out and checks what comes back"
+contact = true
+model = "sonnet"
+effort = "medium"
+instructions = """
+- Read README.md, CLAUDE.md and TODO.md first.
+- Give each task to the member whose area it is: backend (src/), frontend (public/), tester (test/), writer (README.md).
+- When a task is done, tell product so it can be ticked off in TODO.md."""
+
+[teams.demo.members.product]
+role = "Point of contact for priorities: what to build next and what done looks like"
+contact = true
+model = "sonnet"
+effort = "low"
+instructions = """
+- You answer the user about priorities and scope: what goes in the next version, what can wait.
+- You own TODO.md, its order and its wording. You do not write code."""
+
+[teams.demo.members.backend]
+role = "Server and storage: routes, links on disk, slugs (src/)"
+model = "sonnet"
+effort = "high"
+instructions = "- Your area: src/. When a route changes, tell writer so README.md's table stays right."
+
+[teams.demo.members.frontend]
+role = "The page: form, list of links, click counts (public/)"
+instructions = "- Your area: public/. Plain HTML, CSS and a little JavaScript, no build step."
+
+[teams.demo.members.tester]
+role = "Tests with bun test (test/), and checks before each hand-back"
+instructions = "- Your area: test/. Add a test for each change backend makes, run `bun test` and report the results to lead."
+
+[teams.demo.members.writer]
+role = "README and API documentation"
+instructions = "- Your area: README.md. Document what changes in the API, with examples that work."
+
+[teams.demo-fr]
+description = "shorty : un petit raccourcisseur de liens en TypeScript sur Bun. Deux interlocuteurs (chef-projet, chef-produit) et quatre agents."
+lang = "fr"
+model = "haiku"
+permission_mode = "acceptEdits"
+instructions = """
+- chef-projet est le point d'entrée de l'utilisateur : il découpe le travail, le répartit et vérifie ce qui revient. chef-produit répond aux questions sur ce qu'il faut construire.
+- Ne modifie que ta zone ; le reste passe par chef-projet.
+- Messages courts : nomme les fichiers et dis ce que tu attends en retour.
+- Personne ne commite sans la demande de l'utilisateur.
+- Lance `bun test` avant de rendre un travail, et dis ce que tu n'as pas vérifié."""
+
+[teams.demo-fr.members.chef-projet]
+role = "Interlocuteur : découpe le travail, le répartit et vérifie ce qui revient"
+contact = true
+model = "sonnet"
+effort = "medium"
+instructions = """
+- Lis d'abord README.md, CLAUDE.md et TODO.md.
+- Confie chaque tâche au membre dont c'est la zone : dev-api (src/), dev-web (public/), testeur (test/), rédacteur (README.md).
+- Quand une tâche est faite, préviens chef-produit pour qu'il la coche dans TODO.md."""
+
+[teams.demo-fr.members.chef-produit]
+role = "Interlocuteur pour les priorités : ce qu'on construit ensuite et ce qu'on attend du résultat"
+contact = true
+model = "sonnet"
+effort = "low"
+instructions = """
+- Tu réponds à l'utilisateur sur les priorités et le périmètre : ce qui entre dans la prochaine version, ce qui peut attendre.
+- TODO.md est à toi : son ordre et sa rédaction. Tu n'écris pas de code."""
+
+[teams.demo-fr.members.dev-api]
+role = "Serveur et stockage : routes, liens sur disque, identifiants courts (src/)"
+model = "sonnet"
+effort = "high"
+instructions = "- Ta zone : src/. Quand une route change, préviens rédacteur pour que le tableau du README.md reste juste."
+
+[teams.demo-fr.members.dev-web]
+role = "La page : formulaire, liste des liens, nombre de clics (public/)"
+instructions = "- Ta zone : public/. Du HTML, du CSS et un peu de JavaScript, sans étape de construction."
+
+[teams.demo-fr.members.testeur]
+role = "Tests par bun test (test/), et vérifications avant chaque rendu"
+instructions = "- Ta zone : test/. Ajoute un test pour chaque changement de dev-api, lance `bun test` et donne les résultats à chef-projet."
+
+[teams.demo-fr.members."rédacteur"]
+role = "README et documentation de l'API"
+instructions = "- Ta zone : README.md. Documente ce qui change dans l'API, avec des exemples qui marchent."

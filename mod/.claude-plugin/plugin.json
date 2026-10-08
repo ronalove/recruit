@@ -1,0 +1,6 @@
+{
+  "name": "recruit",
+  "version": "1.0.0",
+  "description": "recruit's bridge in each member of a team: the session's model, context and usage for the dashboard, the team's settings on each request and in the prompt, /equipe (or /team) and /recruit",
+  "author": { "name": "ronan" }
+}

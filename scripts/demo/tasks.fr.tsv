@@ -1,0 +1,4 @@
+# Les tâches que les captures donnent à l'équipe de démo : membre<TAB>message, envoyé au membre comme s'il était tapé.
+chef-projet	Fais les points 1 et 3 de TODO.md : raccourcir deux fois la même URL rend le slug existant, et la page affiche le nombre de clics de chaque lien. Fais court.
+chef-produit	Quels points de TODO.md mettre dans la 0.4.0, et dans quel ordre ?
+rédacteur	Lance `bun outdated` et dis à chef-projet si une dépendance est à mettre à jour.

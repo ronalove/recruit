@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>shorty</title>
+  <style>
+    body { font: 16px/1.5 system-ui, sans-serif; max-width: 36rem; margin: 3rem auto; padding: 0 1rem; }
+    form { display: flex; gap: .5rem; }
+    input { flex: 1; padding: .5rem; }
+    li { margin: .25rem 0; }
+    .slug { font-family: ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+  <h1>shorty</h1>
+  <form id="new">
+    <input name="url" type="url" placeholder="https://a-very-long-address.example/…" required>
+    <button>Shorten</button>
+  </form>
+  <ul id="links"></ul>
+  <script type="module">
+    const list = document.querySelector("#links");
+
+    async function refresh() {
+      const links = await (await fetch("/api/links")).json();
+      list.replaceChildren(...links.map((link) => {
+        const item = document.createElement("li");
+        item.innerHTML = `<a class="slug" href="/${link.slug}">/${link.slug}</a> → `;
+        item.append(link.url);
+        return item;
+      }));
+    }
+
+    document.querySelector("#new").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const url = new FormData(event.target).get("url");
+      await fetch("/api/links", { method: "POST", body: JSON.stringify({ url }) });
+      event.target.reset();
+      refresh();
+    });
+
+    refresh();
+  </script>
+</body>
+</html>

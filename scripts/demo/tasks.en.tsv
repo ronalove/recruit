@@ -1,0 +1,4 @@
+# The tasks the screenshots give the demo team: member<TAB>message, sent to the member as if typed.
+lead	Do TODO items 1 and 3: shortening the same URL twice returns the existing slug, and the page shows each link's click count. Keep it small.
+product	Which TODO items should go in 0.4.0, and in what order?
+writer	Run `bun outdated` and tell lead whether a dependency needs updating.

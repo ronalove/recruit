@@ -1,0 +1,11 @@
+/target
+/graft
+.DS_Store
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+# Site (Astro Starlight)
+site/node_modules
+site/dist
+site/.astro

@@ -1,0 +1,1031 @@
+---
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Ronan Lamour
+import { Picture, getImage } from 'astro:assets';
+import '@fontsource-variable/schibsted-grotesk/wght.css';
+import '@fontsource-variable/jetbrains-mono/wght.css';
+import { strings, type Lang } from '../i18n/landing';
+
+import dashboardEn from '../assets/screenshots/dashboard.png';
+import dashboardFr from '../assets/screenshots/dashboard-fr.png';
+import journalEn from '../assets/screenshots/journal.png';
+import journalFr from '../assets/screenshots/journal-fr.png';
+import menuEn from '../assets/screenshots/menu.png';
+import menuFr from '../assets/screenshots/menu-fr.png';
+import teamEn from '../assets/screenshots/team.png';
+import teamFr from '../assets/screenshots/team-fr.png';
+
+interface Props {
+  lang: Lang;
+}
+
+const { lang } = Astro.props;
+const t = strings[lang];
+const other = strings[t.otherLang.code];
+
+// BASE_URL is "/recruit" (no trailing slash is guaranteed), every link and file is built from it.
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const home = (l: Lang) => (l === 'fr' ? `${base}/fr/` : `${base}/`);
+const docsUrl = `${base}${lang === 'fr' ? '/fr' : ''}/getting-started/installation/`;
+const startUrl = `${base}${lang === 'fr' ? '/fr' : ''}/getting-started/quick-start/`;
+const repo = 'https://github.com/ronalove/recruit';
+const brew = 'brew install ronalove/tap/recruit';
+
+const shots = {
+  en: { dashboard: dashboardEn, journal: journalEn, menu: menuEn, team: teamEn },
+  fr: { dashboard: dashboardFr, journal: journalFr, menu: menuFr, team: teamFr },
+}[lang];
+
+// The first tab plays the animation; its still frame is the poster, and what reduced-motion users see.
+const poster = await getImage({ src: shots.dashboard, format: 'webp', width: 1000 });
+const social = await getImage({ src: teamEn, format: 'png', width: 1200 });
+const media = lang === 'fr' ? `${base}/media/demo-fr` : `${base}/media/demo`;
+
+const canonical = new URL(home(lang), Astro.site).href;
+const alternates = (['en', 'fr'] as Lang[]).map((l) => ({ l, href: new URL(home(l), Astro.site).href }));
+
+const icons = {
+  resume: ['M21 12a9 9 0 1 1-3-6.7', 'M21 4v5h-5'],
+  grow: ['M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6', 'M18 8v6', 'M15 11h6'],
+  star: ['M12 3l2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 16.4 6.8 19.1l1-5.8L3.5 9.2l5.9-.9z'],
+};
+---
+
+<!doctype html>
+<html lang={t.htmlLang}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{t.title}</title>
+    <meta name="description" content={t.description} />
+    <link rel="canonical" href={canonical} />
+    {alternates.map((a) => <link rel="alternate" hreflang={a.l} href={a.href} />)}
+    <link rel="alternate" hreflang="x-default" href={alternates[0]!.href} />
+    <link rel="icon" href={`${base}/favicon.svg`} type="image/svg+xml" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="recruit" />
+    <meta property="og:title" content={t.title} />
+    <meta property="og:description" content={t.description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:locale" content={t.locale} />
+    <meta property="og:image" content={new URL(social.src, Astro.site).href} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="color-scheme" content="light" />
+    <script is:inline>
+      document.documentElement.classList.add('js');
+    </script>
+  </head>
+  <body>
+    <a class="skip" href="#main">{lang === 'fr' ? 'Aller au contenu' : 'Skip to content'}</a>
+    <header class="bar">
+      <a class="brand" href={home(lang)}>recruit</a>
+      <span class="grow"></span>
+      <nav class="links" aria-label="Main">
+        <a href={docsUrl}>{t.docs}</a>
+        <a href={repo}>{t.github}</a>
+        <a href={home(t.otherLang.code)} hreflang={t.otherLang.code} lang={t.otherLang.code}>{t.otherLang.label}</a>
+        <a class="pill dark" href={startUrl}>{t.start}</a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero" id="top">
+        <div class="hero-text">
+          <h1>{t.heroTitle} <span class="accent">{t.heroAccent}</span></h1>
+          <p class="lede">{t.heroText}</p>
+          <div class="actions">
+            <a class="pill blue big" href={startUrl}>{t.cta}</a>
+            <div class="cmd">
+              <code>{brew}</code>
+              <button type="button" class="copy" data-copy={brew} data-done={t.copied} aria-label={t.copyLabel}>
+                <span class="copy-text">{t.copy}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="chart" role="img" aria-label={t.chart.label}>
+          <div class="chart-you">{t.chart.you}</div>
+          <div class="wire"></div>
+          <div class="card coordinator">
+            <div class="card-head">
+              <span class="card-name big">{t.chart.coordinator.name}</span>
+              <span class={`state ${t.chart.coordinator.state}`}>{t.chart.states[t.chart.coordinator.state]}</span>
+            </div>
+            <div class="card-task">{t.chart.coordinator.task}</div>
+          </div>
+          <div class="wire"></div>
+          <div class="bar-h"></div>
+          <div class="specialists">
+            {t.chart.specialists.map((s) => (
+              <div class="card">
+                <div class="card-head">
+                  <span class="card-name">{s.name}</span>
+                  <span class={`state ${s.state}`}>{t.chart.states[s.state]}</span>
+                </div>
+                <div class="card-task small">{s.task}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      <section class="compare">
+        <div class="wrap">
+          <h2>{t.compare.title}</h2>
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">{t.compare.one}</th>
+                <th scope="col" class="team">{t.compare.team}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {t.compare.rows.map(([one, team]) => (
+                <tr>
+                  <td>{one}</td>
+                  <td class="team">{team}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="tour">
+        <div class="wrap">
+          <h2>{t.tour.title}</h2>
+          <div class="tabs" role="tablist" aria-label={t.tour.title}>
+            {t.tour.tabs.map((tab, i) => (
+              <button
+                type="button"
+                role="tab"
+                id={`tab-${tab.id}`}
+                aria-controls={`panel-${tab.id}`}
+                aria-selected={i === 0 ? 'true' : 'false'}
+                tabindex={i === 0 ? 0 : -1}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+          {t.tour.tabs.map((tab, i) => (
+            <div class="panel" role="tabpanel" id={`panel-${tab.id}`} aria-labelledby={`tab-${tab.id}`} hidden={i !== 0 ? true : undefined}>
+              <h3 class="panel-title">{tab.label}</h3>
+              <p class="caption">{tab.text}</p>
+              <div class="stage" tabindex="0">
+                {tab.id === 'dashboard' ? (
+                  <>
+                    <video class="demo" autoplay muted loop playsinline preload="metadata" poster={poster.src} aria-label={tab.alt}>
+                      <source src={`${media}.webm`} type="video/webm" />
+                      <source src={`${media}.mp4`} type="video/mp4" />
+                    </video>
+                    <Picture
+                      class="still"
+                      src={shots.dashboard}
+                      alt={tab.alt}
+                      formats={["avif"]} fallbackFormat="webp"
+                      widths={[480, 720, 1000]}
+                      sizes="(min-width: 1000px) 640px, 100vw"
+                      loading="eager"
+                    />
+                  </>
+                ) : (
+                  <Picture
+                    src={shots[tab.id]}
+                    alt={tab.alt}
+                    formats={["avif"]} fallbackFormat="webp"
+                    widths={[640, 960, 1280, 1600, 2000]}
+                    sizes="(min-width: 1240px) 1192px, calc(100vw - 32px)"
+                    loading="lazy"
+                  />
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section class="perks">
+        {t.perks.map((p) => (
+          <div class="perk">
+            <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              {icons[p.icon].map((d) => <path d={d} />)}
+              {p.icon === 'grow' && <circle cx="9" cy="8" r="3" />}
+            </svg>
+            <div>
+              <h3>{p.title}</h3>
+              <p>{p.text}</p>
+            </div>
+          </div>
+        ))}
+      </section>
+
+      <section class="proof-wrap">
+        <div class="proof">
+          <div class="proof-text">
+            <p class="proof-title">{t.proof.title}</p>
+            <p>{t.proof.text}</p>
+          </div>
+          <ul class="members">
+            {t.proof.members.map((m) => <li>{m}</li>)}
+          </ul>
+        </div>
+      </section>
+
+      <section class="final">
+        <div class="wrap center">
+          <h2>{t.final.title}</h2>
+          <div class="term">
+            <pre><span class="dim">$</span> {brew}
+<span class="dim">$</span> recruit</pre>
+            <button type="button" class="copy" data-copy={brew} data-done={t.copied} aria-label={t.copyLabel}>
+              <span class="copy-text">{t.copy}</span>
+            </button>
+          </div>
+          <p class="small-line">{t.final.small}</p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <span class="brand-s">recruit</span>
+      <span>{t.footer.license}</span>
+      <span class="grow"></span>
+      <a href={docsUrl}>{t.footer.docs}</a>
+      <a href={`${repo}/releases`}>{t.footer.releases}</a>
+      <a href={repo}>{t.footer.github}</a>
+    </footer>
+    <p class="sr-only" role="status" aria-live="polite" id="copy-status"></p>
+
+    <script>
+      // Tabs: arrow keys, Home and End move between them; the animation only plays while its tab is shown.
+      const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>('.tabs [role="tab"]'));
+      const video = document.querySelector<HTMLVideoElement>('video.demo');
+      const select = (tab: HTMLButtonElement, focus = false) => {
+        for (const other of tabs) {
+          const on = other === tab;
+          other.setAttribute('aria-selected', String(on));
+          other.tabIndex = on ? 0 : -1;
+          const panel = document.getElementById(other.getAttribute('aria-controls')!);
+          if (panel) panel.hidden = !on;
+        }
+        if (focus) tab.focus();
+        if (video) {
+          if (tab.id === 'tab-dashboard') video.play().catch(() => {});
+          else video.pause();
+        }
+      };
+      tabs.forEach((tab, i) => {
+        tab.addEventListener('click', () => select(tab));
+        tab.addEventListener('keydown', (e) => {
+          const n = tabs.length;
+          const to = { ArrowRight: (i + 1) % n, ArrowLeft: (i + n - 1) % n, Home: 0, End: n - 1 }[e.key];
+          if (to === undefined) return;
+          e.preventDefault();
+          select(tabs[to]!, true);
+        });
+      });
+
+      // Copy buttons.
+      const status = document.getElementById('copy-status');
+      for (const button of document.querySelectorAll<HTMLButtonElement>('button.copy')) {
+        const text = button.querySelector('.copy-text')!;
+        const label = text.textContent;
+        button.addEventListener('click', async () => {
+          const value = button.dataset.copy ?? '';
+          try {
+            await navigator.clipboard.writeText(value);
+          } catch {
+            const area = document.createElement('textarea');
+            area.value = value;
+            area.setAttribute('readonly', '');
+            area.style.position = 'fixed';
+            area.style.opacity = '0';
+            document.body.append(area);
+            area.select();
+            document.execCommand('copy');
+            area.remove();
+          }
+          text.textContent = button.dataset.done ?? label;
+          if (status) status.textContent = button.dataset.done ?? '';
+          setTimeout(() => {
+            text.textContent = label;
+            if (status) status.textContent = '';
+          }, 2000);
+        });
+      }
+    </script>
+  </body>
+</html>
+
+<style is:global>
+  :root {
+    --ink: #111318;
+    --muted: #4a505c;
+    --soft: #5b616e;
+    --line: #d9dde4;
+    --line-soft: #e6e9ee;
+    --panel: #f3f5f8;
+    --blue: #2448d8;
+    --blue-dark: #1a36a8;
+    --sans: 'Schibsted Grotesk Variable', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --mono: 'JetBrains Mono Variable', ui-monospace, Menlo, Consolas, monospace;
+    --gutter: 16px;
+  }
+  @media (min-width: 640px) {
+    :root {
+      --gutter: 24px;
+    }
+  }
+  * {
+    box-sizing: border-box;
+  }
+  html {
+    -webkit-text-size-adjust: 100%;
+    scroll-behavior: smooth;
+  }
+  body {
+    margin: 0;
+    background: #fff;
+    color: var(--ink);
+    font-family: var(--sans);
+    overflow-x: hidden;
+  }
+  a {
+    color: var(--blue);
+    text-decoration: none;
+  }
+  a:hover {
+    color: var(--blue-dark);
+    text-decoration: underline;
+  }
+  :focus-visible {
+    outline: 3px solid var(--blue);
+    outline-offset: 3px;
+    border-radius: 4px;
+  }
+  .tour :focus-visible,
+  .final :focus-visible {
+    outline-color: #fff;
+  }
+  h1,
+  h2,
+  h3,
+  p {
+    margin: 0;
+  }
+  .wrap,
+  .bar,
+  .hero,
+  .perks,
+  .proof-wrap,
+  .foot {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding-left: var(--gutter);
+    padding-right: var(--gutter);
+  }
+  .grow {
+    flex: 1;
+  }
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+  .skip {
+    position: absolute;
+    left: var(--gutter);
+    top: -60px;
+    background: var(--ink);
+    color: #fff;
+    padding: 10px 16px;
+    border-radius: 999px;
+    z-index: 10;
+  }
+  .skip:focus {
+    top: 12px;
+  }
+
+  /* Header */
+  .bar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding-top: 16px;
+    padding-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .brand {
+    font-weight: 800;
+    font-size: 22px;
+    color: var(--ink);
+    letter-spacing: -0.01em;
+  }
+  .brand:hover {
+    color: var(--ink);
+    text-decoration: none;
+  }
+  .links {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    flex-wrap: wrap;
+  }
+  .links a:not(.pill) {
+    color: #3b404b;
+    font-weight: 500;
+  }
+  @media (min-width: 640px) {
+    .bar {
+      padding-top: 20px;
+      padding-bottom: 20px;
+      gap: 28px;
+    }
+    .links {
+      gap: 28px;
+    }
+  }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    border-radius: 999px;
+    padding: 10px 18px;
+    min-height: 44px;
+    color: #fff;
+  }
+  .pill:hover {
+    color: #fff;
+    text-decoration: none;
+  }
+  .pill.dark {
+    background: var(--ink);
+  }
+  .pill.dark:hover {
+    background: #2b2f38;
+  }
+  .pill.blue {
+    background: var(--blue);
+  }
+  .pill.blue:hover {
+    background: var(--blue-dark);
+  }
+  .pill.big {
+    font-size: 17px;
+    padding: 14px 26px;
+  }
+
+  /* Hero */
+  .hero {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 40px 56px;
+    padding-top: 32px;
+    padding-bottom: 64px;
+  }
+  .hero-text {
+    flex: 1 1 480px;
+    min-width: 0;
+  }
+  h1 {
+    font-weight: 800;
+    font-size: clamp(2.5rem, 1.2rem + 5.4vw, 4.75rem);
+    line-height: 1;
+    letter-spacing: -0.035em;
+    text-wrap: balance;
+  }
+  .accent {
+    color: var(--blue);
+  }
+  .lede {
+    font-size: clamp(1.0625rem, 1rem + 0.35vw, 1.3125rem);
+    line-height: 1.5;
+    color: var(--muted);
+    margin: 24px 0 32px;
+    max-width: 540px;
+  }
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 14px 20px;
+  }
+  .cmd {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
+  .cmd code {
+    font-family: var(--mono);
+    font-size: 15px;
+    color: #3b404b;
+    overflow-wrap: anywhere;
+  }
+  .copy {
+    font-family: var(--sans);
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--ink);
+    background: #fff;
+    border: 1px solid #b4bac5;
+    border-radius: 999px;
+    min-height: 44px;
+    min-width: 76px;
+    padding: 0 16px;
+    cursor: pointer;
+  }
+  .copy:hover {
+    background: var(--panel);
+  }
+
+  /* Organisation chart */
+  .chart {
+    flex: 1 1 540px;
+    min-width: 0;
+    background: var(--panel);
+    border-radius: 24px;
+    padding: 28px 16px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  @media (min-width: 640px) {
+    .chart {
+      padding: 36px 28px;
+    }
+  }
+  .chart-you {
+    background: var(--ink);
+    color: #fff;
+    border-radius: 999px;
+    padding: 10px 24px;
+    font-weight: 700;
+    font-size: 16px;
+  }
+  .wire {
+    width: 2px;
+    height: 28px;
+    background: #c3c8d1;
+  }
+  .bar-h {
+    align-self: stretch;
+    height: 2px;
+    background: #c3c8d1;
+    margin: 0 13%;
+  }
+  .card {
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 14px 16px;
+    min-width: 0;
+  }
+  .coordinator {
+    width: min(300px, 100%);
+    padding: 16px 20px;
+    box-shadow: 0 8px 24px rgba(17, 19, 24, 0.06);
+  }
+  .card-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: space-between;
+  }
+  .card-name {
+    font-weight: 800;
+    font-size: 15px;
+  }
+  .card-name.big {
+    font-size: 17px;
+  }
+  .state {
+    font-size: 12px;
+    font-weight: 700;
+    border-radius: 999px;
+    padding: 2px 10px;
+    white-space: nowrap;
+  }
+  .state.working {
+    color: #7a5500;
+    background: #fff1c7;
+  }
+  .state.needs {
+    color: #a11b12;
+    background: #fde3e0;
+  }
+  .state.done {
+    color: #3b404b;
+    background: var(--line-soft);
+  }
+  .card-task {
+    font-size: 14px;
+    color: var(--soft);
+    margin-top: 4px;
+  }
+  .card-task.small {
+    font-size: 13px;
+  }
+  .specialists {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    align-self: stretch;
+    margin-top: 16px;
+  }
+  @media (max-width: 420px) {
+    .specialists {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  /* Comparison */
+  .compare {
+    border-top: 1px solid var(--line-soft);
+  }
+  .compare .wrap {
+    padding-top: 64px;
+    padding-bottom: 64px;
+  }
+  h2 {
+    font-weight: 800;
+    font-size: clamp(1.875rem, 1rem + 3vw, 3rem);
+    letter-spacing: -0.03em;
+    line-height: 1.05;
+    text-wrap: balance;
+  }
+  .compare h2 {
+    margin-bottom: 32px;
+    max-width: 820px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    border-top: 2px solid var(--ink);
+    table-layout: fixed;
+  }
+  th,
+  td {
+    text-align: left;
+    vertical-align: top;
+    padding: 16px 12px 16px 0;
+    border-bottom: 1px solid var(--line-soft);
+    font-size: clamp(1rem, 0.9rem + 0.4vw, 1.1875rem);
+    line-height: 1.45;
+    color: var(--soft);
+  }
+  th {
+    font-size: 15px;
+    font-weight: 700;
+    border-bottom: 1px solid var(--line);
+  }
+  th.team,
+  td.team {
+    padding: 16px 0 16px 16px;
+    border-left: 1px solid var(--line);
+  }
+  th.team {
+    color: var(--blue);
+  }
+  td.team {
+    color: var(--ink);
+    font-weight: 500;
+  }
+  tbody tr:last-child td {
+    border-bottom: 0;
+  }
+  @media (min-width: 640px) {
+    .compare .wrap {
+      padding-top: 96px;
+      padding-bottom: 96px;
+    }
+    th,
+    td {
+      padding: 22px 24px 22px 0;
+    }
+    th.team,
+    td.team {
+      padding: 22px 0 22px 24px;
+    }
+  }
+
+  /* Tour */
+  .tour {
+    background: #0e0f12;
+    color: #e8eaed;
+  }
+  .tour .wrap {
+    padding-top: 64px;
+    padding-bottom: 64px;
+  }
+  .tour h2 {
+    color: #fff;
+    text-align: center;
+    margin-bottom: 28px;
+  }
+  .tabs {
+    display: none;
+    justify-content: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 18px;
+  }
+  .js .tabs {
+    display: flex;
+  }
+  .tabs button {
+    font-family: var(--sans);
+    font-weight: 700;
+    font-size: 15px;
+    min-height: 44px;
+    padding: 0 20px;
+    border-radius: 999px;
+    border: 1px solid #5a5f6a;
+    background: transparent;
+    color: #d6dae2;
+    cursor: pointer;
+  }
+  .tabs button:hover {
+    border-color: #fff;
+  }
+  .tabs button[aria-selected='true'] {
+    background: #fff;
+    border-color: #fff;
+    color: var(--ink);
+  }
+  .panel + .panel {
+    margin-top: 48px;
+  }
+  .js .panel + .panel {
+    margin-top: 0;
+  }
+  .panel[hidden] {
+    display: none;
+  }
+  .panel-title {
+    font-size: 22px;
+    font-weight: 800;
+    color: #fff;
+    text-align: center;
+    margin-bottom: 8px;
+  }
+  .js .panel-title {
+    display: none;
+  }
+  .caption {
+    text-align: center;
+    font-size: clamp(1.0625rem, 1rem + 0.3vw, 1.1875rem);
+    line-height: 1.5;
+    color: #c9ced8;
+    margin: 0 auto 28px;
+    max-width: 720px;
+    min-height: 3.2em;
+  }
+  .stage {
+    height: clamp(220px, 56vw, 680px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #000;
+    border: 1px solid #2b2e35;
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .stage picture,
+  .stage video {
+    max-width: 100%;
+    max-height: 100%;
+    display: block;
+  }
+  .stage img,
+  .stage video {
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+  }
+  .stage video {
+    height: 100%;
+  }
+  .still {
+    display: none;
+  }
+  /* On a phone the captures would be unreadable at the width of the screen: they keep a readable size and the
+     frame scrolls sideways (focusable, so the keyboard can scroll it too). */
+  @media (max-width: 639px) {
+    .stage {
+      display: block;
+      height: auto;
+      overflow-x: auto;
+    }
+    .stage picture,
+    .stage video {
+      width: 600px;
+      max-width: none;
+      max-height: none;
+    }
+    .stage img,
+    .stage video {
+      width: 600px;
+      max-width: none;
+      max-height: none;
+      height: auto;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+    .stage video {
+      display: none;
+    }
+    .stage .still {
+      display: block;
+    }
+  }
+  @media (min-width: 640px) {
+    .tour .wrap {
+      padding-top: 104px;
+      padding-bottom: 104px;
+    }
+  }
+
+  /* Perks */
+  .perks {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+    gap: 40px 56px;
+    padding-top: 64px;
+    padding-bottom: 24px;
+  }
+  .perk {
+    display: flex;
+    gap: 18px;
+    color: var(--blue);
+  }
+  .perk svg {
+    flex: none;
+  }
+  .perk h3 {
+    font-weight: 800;
+    font-size: 24px;
+    letter-spacing: -0.01em;
+    margin-bottom: 8px;
+    color: var(--ink);
+  }
+  .perk p {
+    font-size: 17px;
+    line-height: 1.6;
+    color: var(--muted);
+  }
+  @media (min-width: 640px) {
+    .perks {
+      padding-top: 104px;
+      padding-bottom: 40px;
+    }
+  }
+
+  /* Proof */
+  .proof-wrap {
+    padding-top: 48px;
+    padding-bottom: 64px;
+  }
+  .proof {
+    background: var(--panel);
+    border-radius: 24px;
+    padding: 28px 20px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 28px 40px;
+    align-items: center;
+  }
+  .proof-text {
+    flex: 1 1 360px;
+    min-width: 0;
+  }
+  .proof-title {
+    font-weight: 800;
+    font-size: clamp(1.75rem, 1.2rem + 1.8vw, 2.5rem);
+    line-height: 1.1;
+    letter-spacing: -0.025em;
+  }
+  .proof-text p:not(.proof-title) {
+    font-size: 18px;
+    line-height: 1.55;
+    color: var(--muted);
+    margin-top: 14px;
+    max-width: 560px;
+  }
+  .members {
+    flex: 1 1 280px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    font-family: var(--mono);
+    font-size: 14px;
+  }
+  .members li {
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 6px 14px;
+  }
+  @media (min-width: 640px) {
+    .proof {
+      padding: 48px;
+    }
+    .proof-wrap {
+      padding-bottom: 104px;
+    }
+  }
+
+  /* Final call */
+  .final {
+    background: var(--ink);
+    color: #fff;
+  }
+  .final .wrap {
+    padding-top: 64px;
+    padding-bottom: 64px;
+  }
+  .center {
+    text-align: center;
+  }
+  .final h2 {
+    font-size: clamp(2rem, 1rem + 3.6vw, 3.5rem);
+    margin-bottom: 28px;
+  }
+  .term {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 12px 20px;
+    max-width: 100%;
+    background: #1c1f26;
+    border-radius: 14px;
+    padding: 18px 20px;
+    margin-bottom: 24px;
+  }
+  .term pre {
+    margin: 0;
+    text-align: left;
+    font-family: var(--mono);
+    font-size: clamp(0.875rem, 0.7rem + 0.9vw, 1.0625rem);
+    line-height: 1.8;
+    color: #fff;
+    overflow-x: auto;
+    max-width: 100%;
+  }
+  .dim {
+    color: #9aa0ab;
+  }
+  .final .copy {
+    background: transparent;
+    color: #fff;
+    border-color: #6b717d;
+  }
+  .final .copy:hover {
+    background: #2b2f38;
+  }
+  .small-line {
+    font-size: 16px;
+    color: #b4bac5;
+  }
+  @media (min-width: 640px) {
+    .final .wrap {
+      padding-top: 104px;
+      padding-bottom: 104px;
+    }
+    .term {
+      padding: 22px 30px;
+    }
+  }
+
+  /* Footer */
+  .foot {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 24px;
+    padding-top: 32px;
+    padding-bottom: 32px;
+    color: var(--soft);
+    font-size: 15px;
+  }
+  .brand-s {
+    font-weight: 800;
+    color: var(--ink);
+  }
+</style>
