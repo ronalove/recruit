@@ -1,6 +1,8 @@
 ---
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { Picture, getImage } from 'astro:assets';
 import '@fontsource-variable/schibsted-grotesk/wght.css';
 import '@fontsource-variable/jetbrains-mono/wght.css';
@@ -39,7 +41,17 @@ const shots = {
 // The first tab plays the animation; its still frame is the poster, and what reduced-motion users see.
 const poster = await getImage({ src: shots.dashboard, format: 'webp', width: 1000 });
 const social = await getImage({ src: teamEn, format: 'png', width: 1200 });
-const media = lang === 'fr' ? `${base}/media/demo-fr` : `${base}/media/demo`;
+// The animation (public/media) is only written into the page when its files exist at build time: French prefers
+// demo-fr, and falls back to demo. Without any, the tab shows the still image.
+const mediaDir = join(process.cwd(), 'public', 'media');
+const formats = [
+  { ext: 'webm', type: 'video/webm' },
+  { ext: 'mp4', type: 'video/mp4' },
+];
+const found = (name: string) => formats.filter((f) => existsSync(join(mediaDir, `${name}.${f.ext}`)));
+const names = lang === 'fr' ? ['demo-fr', 'demo'] : ['demo'];
+const mediaName = names.find((name) => found(name).length > 0);
+const videoSources = mediaName ? found(mediaName).map((f) => ({ src: `${base}/media/${mediaName}.${f.ext}`, type: f.type })) : [];
 
 const canonical = new URL(home(lang), Astro.site).href;
 const alternates = (['en', 'fr'] as Lang[]).map((l) => ({ l, href: new URL(home(l), Astro.site).href }));
@@ -176,12 +188,13 @@ const icons = {
               <div class="stage" tabindex="0">
                 {tab.id === 'dashboard' ? (
                   <>
-                    <video class="demo" autoplay muted loop playsinline preload="metadata" poster={poster.src} aria-label={tab.alt}>
-                      <source src={`${media}.webm`} type="video/webm" />
-                      <source src={`${media}.mp4`} type="video/mp4" />
-                    </video>
+                    {videoSources.length > 0 && (
+                      <video class="demo" autoplay muted loop playsinline preload="metadata" poster={poster.src} aria-label={tab.alt}>
+                        {videoSources.map((v) => <source src={v.src} type={v.type} />)}
+                      </video>
+                    )}
                     <Picture
-                      class="still"
+                      class={videoSources.length > 0 ? 'still' : undefined}
                       src={shots.dashboard}
                       alt={tab.alt}
                       formats={["avif"]} fallbackFormat="webp"
@@ -250,7 +263,7 @@ const icons = {
 
     <footer class="foot">
       <span class="brand-s">recruit</span>
-      <span>{t.footer.license}</span>
+      <a href={`${repo}/blob/main/LICENSE`}>{t.footer.license}</a>
       <span class="grow"></span>
       <a href={docsUrl}>{t.footer.docs}</a>
       <a href={`${repo}/releases`}>{t.footer.releases}</a>

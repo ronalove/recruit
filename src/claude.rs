@@ -279,10 +279,7 @@ mod tests {
 
     #[test]
     fn project_keys() {
-        assert_eq!(
-            project_key(Path::new("/Users/ronan/Developer/gitea/omnidex")),
-            "-Users-ronan-Developer-gitea-omnidex"
-        );
+        assert_eq!(project_key(Path::new("/home/user/code/my-project")), "-home-user-code-my-project");
         assert_eq!(project_key(Path::new("/tmp/a.b_c/é")), "-tmp-a-b-c--");
     }
 

@@ -139,7 +139,7 @@ const en: Strings = {
     members: ['coordinator', 'dev-cli', 'dev-mod', 'review', 'ops'],
   },
   final: { title: 'Build your first team.', small: 'Free and open source · For Claude Code · macOS and Linux' },
-  footer: { license: 'AGPL-3.0 license', docs: 'Docs', releases: 'Releases', github: 'GitHub' },
+  footer: { license: 'AGPL-3.0-or-later', docs: 'Docs', releases: 'Releases', github: 'GitHub' },
 };
 
 const fr: Strings = {
@@ -242,7 +242,7 @@ const fr: Strings = {
     members: ['coordinateur', 'dev-cli', 'dev-mod', 'review', 'ops'],
   },
   final: { title: 'Monte ta première équipe.', small: 'Libre et open source · Pour Claude Code · macOS et Linux' },
-  footer: { license: 'Licence AGPL-3.0', docs: 'Docs', releases: 'Versions', github: 'GitHub' },
+  footer: { license: 'AGPL-3.0-or-later', docs: 'Docs', releases: 'Versions', github: 'GitHub' },
 };
 
 export const strings: Record<Lang, Strings> = { en, fr };

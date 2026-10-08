@@ -837,7 +837,7 @@ fn others(count: usize) -> String {
     if count == 1 { t!("… et 1 autre", "… and 1 more") } else { t!("… et {} autres", "… and {} more", count) }
 }
 
-/// ` nom en double ailleurs : coordinateur (omnidex)`, dimmed: sessions open elsewhere under a member's name, which
+/// ` nom en double ailleurs : coordinateur (shop)`, dimmed: sessions open elsewhere under a member's name, which
 /// messages by name could reach.
 fn elsewhere_line(list: &[(String, Option<String>)], width: usize) -> Option<String> {
     if list.is_empty() {
@@ -2456,7 +2456,7 @@ mod tests {
         let running: Vec<Running> = serde_json::from_value(serde_json::json!([
             {"name": "dev", "cwd": "/tmp/autre", "pid": 4},
             {"name": "coordinateur", "cwd": "/tmp/web", "status": "busy", "pid": 1},
-            {"name": "coordinateur", "cwd": "/Users/r/omnidex", "pid": 2},
+            {"name": "coordinateur", "cwd": "/home/user/code/shop", "pid": 2},
             {"name": "dev", "cwd": "/tmp/autre", "pid": 5},
             {"name": "dev", "pid": 6},
             {"name": "inconnu", "cwd": "/tmp/ailleurs", "pid": 7},
@@ -2473,7 +2473,7 @@ mod tests {
         assert_eq!(
             elsewhere,
             [
-                ("coordinateur", Some("omnidex")),
+                ("coordinateur", Some("shop")),
                 ("dev", None),
                 ("dev", Some("autre")),
                 ("dev", Some("gpj.exe")),
@@ -2491,10 +2491,10 @@ mod tests {
                 sample_card("interface", false, State::Waiting),
             ]
         };
-        let b = Board { elsewhere: vec![("coordinateur".into(), Some("omnidex".into()))], ..board(cards()) };
+        let b = Board { elsewhere: vec![("coordinateur".into(), Some("shop".into()))], ..board(cards()) };
         let lines =
             |height: usize| -> Vec<String> { render(&b, 70, height).lines.iter().map(|l| visible(l)).collect() };
-        let line = t!(" nom en double ailleurs : {}", " name in use elsewhere: {}", "coordinateur (omnidex)");
+        let line = t!(" nom en double ailleurs : {}", " name in use elsewhere: {}", "coordinateur (shop)");
         // Right over the usage, dimmed.
         let tall = lines(23);
         assert_eq!(tall[20], line);
@@ -2506,7 +2506,7 @@ mod tests {
         assert_eq!(render(&b, 70, 15).zones, render(&board(cards()), 70, 15).zones);
         // Several, on one line at most.
         let b = Board {
-            elsewhere: vec![("coordinateur".into(), Some("omnidex".into())), ("dev".into(), None)],
+            elsewhere: vec![("coordinateur".into(), Some("shop".into())), ("dev".into(), None)],
             ..board(cards())
         };
         let shown = render(&b, 30, 23)
