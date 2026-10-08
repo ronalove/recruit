@@ -417,14 +417,14 @@ impl Action {
     pub(crate) const ALL: [Action; 5] =
         [Action::New, Action::Dashboard, Action::RestartAll, Action::Detach, Action::Stop];
 
-    /// Its key, the same in both languages but for stopping.
+    /// Its key, the same in both languages.
     pub(crate) fn key(self) -> char {
         match self {
             Action::New => 'n',
             Action::Dashboard => 't',
             Action::RestartAll => 'R',
             Action::Detach => 'd',
-            Action::Stop => t!("a", "s").chars().next().unwrap_or('a'),
+            Action::Stop => 'q',
         }
     }
 }
@@ -1503,12 +1503,12 @@ impl Sheet {
             Action::RestartAll => {
                 let everyone: Vec<String> = self.team.people.iter().map(|p| p.name.clone()).collect();
                 let confirm = Confirm::new(
-                    t!("Tout relancer à neuf ?", "Restart everyone afresh?"),
+                    t!("Réinitialiser l'équipe ?", "Reset the team?"),
                     vec![t!(
                         "Chaque membre repart sur une conversation neuve, son contexte vidé.",
                         "Every member starts over on a new conversation, its context cleared."
                     )],
-                    t!("Tout relancer", "Restart everyone"),
+                    t!("Réinitialiser", "Reset"),
                     vec![Effect::RestartAll],
                 );
                 self.overlay = Overlay::Confirm(confirm.busy(self.interrupted(&everyone)).danger(true));
@@ -1517,12 +1517,12 @@ impl Sheet {
             Action::Detach => {}
             Action::Stop => {
                 let confirm = Confirm::new(
-                    t!("Arrêter l'équipe ?", "Stop the team?"),
+                    t!("Quitter l'équipe ?", "Quit the team?"),
                     vec![t!(
                         "Tous les membres s'arrêtent et sa session tmux se ferme.",
                         "Every member stops and its tmux session closes."
                     )],
-                    t!("Arrêter", "Stop"),
+                    t!("Quitter", "Quit"),
                     vec![Effect::Stop],
                 );
                 self.overlay = Overlay::Confirm(confirm.danger(true));
@@ -1838,8 +1838,8 @@ type Sentence = fn(&str) -> String;
 /// What the screen says while the team's files do not read.
 fn unreadable(error: &str) -> String {
     t!(
-        "Les fichiers de l'équipe ne se lisent pas ({}) : réglages en lecture seule ; détacher et arrêter restent possibles.",
-        "The team's files do not read ({}): settings read only; detaching and stopping still work.",
+        "Les fichiers de l'équipe ne se lisent pas ({}) : réglages en lecture seule ; détacher et quitter restent possibles.",
+        "The team's files do not read ({}): settings read only; detaching and quitting still work.",
         error
     )
 }

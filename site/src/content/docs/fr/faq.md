@@ -7,7 +7,7 @@ description: Bon à savoir avant de commencer, et que faire quand quelque chose 
 
 ### Fermer le terminal n'arrête pas l'équipe
 
-Une équipe tourne dans le serveur tmux propre à recruit : fermer la fenêtre, même avec `Cmd+q`, laisse les agents travailler. `recruit`, ou `recruit attach`, les retrouve là où tu les as laissés, depuis n'importe quel terminal, même en SSH. Pour arrêter une équipe : `Alt+q` puis « Arrêter l'équipe », ou `recruit stop`.
+Une équipe tourne dans le serveur tmux propre à recruit : fermer la fenêtre, même avec `Cmd+q`, laisse les agents travailler. `recruit`, ou `recruit attach`, les retrouve là où tu les as laissés, depuis n'importe quel terminal, même en SSH. Pour arrêter une équipe : `Alt+q` puis « Quitter » (`q`), ou `recruit stop`.
 
 ### Approbation du dossier
 
@@ -101,7 +101,7 @@ Le nom d'une équipe ou d'un membre, écrit à la main dans le fichier de l'équ
 recruit: /home/moi/mon-app/.recruit/settings.toml : le membre « -dev » de l'équipe « web » ne peut pas porter ce nom : lettres, chiffres, -, _ et . seulement, sans espace, sans - ni . au début, 40 caractères au plus. Renomme-le dans le fichier.
 ```
 
-Deux membres dont les noms ne diffèrent que par la casse donnent « ne diffère de … que par la casse ». `recruit edit` (ou `recruit edit <équipe>`, `recruit edit --local`) ouvre quand même le fichier : renomme-y l'équipe ou le membre. Tant qu'il n'est pas corrigé, les autres commandes de recruit qui lisent le fichier s'arrêtent dessus ; le fichier d'une équipe globale les arrête toutes, puisque chacune lit toutes les équipes globales. Une équipe qui tourne déjà continue de travailler : son menu s'ouvre en lecture seule, et `Alt+q` permet toujours de se détacher ou de l'arrêter.
+Deux membres dont les noms ne diffèrent que par la casse donnent « ne diffère de … que par la casse ». `recruit edit` (ou `recruit edit <équipe>`, `recruit edit --local`) ouvre quand même le fichier : renomme-y l'équipe ou le membre. Tant qu'il n'est pas corrigé, les autres commandes de recruit qui lisent le fichier s'arrêtent dessus ; le fichier d'une équipe globale les arrête toutes, puisque chacune lit toutes les équipes globales. Une équipe qui tourne déjà continue de travailler : son menu s'ouvre en lecture seule, et `Alt+q` permet toujours de se détacher ou de la quitter.
 
 ### « plusieurs équipes dans ce projet »
 

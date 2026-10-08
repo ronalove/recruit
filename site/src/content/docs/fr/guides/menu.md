@@ -59,9 +59,9 @@ Tout se clique. Dans une fenêtre étroite, la liste ne garde que les noms, et l
 |---|---|
 | `n` | Nouvel agent : un rôle intégré, un agent que Claude compose d'après ta demande, ou un agent que tu écris. « ⏎ Ajouter et lancer » lui donne tout de suite un panneau. |
 | `t` | Tableau de bord : le tableau de bord et le journal, oui ou non |
-| `R` | Relancer tout à neuf : chaque membre sur une nouvelle conversation, les contextes vidés |
+| `R` | Réinitialiser : chaque membre sur une nouvelle conversation, les contextes vidés (demande « Réinitialiser l'équipe ? ») |
 | `d` | Détacher : laisser l'équipe tourner |
-| `a` | Arrêter l'équipe (`s` en anglais) |
+| `q` | Quitter : arrêter l'équipe, la session de chaque membre fermée (demande « Quitter l'équipe ? ») |
 
 Ces touches marchent depuis la liste des membres ; dans une fiche, une lettre ne fait rien. Un clic marche partout.
 
@@ -90,4 +90,4 @@ Le menu demande d'abord confirmation quand un membre qu'il relancerait est au tr
 - Un nom qui ne diffère de celui d'un coéquipier que par la casse est refusé, tout comme le nom d'une session déjà ouverte dans le dossier de l'équipe.
 - Un onglet ne peut pas prendre le nom d'un onglet de recruit (« Interlocuteurs », « Agents (2) »…).
 
-Si les fichiers de l'équipe ne se lisent pas (une faute de frappe faite à la main, par exemple), le menu s'ouvre quand même, en lecture seule : les membres tels que lancés, l'erreur, et seulement détacher ou arrêter.
+Si les fichiers de l'équipe ne se lisent pas (une faute de frappe faite à la main, par exemple), le menu s'ouvre quand même, en lecture seule : les membres tels que lancés, l'erreur, et seulement détacher ou quitter.

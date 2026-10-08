@@ -7,7 +7,7 @@ description: Good to know before you start, and what to do when something does n
 
 ### Does closing the terminal stop the team?
 
-No. A team runs in recruit's own tmux server: closing the window, even with `Cmd+q`, leaves the agents working. `recruit`, or `recruit attach`, finds them where you left them, from any terminal, even over SSH. To stop a team: `Alt+q` then "Stop the team", or `recruit stop`.
+No. A team runs in recruit's own tmux server: closing the window, even with `Cmd+q`, leaves the agents working. `recruit`, or `recruit attach`, finds them where you left them, from any terminal, even over SSH. To stop a team: `Alt+q` then "Quit" (`q`), or `recruit stop`.
 
 ### Why does Claude Code ask whether to trust the folder?
 
@@ -101,7 +101,7 @@ A team's or a member's name, written by hand in the team's file, breaks recruit'
 recruit: /home/me/my-app/.recruit/settings.toml: member "-dev" of team "web" cannot have this name: letters, digits, -, _ and . only, no spaces, not starting with - or ., at most 40 characters. Rename it in the file.
 ```
 
-Two members whose names differ only by case get "differs from … by case only". `recruit edit` (or `recruit edit <team>`, `recruit edit --local`) opens the file even so: rename the team or the member there. Until it is fixed, the other recruit commands that read the file stop on it; a global team's file stops all of them, since each one reads all the global teams. A team already running keeps working: its menu opens read-only, and `Alt+q` still detaches or stops it.
+Two members whose names differ only by case get "differs from … by case only". `recruit edit` (or `recruit edit <team>`, `recruit edit --local`) opens the file even so: rename the team or the member there. Until it is fixed, the other recruit commands that read the file stop on it; a global team's file stops all of them, since each one reads all the global teams. A team already running keeps working: its menu opens read-only, and `Alt+q` still detaches from it or quits it.
 
 ### "several teams in this project"
 

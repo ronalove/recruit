@@ -59,7 +59,7 @@ Pour regarder un agent, clique sur sa carte dans le tableau de bord, ou va dans 
 
 ## 4. Partir et revenir
 
-`Alt+q` (`⌥q` sous macOS), ou le bouton « quitter » à droite de la barre tmux, propose de se détacher ou d'arrêter l'équipe. Détachée, l'équipe continue de travailler, même si tu fermes le terminal :
+`Alt+q` (`⌥q` sous macOS), ou le bouton « quitter » à droite de la barre tmux, propose de se détacher (`d`) ou de quitter, ce qui arrête l'équipe (`q`). Détachée, l'équipe continue de travailler, même si tu fermes le terminal :
 
 ```sh
 recruit          # retour là où tu l'as laissée, depuis n'importe quel terminal, même en SSH

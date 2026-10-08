@@ -885,12 +885,12 @@ fn action_label(action: Action, dashboard: bool, long: bool) -> String {
         (Action::Dashboard, true) if dashboard => t!("Tableau de bord : oui", "Dashboard: yes"),
         (Action::Dashboard, true) => t!("Tableau de bord : non", "Dashboard: no"),
         (Action::Dashboard, false) => t!("tableau", "dashboard"),
-        (Action::RestartAll, true) => t!("Relancer tout à neuf", "Restart all afresh"),
-        (Action::RestartAll, false) => t!("tout relancer", "restart all"),
+        (Action::RestartAll, true) => t!("Réinitialiser", "Reset"),
+        (Action::RestartAll, false) => t!("réinitialiser", "reset"),
         (Action::Detach, true) => t!("Détacher", "Detach"),
         (Action::Detach, false) => t!("détacher", "detach"),
-        (Action::Stop, true) => t!("Arrêter", "Stop"),
-        (Action::Stop, false) => t!("arrêter", "stop"),
+        (Action::Stop, true) => t!("Quitter", "Quit"),
+        (Action::Stop, false) => t!("quitter", "quit"),
     }
 }
 
@@ -987,10 +987,14 @@ mod tests {
 
     #[test]
     fn stopping_stays_in_sight() {
+        // At the narrowest the menu draws, quitting and detaching always show. Short of room (in French, whose words
+        // are longer), resetting, the least needed, gives its place first.
         let text = rows(&draw(&sheet(), &look(), 50, 14));
         let keys = &text[12];
-        assert!(keys.contains(&t!("arrêter", "stop")) && keys.contains(&t!("détacher", "detach")), "{keys}");
-        assert!(!keys.contains(&t!("tout relancer", "restart all")), "the least needed went: {keys}");
+        assert!(keys.contains(&t!("quitter", "quit")) && keys.contains(&t!("détacher", "detach")), "{keys}");
+        let reset = keys.contains(&t!("réinitialiser", "reset"));
+        assert!(!reset || keys.contains(&t!("tableau", "dashboard")), "the least needed went first: {keys}");
+        assert!(columns(keys) <= 50, "{keys}");
     }
 
     #[test]
@@ -1035,7 +1039,7 @@ mod tests {
         s.key(Key::Char(super::super::sheet::Action::Stop.key()), &Fake::quiet());
         let drawn = draw(&s, &look(), 100, 28);
         let text = rows(&drawn);
-        assert!(text.iter().any(|r| r.contains(&t!("Arrêter l'équipe ?", "Stop the team?"))));
+        assert!(text.iter().any(|r| r.contains(&t!("Quitter l'équipe ?", "Quit the team?"))));
         assert_eq!(drawn.canvas.style(1, 0).fg, Some(FADED), "the rest faded");
         assert!(
             drawn.zones.iter().all(|z| matches!(z.target, Target::Yes | Target::No)),
@@ -1095,7 +1099,7 @@ mod tests {
         let text = rows(&draw(&s, &look(), 100, 28));
         assert!(text.iter().any(|r| r.contains(&t!("lecture seule", "read only"))));
         assert!(!text.iter().any(|r| r.contains(&t!("Nouvel agent", "New agent"))), "nothing to add");
-        let buttons = text.iter().find(|r| r.contains(&t!("Arrêter", "Stop"))).unwrap();
+        let buttons = text.iter().find(|r| r.contains(&t!("Quitter", "Quit"))).unwrap();
         assert!(buttons.contains(&t!("Détacher", "Detach")) && !buttons.contains(&t!("Tableau", "Dashboard")));
     }
 

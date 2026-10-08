@@ -26,7 +26,7 @@ Your own tmux configuration is read too, `~/.tmux.conf` then `~/.config/tmux/tmu
 | `Ctrl-b d` | detach: the team keeps running |
 | `Alt+j` | journal full, reduced, then hidden (or `/team`, `/equipe` in a French team, in a member's prompt) |
 | `Alt+r`, or the "menu" button | the [team's menu](/recruit/guides/menu/) (or `/recruit` in a member's prompt) |
-| `Alt+q`, or the "quit" button | detach (the team keeps running) or stop the team, in one go |
+| `Alt+q`, or the "quit" button | a small menu: Detach (`d`, the team keeps running), Quit (`q`, stops the team), Cancel (`c`) |
 
 A click on a tab or a pane also works, and so does a click on a member's card on the dashboard. `Ctrl-b` is tmux's prefix, unless your configuration changes it.
 
@@ -57,7 +57,7 @@ Running `recruit` again on a running team also starts again the members that no 
 
 ## Stop
 
-`Alt+q` then "Stop the team", or from a shell:
+`Alt+q` then "Quit" (`q`), "Quit" in the team's menu, or from a shell:
 
 ```sh
 recruit stop       # asks first

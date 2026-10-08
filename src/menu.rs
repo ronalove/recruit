@@ -364,7 +364,7 @@ impl Menu<'_> {
                 self.reload(sheet, None);
             }
             Effect::RestartAll => {
-                let done = t!("Toute l'équipe a été relancée à neuf.", "The whole team was restarted afresh.");
+                let done = t!("L'équipe a été réinitialisée.", "The team was reset.");
                 sheet.said = Some(self.running.restart_all().map_or_else(failed, |()| Said::Done(done)));
                 self.reload(sheet, None);
             }

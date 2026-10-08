@@ -26,7 +26,7 @@ Ta propre configuration tmux est lue aussi, `~/.tmux.conf` puis `~/.config/tmux/
 | `Ctrl-b d` | se détacher : l'équipe continue de tourner |
 | `Alt+j` | journal complet, réduit, puis masqué (ou `/equipe`, `/team` dans une équipe en anglais, dans l'invite d'un membre) |
 | `Alt+r`, ou le bouton « menu » | le [menu de l'équipe](/recruit/fr/guides/menu/) (ou `/recruit` dans l'invite d'un membre) |
-| `Alt+q`, ou le bouton « quitter » | se détacher (l'équipe continue) ou arrêter l'équipe, en une fois |
+| `Alt+q`, ou le bouton « quitter » | un petit menu : Détacher (`d`, l'équipe continue), Quitter (`q`, arrête l'équipe), Annuler (`a`) |
 
 Un clic sur un onglet ou un panneau marche aussi, tout comme un clic sur la carte d'un membre dans le tableau de bord. `Ctrl-b` est le préfixe de tmux, sauf si ta configuration le change.
 
@@ -57,7 +57,7 @@ Relancer `recruit` sur une équipe qui tourne remet aussi en route les membres a
 
 ## Arrêter
 
-`Alt+q` puis « Arrêter l'équipe », ou depuis un shell :
+`Alt+q` puis « Quitter » (`q`), « Quitter » dans le menu de l'équipe, ou depuis un shell :
 
 ```sh
 recruit stop       # demande d'abord

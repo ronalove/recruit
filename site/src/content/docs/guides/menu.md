@@ -59,9 +59,9 @@ Everything can be clicked. In a narrow window, the list keeps only the names, an
 |---|---|
 | `n` | New agent: a built-in role, one Claude composes from your request, or one you write. "⏎ Add and launch" gives it a pane at once. |
 | `t` | Dashboard: the dashboard and the journal, on or off |
-| `R` | Restart all afresh: every member on a new conversation, their contexts emptied |
+| `R` | Reset: every member on a new conversation, their contexts emptied (asks "Reset the team?") |
 | `d` | Detach: leave the team running |
-| `s` | Stop the team (`a` in French) |
+| `q` | Quit: stop the team, every member's session closed (asks "Quit the team?") |
 
 These keys work from the list of members; in a sheet, a letter does nothing. A click works everywhere.
 
@@ -90,4 +90,4 @@ The menu asks first when a member it would restart is at work, waiting for a per
 - A name that differs from a teammate's only by case is refused, and so is the name of a session already open in the team's folder.
 - A tab cannot take the name of one of recruit's tabs ("Contacts", "Agents (2)"…).
 
-When the team's files do not read (a typo made by hand, for instance), the menu still opens, read-only: the members as launched, the error, and only detach and stop.
+When the team's files do not read (a typo made by hand, for instance), the menu still opens, read-only: the members as launched, the error, and only detach and quit.

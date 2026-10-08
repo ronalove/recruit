@@ -59,7 +59,7 @@ To watch an agent, click its card on the dashboard, or go to its tab with `Alt+1
 
 ## 4. Leave and come back
 
-`Alt+q` (`⌥q` on macOS), or the "quit" button on the right of the status line, offers to detach or to stop the team. Detached, the team keeps working, even when you close the terminal:
+`Alt+q` (`⌥q` on macOS), or the "quit" button on the right of the status line, offers to detach (`d`) or to quit, which stops the team (`q`). Detached, the team keeps working, even when you close the terminal:
 
 ```sh
 recruit          # back where you left it, from any terminal, even over SSH

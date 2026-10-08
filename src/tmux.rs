@@ -834,15 +834,15 @@ fn status_right(lang: Lang) -> String {
 /// `-M` lets the mouse choose an item when Alt+q opened it: a menu opened from a key ignores the mouse, a click on
 /// an item would close it unchosen.
 fn quit_menu(lang: Lang) -> Vec<String> {
-    let (detach, stop, stop_key, cancel) = match lang {
-        Lang::Fr => ("Détacher : l'équipe continue", "Arrêter l'équipe", "a", "Annuler"),
-        Lang::En => ("Detach: the team keeps running", "Stop the team", "s", "Cancel"),
+    let (detach, quit, cancel, cancel_key) = match lang {
+        Lang::Fr => ("Détacher", "Quitter", "Annuler", "a"),
+        Lang::En => ("Detach", "Quit", "Cancel", "c"),
     };
     let title = "#[align=centre] recruit ";
     ["display-menu", "-M", "-O", "-T", title, "-x", "C", "-y", "C"]
         .into_iter()
-        .chain([detach, "d", "detach-client", stop, stop_key, "kill-session"])
-        .chain(["", cancel, "q", ""])
+        .chain([detach, "d", "detach-client", quit, "q", "kill-session"])
+        .chain(["", cancel, cancel_key, ""])
         .map(String::from)
         .collect()
 }
@@ -981,7 +981,11 @@ mod tests {
         let menu = quit_menu(Lang::Fr);
         // The mouse handled, whatever opened it, and the menu kept open by the click's release or a motion.
         assert_eq!(menu[..3], ["display-menu", "-M", "-O"]);
-        assert!(menu.contains(&"kill-session".to_string()) && menu.contains(&"detach-client".to_string()));
+        // Short words, and their keys: d, q, then a (c in English) to cancel.
+        let items = ["Détacher", "d", "detach-client", "Quitter", "q", "kill-session", "", "Annuler", "a", ""];
+        assert_eq!(menu[menu.len() - items.len()..], items);
+        let en = quit_menu(Lang::En);
+        assert_eq!(en[en.len() - 7..], ["Quit", "q", "kill-session", "", "Cancel", "c", ""]);
         assert_eq!(tmux_quote("detach-client"), "detach-client");
         assert_eq!(tmux_quote(""), "\"\"");
         assert_eq!(tmux_quote("Arrêter l'équipe"), "\"Arrêter l'équipe\"");
