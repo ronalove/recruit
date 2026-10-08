@@ -40,6 +40,15 @@ Avec [le mod de recruit](/recruit/fr/guides/claude-code/#le-mod-de-recruit), cha
 Haiku écrit les deux formes de la ligne dans le même appel, une fois par nouvelle demande, par la session du membre et donc sur ton compte : la demande lue jusqu'à 2 000 caractères, deux lignes en retour.
 :::
 
+### Sous-agents et teammates
+
+Quand un membre confie une partie de son travail à des agents à lui, ils apparaissent sous sa carte, avec [le mod de recruit](/recruit/fr/guides/claude-code/#le-mod-de-recruit) :
+
+- **Un sous-agent**, lancé par le membre pour une tâche, a une ligne sous un sablier : son type, ce qu'on lui a demandé, et depuis combien de temps il travaille. La ligne est jaune pendant qu'il travaille. Une fois fini, il passe en ✓ atténué une dizaine de secondes, puis disparaît. Un sous-agent en échec ou arrêté passe en ✗ rouge et reste une trentaine de secondes. Un sous-agent lancé par un sous-agent a aussi sa ligne, dans la même liste.
+- **Un teammate**, un agent d'une équipe Claude Code lancée par le membre, a une ligne sous une silhouette : son nom, et depuis combien de temps il est dans son état. Jaune au travail, atténué quand il attend un message, rouge s'il a échoué. La ligne reste tant que la session du membre liste le teammate. Un teammate dont l'état n'a pas changé depuis une demi-heure affiche `?` : son panneau est peut-être mort. Au bout de deux heures, la ligne disparaît.
+
+Ils n'ont que la place qui reste une fois que chaque carte montre ce que fait son membre : ils ne raccourcissent jamais la tâche d'un membre, le leur ou un autre. Faute de place, une carte les compte sur une ligne (« ⧗ 2 sous-agents   ♙ 1 teammate », ou « ⧗ 2 · ♙ 1 » dans un panneau étroit), puis s'en passe. Le [menu de l'équipe](/recruit/fr/guides/menu/) ne les montre pas : il n'y a rien à y régler.
+
 ### Compacter une conversation
 
 Un clic sur le contexte d'un membre au repos, marqué ⟳, propose de compacter sa conversation, après confirmation. C'est ce que Claude Code ferait de lui-même au seuil, et cela coûte autant : le modèle du membre relit tout son contexte pour le résumer. Un membre qui s'est remis au travail entre-temps refuse. Ensuite, jusqu'à la réponse suivante du membre, la carte montre le contexte tel que Claude Code le compte, comme `/context`.
@@ -52,7 +61,7 @@ Les cartes viennent dans cet ordre : les interlocuteurs, les agents qui t'attend
 - côte à côte avec une autre carte, avec une ligne ou aucune ;
 - pour un agent de travail au repos, son seul nom, dans une liste sous les cartes.
 
-Les agents au travail gardent toute la largeur et toute leur tâche tant que les autres peuvent faire de la place : ceux qui sont au repos depuis le plus longtemps passent les premiers dans la liste, et la liste se réduit à une ligne (« … et 3 autres ») avant qu'un agent au travail perde quoi que ce soit de sa tâche. La disposition ne change qu'avec les cartes, leurs états ou le panneau.
+Les agents au travail gardent toute la largeur et toute leur tâche tant que les autres peuvent faire de la place : ceux qui sont au repos depuis le plus longtemps passent les premiers dans la liste, et la liste se réduit à une ligne (« … et 3 autres ») avant qu'un agent au travail perde quoi que ce soit de sa tâche. Les sous-agents et les teammates passent en dernier : ils ne prennent que la place que laissent les cartes et les noms, listés, puis comptés, puis plus du tout. La disposition ne change qu'avec les cartes, leurs états ou le panneau.
 
 Quand des sessions ouvertes ailleurs portent le nom de membres, une ligne atténuée, au-dessus de l'usage, les nomme, s'il reste de la place.
 

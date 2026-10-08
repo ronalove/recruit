@@ -62,6 +62,15 @@ async function bridgeOf($: EngineInterface): Promise<Bridge | undefined> {
   return exe && state && member ? { exe, state, member } : undefined
 }
 
+// The agents the session started, as it lists them; null when it could not this time (recruit keeps those it had).
+async function agents($: EngineInterface): Promise<unknown[] | null> {
+  try {
+    return await $.agent.list()
+  } catch {
+    return null
+  }
+}
+
 async function tick(
   $: EngineInterface,
   bridge: Bridge,
@@ -88,6 +97,7 @@ async function tick(
     rateLimits: usage.rateLimits,
     threshold,
     compacted,
+    agents: await agents($),
     ...handover,
   }
   return call($, bridge, 'tick', input)

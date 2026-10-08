@@ -81,6 +81,9 @@ pub struct Override {
 /// What a member's session last told: kept for the dashboard.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Report {
+    /// The session's id.
+    #[serde(default)]
+    pub session: Option<String>,
     /// The session's own model.
     #[serde(default)]
     pub model: Option<String>,
@@ -103,6 +106,154 @@ pub struct Report {
     /// When the breakdown was asked, while no answer came: asked again only after a while. 0 when none waits.
     #[serde(default)]
     pub breakdown_asked: i64,
+    /// The agents the session started: its subagents at work, and for a while those just over; its teammates, as long
+    /// as it lists them (see [`helpers`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub helpers: Vec<Helper>,
+}
+
+/// An agent a member's session started, as its mod last listed it (`$.agent.list()`): a subagent, or a teammate of
+/// a team of Claude Code's own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Helper {
+    pub id: String,
+    /// Its type: `Explore`, `general-purpose`…; a teammate's may be its role.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The few words of the call that started it.
+    pub description: String,
+    /// A teammate's name in its team; none for a subagent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teammate: Option<String>,
+    pub status: HelperStatus,
+    /// When it was first seen, and since when in this status, in seconds since the epoch.
+    pub started: i64,
+    pub since: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HelperStatus {
+    /// Started or at work; for a subagent, held or between two turns too.
+    Running,
+    /// A teammate waiting for a message, or held.
+    Idle,
+    Done,
+    /// Failed, or stopped.
+    Failed,
+}
+
+/// How long a subagent stays on the dashboard once done, and once failed or stopped, in seconds.
+pub const SUBAGENT_DONE_SHOWN: i64 = 10;
+pub const SUBAGENT_FAILED_SHOWN: i64 = 30;
+/// A teammate in the same status this long may be a ghost: one in a pane of its own keeps the word it last wrote
+/// when that pane dies. Shown as unknown after the first, dropped after the second.
+pub const TEAMMATE_UNKNOWN: i64 = 30 * 60;
+pub const TEAMMATE_DROPPED: i64 = 2 * 60 * 60;
+
+impl Helper {
+    /// Still shown at `now`: a subagent at work, or over since less than a while, longer for one that failed; a
+    /// teammate unless it stayed in its status too long.
+    pub fn shown(&self, now: i64) -> bool {
+        let over = now - self.since;
+        match (self.teammate.is_some(), self.status) {
+            (true, _) => over < TEAMMATE_DROPPED,
+            (false, HelperStatus::Done) => over < SUBAGENT_DONE_SHOWN,
+            (false, HelperStatus::Failed) => over < SUBAGENT_FAILED_SHOWN,
+            (false, _) => true,
+        }
+    }
+
+    /// A teammate that may be a ghost (see [`TEAMMATE_UNKNOWN`]).
+    pub fn unknown(&self, now: i64) -> bool {
+        self.teammate.is_some() && now - self.since >= TEAMMATE_UNKNOWN
+    }
+}
+
+/// The agents a member's session started, from a tick's `input` and the report the last one left (`before`). Its
+/// `agents`: a list (see [`helpers`]); `null`, the session could not list them this time, and they stay as they were;
+/// none at all, an older mod, which never lists them: none. A session other than the last one (the member started
+/// again on another conversation) left them behind (see [`left_behind`]); started again on the same one, its mod's
+/// start did (see [`start`]).
+fn helpers_now(before: &Report, input: &Value, now: i64) -> Vec<Helper> {
+    let session = input["session"].as_str();
+    let changed = before.session.is_some() && before.session.as_deref() != session;
+    let kept = if changed { left_behind(&before.helpers, now) } else { before.helpers.clone() };
+    match input.get("agents") {
+        None => Vec::new(),
+        Some(Value::Array(agents)) => helpers(&kept, agents, now),
+        Some(_) => kept,
+    }
+}
+
+/// The agents a session's process left behind when it ended, the member started again on its conversation or on
+/// another: its subagents at work or held, stopped with it; its teammates, gone with it; those over, as they were.
+fn left_behind(helpers: &[Helper], now: i64) -> Vec<Helper> {
+    helpers
+        .iter()
+        .filter(|h| h.teammate.is_none())
+        .map(|h| match h.status {
+            HelperStatus::Running | HelperStatus::Idle => {
+                Helper { status: HelperStatus::Failed, since: now, ..h.clone() }
+            }
+            _ => h.clone(),
+        })
+        .collect()
+}
+
+/// A member's process starts again: the agents the last one started, in its report, are left behind (see
+/// [`left_behind`]). Its conversation may be the same, so its session too: a tick alone could not tell.
+fn restarted(state: &Path, member: &str, now: i64) -> Result<()> {
+    let Some(mut report) = report(state, member).filter(|r| !r.helpers.is_empty()) else { return Ok(()) };
+    report.helpers = left_behind(&report.helpers, now);
+    write_atomic(&reports(state).join(format!("{member}.json")), &serde_json::to_string(&report)?)
+}
+
+/// The agents a member's session started now, from what its mod lists (`agents`, `$.agent.list()` as is) and what the
+/// last tick kept (`before`): each with the moment it was first seen and the moment its status was. A teammate has a
+/// `teammateId`, and leaves when the session no longer lists it; a subagent no longer listed is over (the session
+/// drops it a while after its end), and shows a while once over.
+pub fn helpers(before: &[Helper], agents: &[Value], now: i64) -> Vec<Helper> {
+    let text = |agent: &Value, key: &str| agent[key].as_str().unwrap_or_default().to_string();
+    let mut list: Vec<Helper> = agents
+        .iter()
+        .filter_map(|agent| {
+            let id = agent["id"].as_str().filter(|id| !id.is_empty())?;
+            let teammate = agent["teammateId"].as_str().filter(|t| !t.is_empty()).map(|address| {
+                // `<name>@<team>`, when it has no name of its own.
+                agent["name"].as_str().filter(|n| !n.is_empty()).unwrap_or(address.split('@').next().unwrap_or(address))
+            });
+            let status = match (agent["status"].as_str().unwrap_or_default(), teammate.is_some()) {
+                ("completed", _) => HelperStatus::Done,
+                ("failed" | "killed", _) => HelperStatus::Failed,
+                ("idle" | "waiting", true) => HelperStatus::Idle,
+                _ => HelperStatus::Running,
+            };
+            let was = before.iter().find(|h| h.id == id);
+            Some(Helper {
+                id: id.to_string(),
+                kind: text(agent, "type"),
+                description: text(agent, "description"),
+                teammate: teammate.map(String::from),
+                status,
+                started: was.map_or(now, |h| h.started),
+                since: was.filter(|h| h.status == status).map_or(now, |h| h.since),
+            })
+        })
+        .collect();
+    let over: Vec<Helper> = before
+        .iter()
+        .filter(|h| h.teammate.is_none() && !list.iter().any(|listed| listed.id == h.id))
+        .cloned()
+        .map(|h| match h.status {
+            HelperStatus::Running | HelperStatus::Idle => Helper { status: HelperStatus::Done, since: now, ..h },
+            _ => h,
+        })
+        .collect();
+    list.extend(over);
+    list.retain(|h| h.shown(now));
+    list.sort_by(|a, b| (a.started, &a.id).cmp(&(b.started, &b.id)));
+    list
 }
 
 impl Report {
@@ -359,6 +510,7 @@ fn start(snapshot: &Snapshot, state: &Path, member: &str, input: &Value) -> Resu
         // At best: the mod would not start at all otherwise.
         let _ = started(snapshot, state, session, info);
     }
+    let _ = restarted(state, member, board::now());
     Ok(json!({ "register": register, "quiet": info.is_some_and(|m| m.quiet) }))
 }
 
@@ -371,6 +523,7 @@ fn tick(snapshot: &Snapshot, state: &Path, member: &str, input: &Value) -> Resul
     let before = report(state, member).unwrap_or_default();
     let mut report: Report = serde_json::from_value(input.clone()).unwrap_or_default();
     report.at = now;
+    report.helpers = helpers_now(&before, input, now);
     // Just compacted, the session tells no context until it answers again: the breakdown's count stands in, asked at
     // once, until the session answers.
     let compacted = input["compaction"]["done"] == true;
@@ -1269,5 +1422,117 @@ mod tests {
         let manifest: Value = serde_json::from_str(FILES[0].1).unwrap();
         assert_eq!(manifest["name"], "recruit");
         assert!(FILES[2].1.contains("'_mod'"));
+    }
+
+    #[test]
+    fn subagents_from_launch_to_end() {
+        let agent = |id: &str, kind: &str, status: &str| json!({ "id": id, "type": kind, "description": format!("{id} work"), "status": status });
+        let list = |agents: Vec<Value>| agents;
+        let states = |list: &[Helper]| list.iter().map(|h| (h.id.clone(), h.status, h.since)).collect::<Vec<_>>();
+        // Started: seen from now on.
+        let first = helpers(&[], &list(vec![agent("a", "Explore", "running")]), 100);
+        assert_eq!((first[0].kind.as_str(), first[0].description.as_str()), ("Explore", "a work"));
+        assert_eq!((first[0].teammate.as_ref(), first[0].started), (None, 100));
+        // A second one, held, and the first between two turns: both at work; the first keeps its start.
+        let both = helpers(&first, &list(vec![agent("a", "Explore", "idle"), agent("b", "Plan", "waiting")]), 104);
+        assert_eq!(states(&both), [("a".into(), HelperStatus::Running, 100), ("b".into(), HelperStatus::Running, 104)]);
+        // Done, stopped: over since the moment seen so, which stays.
+        let over = helpers(&both, &list(vec![agent("a", "Explore", "completed"), agent("b", "Plan", "killed")]), 110);
+        let later = helpers(&over, &list(vec![agent("a", "Explore", "completed")]), 115);
+        assert_eq!(states(&later), [("a".into(), HelperStatus::Done, 110), ("b".into(), HelperStatus::Failed, 110)]);
+        // Done ten seconds ago: gone; failed, still there a while.
+        let gone = helpers(&later, &list(Vec::new()), 120);
+        assert_eq!(states(&gone), [("b".into(), HelperStatus::Failed, 110)]);
+        assert!(helpers(&gone, &list(Vec::new()), 140).is_empty());
+        // One the session no longer lists while at work: over.
+        let dropped = helpers(&first, &list(Vec::new()), 105);
+        assert_eq!(states(&dropped), [("a".into(), HelperStatus::Done, 105)]);
+    }
+
+    #[test]
+    fn teammates_until_no_longer_listed() {
+        let mate = |status: &str| {
+            json!({ "id": "m1", "type": "reviewer", "description": "review", "status": status,
+                    "teammateId": "critic@web", "name": "critic" })
+        };
+        let one = |status: &str| vec![mate(status)];
+        let first = helpers(&[], &one("running"), 100);
+        assert_eq!((first[0].teammate.as_deref(), first[0].status), (Some("critic"), HelperStatus::Running));
+        // Waiting for a message: idle, since then.
+        let idle = helpers(&first, &one("idle"), 130);
+        assert_eq!((idle[0].status, idle[0].since, idle[0].started), (HelperStatus::Idle, 130, 100));
+        // Done, it stays while listed; once no longer listed, it leaves.
+        let done = helpers(&idle, &one("completed"), 200);
+        assert_eq!(helpers(&done, &one("completed"), 400)[0].status, HelperStatus::Done);
+        assert!(helpers(&done, &[], 210).is_empty());
+        // A ghost: the same word half an hour, unknown; two hours, gone.
+        let still = helpers(&first, &one("running"), 100 + TEAMMATE_UNKNOWN);
+        assert!(still[0].unknown(100 + TEAMMATE_UNKNOWN) && !first[0].unknown(101));
+        assert!(helpers(&still, &one("running"), 100 + TEAMMATE_DROPPED).is_empty());
+        // Without a name, the address's.
+        let bare = json!({ "id": "m2", "type": "x", "description": "", "status": "running", "teammateId": "solo@web" });
+        assert_eq!(helpers(&[], &[bare], 1)[0].teammate.as_deref(), Some("solo"));
+    }
+
+    #[test]
+    fn same_session_new_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let agent =
+            |id: &str, status: &str| json!({ "id": id, "type": "Explore", "description": "", "status": status });
+        let mate =
+            json!({ "id": "m", "type": "x", "description": "", "status": "running", "teammateId": "critic@web" });
+        let helpers = helpers(&[], &[agent("a", "running"), agent("b", "completed"), mate], 100);
+        let before = Report { session: Some("s1".into()), at: 100, helpers, ..Default::default() };
+        fs::create_dir_all(reports(state)).unwrap();
+        write_atomic(&reports(state).join("dev.json"), &serde_json::to_string(&before).unwrap()).unwrap();
+        // Started again on the same conversation: the subagent at work was stopped, the one done stays, the teammate
+        // went; the next tick, same session, keeps it so.
+        restarted(state, "dev", 106).unwrap();
+        let after = report(state, "dev").unwrap();
+        let states: Vec<(&str, HelperStatus, i64)> =
+            after.helpers.iter().map(|h| (h.id.as_str(), h.status, h.since)).collect();
+        assert_eq!(states, [("a", HelperStatus::Failed, 106), ("b", HelperStatus::Done, 100)]);
+        let next = helpers_now(&after, &json!({ "session": "s1", "agents": [] }), 108);
+        assert_eq!(next.iter().map(|h| h.status).collect::<Vec<_>>(), [HelperStatus::Failed, HelperStatus::Done]);
+        // Nothing to leave behind: no report written.
+        restarted(state, "nobody", 106).unwrap();
+        assert!(report(state, "nobody").is_none());
+    }
+
+    #[test]
+    fn subagent_listed_again_once_done() {
+        let agent = |status: &str| json!({ "id": "a", "type": "Explore", "description": "", "status": status });
+        let done = helpers(&helpers(&[], &[agent("running")], 100), &[agent("completed")], 105);
+        // Woken by a message, under the same id: at work again, since then, from its first start.
+        let again = helpers(&done, &[agent("running")], 108);
+        assert_eq!((again[0].status, again[0].started, again[0].since), (HelperStatus::Running, 100, 108));
+    }
+
+    #[test]
+    fn helpers_from_a_tick() {
+        let agent =
+            |id: &str, status: &str| json!({ "id": id, "type": "Explore", "description": "", "status": status });
+        let report = |input: &Value, before: &Report, now| Report {
+            session: input["session"].as_str().map(String::from),
+            helpers: helpers_now(before, input, now),
+            ..Default::default()
+        };
+        let first = report(
+            &json!({ "session": "s1", "agents": [agent("a", "running"), agent("b", "completed")] }),
+            &Report::default(),
+            100,
+        );
+        assert_eq!(first.helpers.len(), 2);
+        // The session could not list them: as they were, their times too.
+        let failed = report(&json!({ "session": "s1", "agents": null }), &first, 104);
+        assert_eq!(failed.helpers, first.helpers);
+        // An older mod, which never lists them: none.
+        assert!(report(&json!({ "session": "s1" }), &first, 104).helpers.is_empty());
+        // The member started again: those at work were stopped with the session, those done stay done.
+        let again = report(&json!({ "session": "s2", "agents": [] }), &first, 106);
+        let states: Vec<(&str, HelperStatus, i64)> =
+            again.helpers.iter().map(|h| (h.id.as_str(), h.status, h.since)).collect();
+        assert_eq!(states, [("a", HelperStatus::Failed, 106), ("b", HelperStatus::Done, 100)]);
     }
 }

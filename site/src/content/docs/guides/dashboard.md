@@ -40,6 +40,15 @@ With [recruit's mod](/recruit/guides/claude-code/#recruits-mod), loaded with Cla
 Haiku writes both forms of the line in the same call, once per new request, through the member's session and so on your account: the request read up to 2,000 characters, two lines back.
 :::
 
+### Subagents and teammates
+
+When a member hands part of its work to agents of its own, they show under its card, with [recruit's mod](/recruit/guides/claude-code/#recruits-mod):
+
+- **A subagent**, one the member started for a task, gets a line under an hourglass: its type, what it was asked, and for how long it has been working. The line is yellow while it works. Once done, it turns to a dimmed ✓ for about ten seconds, then goes. One that failed or was stopped turns to a red ✗ and stays about thirty seconds. A subagent started by a subagent gets its own line too, in the same list.
+- **A teammate**, an agent of a Claude Code team that the member started, gets a line under a person: its name, and for how long it has been in its state. Yellow at work, dimmed while it waits for a message, red if it failed. The line stays as long as the member's session lists the teammate. A teammate whose state has not changed for half an hour shows `?`: its pane may have died. After two hours, the line goes.
+
+They only get the room left once every card shows what its member does: they never shorten a member's task, whether it is theirs or another member's. Short of room, a card counts them on one line ("⧗ 2 subagents   ♙ 1 teammate", or "⧗ 2 · ♙ 1" in a narrow pane), then leaves them out. The [team's menu](/recruit/guides/menu/) does not show them: there is nothing to set on them.
+
 ### Compacting a conversation
 
 A click on the context of a member at rest, marked ⟳, offers to compact its conversation, once you confirm. It is what Claude Code would do on its own at the threshold, and costs as much: the member's model rereads its whole context to sum it up. A member that went back to work meanwhile refuses. Until the member's next answer, the card then shows the context as Claude Code counts it, like `/context`.
@@ -52,7 +61,7 @@ The cards come in this order: the contacts, the agents waiting for you, those at
 - side by side with another card, with one line or none;
 - for a working agent at rest, only its name, in a list below the cards.
 
-The agents at work keep the whole width and their whole task as long as the others can make room: those at rest longest go into the list first, and the list comes down to one line ("… and 3 more") before an agent at work loses any of its task. The layout changes only when the cards, their states or the pane change.
+The agents at work keep the whole width and their whole task as long as the others can make room: those at rest longest go into the list first, and the list comes down to one line ("… and 3 more") before an agent at work loses any of its task. Subagents and teammates come last: they take only the room the cards and the names leave, listed, then counted, then left out. The layout changes only when the cards, their states or the pane change.
 
 When sessions open elsewhere use members' names, a dimmed line over the usage names them, if room is left.
 

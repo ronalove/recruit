@@ -90,6 +90,27 @@ pub(crate) enum Glyphs {
     Nerd,
 }
 
+impl Glyphs {
+    /// The sign of a subagent, there for a while: an hourglass, one column wide (not ⏳, which takes two).
+    pub(crate) fn hourglass(self) -> char {
+        match self {
+            // nf-md-timer_sand
+            Glyphs::Nerd => '\u{F051F}',
+            Glyphs::Unicode => '⧗',
+        }
+    }
+
+    /// The sign of a teammate of the session's own team: a person, one column wide (a pawn: ☺ and ♟ may be drawn as
+    /// emoji, two columns).
+    pub(crate) fn person(self) -> char {
+        match self {
+            // nf-md-account
+            Glyphs::Nerd => '\u{F0004}',
+            Glyphs::Unicode => '♙',
+        }
+    }
+}
+
 /// Terminals that carry the Nerd Font symbols themselves, whatever font the user picked.
 pub(crate) const NERD_TERMINALS: [&str; 3] = ["ghostty", "kitty", "wezterm"];
 
@@ -208,6 +229,15 @@ mod tests {
         assert_eq!(State::Working.icon(Glyphs::Nerd, frame(Duration::from_millis(1000))), '⠋');
         assert_eq!(State::Idle.icon(Glyphs::Unicode, 3), '◷');
         assert_eq!(State::Waiting.icon(Glyphs::Nerd, 3), '\u{F009E}');
+    }
+
+    #[test]
+    fn helpers_signs_one_column_wide() {
+        use unicode_width::UnicodeWidthChar;
+        for glyphs in [Glyphs::Unicode, Glyphs::Nerd] {
+            assert_eq!(glyphs.hourglass().width(), Some(1), "{glyphs:?}");
+            assert_eq!(glyphs.person().width(), Some(1), "{glyphs:?}");
+        }
     }
 
     #[test]

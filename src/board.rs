@@ -18,7 +18,7 @@ use crossterm::terminal::{self, ClearType};
 use crossterm::{cursor, queue};
 use serde::{Deserialize, Serialize};
 
-use crate::bridge::{Report, Task};
+use crate::bridge::{Helper, HelperStatus, Report, Task};
 use crate::claude::{self, Running};
 use crate::config::{TmuxSettings, write_atomic};
 use crate::i18n::Lang;
@@ -149,6 +149,8 @@ struct Card {
     doing: Option<Task>,
     /// Its state each second, as (time, working).
     samples: Vec<(i64, bool)>,
+    /// The agents its session started: subagents, teammates.
+    helpers: Vec<Helper>,
 }
 
 /// How near a session is to compacting on its own, which colors its context.
@@ -282,6 +284,18 @@ struct Memory {
     sessions: HashMap<String, (String, Instant)>,
 }
 
+/// Older than this, in seconds, a member's report says nothing of the agents it started: its mod ticks every 2 s.
+const FRESH_REPORT: i64 = 10;
+
+/// The agents a member's session started that its card shows at `now`: while its mod reports (a member stopped took
+/// them along), those still shown.
+fn helpers_shown(report: &Report, now: i64) -> Vec<Helper> {
+    if now - report.at > FRESH_REPORT {
+        return Vec::new();
+    }
+    report.helpers.iter().filter(|h| h.shown(now)).cloned().collect()
+}
+
 /// How long the dashboard remembers a session it no longer sees, under its last name.
 const KEEP: Duration = Duration::from_secs(60);
 
@@ -341,6 +355,7 @@ impl Memory {
             let report = bridge::report(state, &member.name).unwrap_or_default();
             let (model, effort) = bridge::model_and_effort(state, member);
             let context = report.context.as_ref();
+            let helpers = helpers_shown(&report, now);
             board.cards.push(Card {
                 name: member.name.clone(),
                 color: member_color(s, &member.name),
@@ -353,6 +368,7 @@ impl Memory {
                 effort: effort.filter(|e| bridge::EFFORTS.contains(&e.as_str())),
                 doing: bridge::doing(state, &member.name),
                 samples: samples.iter().copied().collect(),
+                helpers,
             });
         }
         // Those no longer in the team, forgotten; but for a while those whose session may come back under another name.
@@ -680,7 +696,7 @@ fn header(b: &Board, width: usize) -> String {
 }
 
 /// How a piece of a line is painted.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Paint {
     Plain,
     Dim,
@@ -872,9 +888,27 @@ fn column_widths(width: usize, columns: usize) -> Vec<usize> {
 }
 
 /// The lines a card `width` wide takes: its title and its curve, and in between what the member does over at most
-/// `lines` lines.
-fn card_height(c: &Card, width: usize, lines: usize) -> usize {
-    2 + if lines == 0 { 0 } else { doing_lines(c, width, lines).len() }
+/// `lines` lines, then the agents its session started, as `helpers` says.
+fn card_height(c: &Card, width: usize, lines: usize, helpers: Helpers) -> usize {
+    2 + if lines == 0 { 0 } else { doing_lines(c, width, lines).len() } + helper_lines(c, helpers)
+}
+
+/// How the agents a member's session started show on its card: one line each, else counted on one line, else not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Helpers {
+    Listed,
+    Counted,
+    Left,
+}
+
+/// The lines they take.
+fn helper_lines(c: &Card, helpers: Helpers) -> usize {
+    match helpers {
+        _ if c.helpers.is_empty() => 0,
+        Helpers::Listed => c.helpers.len(),
+        Helpers::Counted => 1,
+        Helpers::Left => 0,
+    }
 }
 
 /// The dashboard's parts, in order: the contacts, the working agents at work or waiting for the user, those at rest.
@@ -905,19 +939,24 @@ fn ordered(cards: &[Card]) -> Vec<&Card> {
 /// for a working agent at rest, only its name in a list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Form {
-    Card { half: bool, lines: usize },
+    Card { half: bool, lines: usize, helpers: Helpers },
     Named,
 }
 
-/// A card's forms as room runs out: what the member does over two lines, then one; then beside another, when two hold
-/// side by side; then without what it does; a working agent at rest ends in the list of names.
+/// A card's forms as room runs out: with the agents its session started, one a line, then counted, then without them,
+/// what the member does over two lines all along (it never gives it up for them); then over one line; then beside
+/// another, when two hold side by side; then without what it does; a working agent at rest ends in the list of names.
 fn forms(c: &Card, two: bool) -> Vec<Form> {
-    let card = |half, lines| Form::Card { half, lines };
-    let mut forms = vec![card(false, 2), card(false, 1)];
+    let card = |half, lines, helpers| Form::Card { half, lines, helpers };
+    let mut forms = Vec::new();
+    if !c.helpers.is_empty() {
+        forms.extend([card(false, 2, Helpers::Listed), card(false, 2, Helpers::Counted)]);
+    }
+    forms.extend([card(false, 2, Helpers::Left), card(false, 1, Helpers::Left)]);
     if two {
-        forms.extend([card(true, 1), card(true, 0)]);
+        forms.extend([card(true, 1, Helpers::Left), card(true, 0, Helpers::Left)]);
     } else {
-        forms.push(card(false, 0));
+        forms.push(card(false, 0, Helpers::Left));
     }
     if !c.contact && resting(c) {
         forms.push(Form::Named);
@@ -930,7 +969,7 @@ fn forms(c: &Card, two: bool) -> Vec<Form> {
 /// at all.
 #[derive(Debug, Default)]
 struct Layout<'a> {
-    rows: Vec<Vec<(&'a Card, usize)>>,
+    rows: Vec<Vec<(&'a Card, usize, Helpers)>>,
     named: Vec<&'a Card>,
     whole: bool,
     more: usize,
@@ -947,6 +986,10 @@ enum Names {
     Counted,
 }
 
+/// A card of the list by its place in it, with the lines it gives what the member does and how the agents its session
+/// started show.
+type Placed = (usize, usize, Helpers);
+
 /// The cards of `list`, in its order, over `room` lines of a pane `width` wide, each in its own form. `list` goes from
 /// what matters most to what matters least: the contacts, the agents waiting for the user, at work, at rest from the
 /// latest. In that order, each card takes the richest form that still leaves room for all those after it in their
@@ -955,50 +998,56 @@ enum Names {
 /// line while the cards choose; all of them if they hold once the cards have. A card with nothing to say of what the
 /// member does only goes across the pane after that, with the room left. Even all in their barest form too many: the
 /// first cards that hold, the agents at rest only counted with the others while the cards choose, then named if they
-/// still hold.
+/// still hold. The agents a member's session started, under its card, only get the room left then: listed, else
+/// counted; they never take what the members do.
 ///
-/// The same cards always get the same layout: it changes only with them, their states or the pane.
+/// The same cards always get the same layout: it changes only with them, their states, the agents their sessions
+/// started or the pane.
 fn arrange<'a>(list: &[&'a Card], width: usize, room: usize) -> Layout<'a> {
     let two = width >= 2 * MIN_CARD;
     let ladders: Vec<Vec<Form>> = list.iter().map(|c| forms(c, two)).collect();
     // Each card's height across the pane and in the narrower column, for each number of lines, measured once.
     let half = column_widths(width, 2)[0];
-    let heights: Vec<[[usize; 3]; 2]> =
-        list.iter().map(|c| [width, half].map(|w| [0, 1, 2].map(|lines| card_height(c, w, lines)))).collect();
-    let tall = |i: usize, half: bool, lines: usize| heights[i][usize::from(half)][lines];
+    let heights: Vec<[[usize; 3]; 2]> = list
+        .iter()
+        .map(|c| [width, half].map(|w| [0, 1, 2].map(|lines| card_height(c, w, lines, Helpers::Left))))
+        .collect();
+    let tall = |i: usize, half: bool, lines: usize, helpers: Helpers| {
+        heights[i][usize::from(half)][lines] + helper_lines(list[i], helpers)
+    };
 
     // The layout for each card's form, the first `shown` cards only; and the lines it takes.
     let build = |levels: &[usize], shown: usize, names: Names| -> (Layout<'a>, usize) {
         let mut layout = Layout { whole: names == Names::Whole, ..Default::default() };
-        let mut rows: Vec<(Vec<(usize, usize)>, usize)> = Vec::new();
+        let mut rows: Vec<(Vec<Placed>, usize)> = Vec::new();
         let mut placed = 0;
         // Cards side by side, two by two in their order; one left over goes across.
-        let mut run: Vec<(usize, usize)> = Vec::new();
-        let pair = |run: &mut Vec<(usize, usize)>, rows: &mut Vec<(Vec<(usize, usize)>, usize)>| {
+        let mut run: Vec<Placed> = Vec::new();
+        let pair = |run: &mut Vec<Placed>, rows: &mut Vec<(Vec<Placed>, usize)>| {
             for two in run.chunks(2) {
                 let height = match two {
-                    [(i, lines)] => tall(*i, false, *lines),
-                    _ => two.iter().map(|&(i, lines)| tall(i, true, lines)).max().unwrap_or(0),
+                    [(i, lines, helpers)] => tall(*i, false, *lines, *helpers),
+                    _ => two.iter().map(|&(i, lines, helpers)| tall(i, true, lines, helpers)).max().unwrap_or(0),
                 };
                 rows.push((two.to_vec(), height));
             }
             run.clear();
         };
         for (i, c) in list.iter().enumerate() {
-            if run.first().is_some_and(|&(j, _)| section(list[j]) != section(c)) {
+            if run.first().is_some_and(|&(j, ..)| section(list[j]) != section(c)) {
                 pair(&mut run, &mut rows);
             }
             match ladders[i][levels[i]] {
                 Form::Named if names == Names::Counted => layout.more += 1,
                 Form::Named => layout.named.push(c),
                 Form::Card { .. } if placed == shown => layout.more += 1,
-                Form::Card { half, lines } => {
+                Form::Card { half, lines, helpers } => {
                     placed += 1;
                     if half {
-                        run.push((i, lines));
+                        run.push((i, lines, helpers));
                     } else {
                         pair(&mut run, &mut rows);
-                        rows.push((vec![(i, lines)], tall(i, false, lines)));
+                        rows.push((vec![(i, lines, helpers)], tall(i, false, lines, helpers)));
                     }
                 }
             }
@@ -1006,8 +1055,10 @@ fn arrange<'a>(list: &[&'a Card], width: usize, room: usize) -> Layout<'a> {
         pair(&mut run, &mut rows);
         let mut height = rows.iter().map(|(_, h)| h + 1).sum::<usize>().saturating_sub(1);
         height += usize::from(layout.more > 0) + resting_names(&layout.named, width, layout.whole).len();
-        layout.rows =
-            rows.into_iter().map(|(row, _)| row.into_iter().map(|(i, lines)| (list[i], lines)).collect()).collect();
+        layout.rows = rows
+            .into_iter()
+            .map(|(row, _)| row.into_iter().map(|(i, lines, helpers)| (list[i], lines, helpers)).collect())
+            .collect();
         (layout, height)
     };
     let fits = |levels: &[usize], shown: usize, names: Names| build(levels, shown, names).1 <= room;
@@ -1039,14 +1090,17 @@ fn arrange<'a>(list: &[&'a Card], width: usize, room: usize) -> Layout<'a> {
                 .unwrap_or(was);
         }
     };
-    // What the members do first. Across the pane, a card that says nothing more than beside another: it waits for
-    // the names.
+    // What the members do first, without the agents their sessions started: those of a card would take the room of
+    // what the next ones do. Across the pane, a card that says nothing more than beside another: it waits for the
+    // names.
     let plain = |i: usize| list[i].doing.is_none();
     let beside = |i: usize| ladders[i].iter().position(|f| matches!(f, Form::Card { half: true, .. }));
-    choose(&mut levels, names, &|i| if plain(i) { beside(i).unwrap_or(0) } else { 0 });
+    let bare =
+        |i: usize| ladders[i].iter().position(|f| matches!(f, Form::Card { helpers: Helpers::Left, .. })).unwrap_or(0);
+    choose(&mut levels, names, &|i| if plain(i) { beside(i).unwrap_or(0) } else { bare(i) });
     // Then the names: all of them if they hold, else on one line, else only counted.
     let names = [Names::Whole, Names::Line].into_iter().find(|&names| fits(&levels, shown, names)).unwrap_or(names);
-    // The room left, to the cards that say nothing more across the pane.
+    // The room left, to the agents the sessions started and to the cards that say nothing more across the pane.
     choose(&mut levels, names, &|_| 0);
     build(&levels, shown, names).0
 }
@@ -1054,12 +1108,15 @@ fn arrange<'a>(list: &[&'a Card], width: usize, room: usize) -> Layout<'a> {
 /// Rows of cards, one across the pane or two side by side, an empty line between two rows, each as tall as its tallest
 /// card; each card a zone, and the context of a member at rest another, to compact it. The model, the effort and the
 /// time in columns from one card to the next of the same width.
-fn cards(rows: &[Vec<(&Card, usize)>], width: usize, b: &Board) -> Drawn {
-    let placed: Vec<Vec<(&Card, usize, usize)>> = rows
+fn cards(rows: &[Vec<(&Card, usize, Helpers)>], width: usize, b: &Board) -> Drawn {
+    let placed: Vec<Vec<(&Card, usize, usize, Helpers)>> = rows
         .iter()
-        .map(|row| row.iter().zip(column_widths(width, row.len())).map(|(&(c, lines), w)| (c, w, lines)).collect())
+        .map(|row| {
+            let widths = column_widths(width, row.len());
+            row.iter().zip(widths).map(|(&(c, lines, helpers), w)| (c, w, lines, helpers)).collect()
+        })
         .collect();
-    let right = |n: usize| Right::of(placed.iter().filter(|row| row.len() == n).flatten().map(|&(c, w, _)| (c, w)));
+    let right = |n: usize| Right::of(placed.iter().filter(|row| row.len() == n).flatten().map(|&(c, w, ..)| (c, w)));
     let rights = [right(1), right(2)];
     let mut drawn = Drawn::default();
     for (i, row) in placed.iter().enumerate() {
@@ -1069,7 +1126,7 @@ fn cards(rows: &[Vec<(&Card, usize)>], width: usize, b: &Board) -> Drawn {
         let top = drawn.len();
         let right = &rights[row.len() - 1];
         let row: Vec<(&Card, usize, Vec<String>)> =
-            row.iter().map(|&(c, w, lines)| (c, w, card(c, w, lines, right, b))).collect();
+            row.iter().map(|&(c, w, lines, helpers)| (c, w, card(c, w, lines, helpers, right, b))).collect();
         let mut col = 0;
         for (c, w, card) in &row {
             let zone = |kind, row, col, rows, cols| Zone { member: c.name.clone(), kind, row, col, rows, cols };
@@ -1155,18 +1212,20 @@ fn compaction_cells(c: &Card) -> Option<usize> {
     Some(2 + format!("{percent:.0} %").chars().count())
 }
 
-/// A card, `width` wide: its title, what the member does over at most `lines` lines, its curve and context. A capsule
-/// on the left in the state's color, on all its lines; the state read by its intensity: yellow and bold at work, red
-/// waiting for the user, faded at rest.
+/// A card, `width` wide: its title, what the member does over at most `lines` lines, the agents its session started
+/// as `helpers` says, its curve and context. A capsule on the left in the state's color, on all its lines; the state
+/// read by its intensity: yellow and bold at work, red waiting for the user, faded at rest.
 ///
 /// ```text
 /// ╻ ⠹ dev-mod            Opus █ xhigh   3m
 /// ┃   Je relis la maquette des cartes
+/// ┃   ⧗ Explore · Lire le tableau de bord  12s
 /// ╹   ⣀⣀⣠⣤⣶⣿⣿⣶⣤⣀⣀                   74 %
 /// ```
-fn card(c: &Card, width: usize, lines: usize, right: &Right, b: &Board) -> Vec<String> {
+fn card(c: &Card, width: usize, lines: usize, helpers: Helpers, right: &Right, b: &Board) -> Vec<String> {
     let doing = if lines == 0 { Vec::new() } else { doing_lines(c, width, lines) };
-    let height = 2 + doing.len();
+    let helpers = helpers_drawn(c, helpers, width.saturating_sub(4), b);
+    let height = 2 + doing.len() + helpers.len();
     let color = c.state.color();
     let line = if c.state == State::Waiting { Paint::Bold(color) } else { Paint::Color(color) };
     // From halfway down the first line to halfway down the last: two cards never touch.
@@ -1204,6 +1263,12 @@ fn card(c: &Card, width: usize, lines: usize, right: &Right, b: &Board) -> Vec<S
         let pad = " ".repeat(width.saturating_sub(4 + text.chars().count()));
         out.push(painted(&[bar(1 + i), ("   ".into(), Paint::Plain), (text, paint), (pad, Paint::Plain)], width));
     }
+    let above = out.len();
+    for (i, pieces) in helpers.into_iter().enumerate() {
+        let mut line = vec![bar(above + i), ("   ".into(), Paint::Plain)];
+        line.extend(pieces);
+        out.push(painted(&line, width));
+    }
     let mut bottom = vec![
         bar(height - 1),
         ("   ".into(), Paint::Plain),
@@ -1214,6 +1279,100 @@ fn card(c: &Card, width: usize, lines: usize, right: &Right, b: &Board) -> Vec<S
     bottom.push((" ".into(), Paint::Plain));
     out.push(painted(&bottom, width));
     out
+}
+
+/// The agents a member's session started, as `helpers` says, each line `width` wide: its sign, what it is and the time.
+/// A subagent under an hourglass, its type and what it was asked, the time since it started (until it ended): yellow
+/// at work, faded with ✓ once done, red with ✗ once failed or stopped. A teammate under a person, its name, the time
+/// in its status: yellow at work, faded waiting for a message or done, red once failed; faded under `?` when its
+/// status stayed the same too long (see [`bridge::TEAMMATE_UNKNOWN`]). Counted, both kinds on one line, yellow when
+/// one of them works.
+fn helpers_drawn(c: &Card, helpers: Helpers, width: usize, b: &Board) -> Vec<Vec<(String, Paint)>> {
+    let list = &c.helpers;
+    if list.is_empty() {
+        return Vec::new();
+    }
+    let at_work = Paint::Color(State::Working.color());
+    let failed = Paint::Color(State::Waiting.color());
+    match helpers {
+        Helpers::Left => Vec::new(),
+        Helpers::Counted => {
+            let subagents = list.iter().filter(|h| h.teammate.is_none()).count();
+            let teammates = list.len() - subagents;
+            // Each kind there: its sign, how many, and what they are.
+            let kinds: Vec<(char, usize, String)> = [
+                (b.glyphs.hourglass(), subagents, t!("sous-agent{}", "subagent{}", plural(subagents))),
+                (b.glyphs.person(), teammates, t!("teammate{}", "teammate{}", plural(teammates))),
+            ]
+            .into_iter()
+            .filter(|(_, n, _)| *n > 0)
+            .collect();
+            // The richest that holds on the line, its last column left blank: `⧗ 12 sous-agents   ♙ 3 teammates`,
+            // then `⧗ 12 · ♙ 3`, then the first kind alone, `⧗ 12`, then nothing.
+            let words =
+                kinds.iter().map(|(sign, n, what)| format!("{sign} {n} {what}")).collect::<Vec<_>>().join("   ");
+            let counts: Vec<String> = kinds.iter().map(|(sign, n, _)| format!("{sign} {n}")).collect();
+            let text = [words, counts.join(" · "), counts[0].clone()]
+                .into_iter()
+                .find(|text| text.chars().count() < width)
+                .unwrap_or_default();
+            let paint = if list.iter().any(|h| h.status == HelperStatus::Running && !h.unknown(b.now)) {
+                at_work
+            } else if list.iter().any(|h| h.status == HelperStatus::Failed) {
+                failed
+            } else {
+                Paint::Dim
+            };
+            vec![vec![(text, paint)]]
+        }
+        Helpers::Listed => list
+            .iter()
+            .map(|h| {
+                let (sign, label, secs) = match &h.teammate {
+                    Some(name) => {
+                        let sign = if h.unknown(b.now) { '?' } else { b.glyphs.person() };
+                        (sign, name.clone(), b.now - h.since)
+                    }
+                    None => {
+                        let sign = match h.status {
+                            HelperStatus::Done => '✓',
+                            HelperStatus::Failed => '✗',
+                            _ => b.glyphs.hourglass(),
+                        };
+                        let label = match h.description.trim() {
+                            "" => h.kind.clone(),
+                            text => format!("{} · {text}", h.kind),
+                        };
+                        let until = if h.status == HelperStatus::Running { b.now } else { h.since };
+                        (sign, label, until - h.started)
+                    }
+                };
+                let paint = match h.status {
+                    _ if h.unknown(b.now) => Paint::Dim,
+                    HelperStatus::Running => at_work,
+                    HelperStatus::Failed => failed,
+                    HelperStatus::Idle | HelperStatus::Done => Paint::Dim,
+                };
+                let time = duration(secs.max(0) as u64);
+                let label = fit(&label, width.saturating_sub(4 + time.chars().count()));
+                let gap = width.saturating_sub(4 + label.chars().count() + time.chars().count());
+                let plain = if paint == at_work { Paint::Plain } else { paint };
+                vec![
+                    (sign.to_string(), paint),
+                    (" ".into(), Paint::Plain),
+                    (label, plain),
+                    (" ".repeat(gap + 1), Paint::Plain),
+                    (time, plain),
+                    (" ".into(), Paint::Plain),
+                ]
+            })
+            .collect(),
+    }
+}
+
+/// The plural's `s`, in either language.
+fn plural(n: usize) -> &'static str {
+    if n > 1 { "s" } else { "" }
 }
 
 /// What the member does, over at most `lines` lines of a card `width` wide: the task in progress; at rest, the task
@@ -1685,6 +1844,7 @@ mod tests {
             effort: Some("xhigh".into()),
             doing: None,
             samples: (0..600).map(|i| (1000 - i, i % 3 == 0)).collect(),
+            helpers: Vec::new(),
         }
     }
 
@@ -1984,13 +2144,16 @@ mod tests {
         // In a state the dashboard does not know: the task as it was, faded, nothing done.
         let unknown = doing("ops", State::Other, "Je publie la version 0.6.2", Some("Version 0.6.2 publiée"));
         let right = Right { model: 4, effort: 7, time: 2 };
-        let line = card(&unknown, 50, 1, &right, &board(Vec::new()))[1].clone();
+        let line = card(&unknown, 50, 1, Helpers::Left, &right, &board(Vec::new()))[1].clone();
         assert_eq!(visible(&line).trim_end(), "┃   Je publie la version 0.6.2");
         assert!(line.contains(&"Je publie la version 0.6.2".dim().to_string()));
         // The model gave no form for it done: as it was.
         let undone = doing("review", State::Idle, "Je relis le clic", None);
         let right = Right { model: 4, effort: 7, time: 2 };
-        assert_eq!(visible(&card(&undone, 50, 1, &right, &board(Vec::new()))[1]).trim_end(), "┃   ✓ Je relis le clic");
+        assert_eq!(
+            visible(&card(&undone, 50, 1, Helpers::Left, &right, &board(Vec::new()))[1]).trim_end(),
+            "┃   ✓ Je relis le clic"
+        );
         // Short of room, the agent at rest goes first, into the list of names; the one at work keeps its task.
         let lines: Vec<String> = render(&board(cards), 50, 15).lines.iter().map(|l| visible(l)).collect();
         assert!(lines.iter().any(|l| l.trim_end() == "┃   Je relis la maquette des cartes"), "{lines:#?}");
@@ -2032,11 +2195,228 @@ mod tests {
         ]
     }
 
+    /// The contact at work over two lines, with what its session started: two subagents, one at work and one done,
+    /// and a teammate waiting for a message; the agent at rest with its task done.
+    fn with_helpers() -> Vec<Card> {
+        let helper = |id: &str, kind: &str, description: &str, teammate: Option<&str>, status, started, since| Helper {
+            id: id.into(),
+            kind: kind.into(),
+            description: description.into(),
+            teammate: teammate.map(String::from),
+            status,
+            started,
+            since,
+        };
+        let mut cards = long_and_short();
+        cards[0].helpers = vec![
+            helper("a", "Explore", "Lire le tableau de bord", None, HelperStatus::Running, 988, 988),
+            helper("b", "Plan", "Découper la tâche", None, HelperStatus::Done, 900, 996),
+            helper("m", "reviewer", "", Some("critic"), HelperStatus::Idle, 800, 940),
+        ];
+        cards
+    }
+
+    #[test]
+    fn helpers_under_the_card() {
+        let lines: Vec<String> = render(&board(with_helpers()), 70, 30).lines.iter().map(|l| visible(l)).collect();
+        let top = title(&lines, "coordinateur").unwrap();
+        let card: Vec<&str> = lines[top..top + 7].iter().map(|l| l.trim_end()).collect();
+        // Under what it does, one line each, the time on the right as on the title: since the start, until the end;
+        // in its status.
+        assert!(card[1].starts_with("┃   Je relis") && card[2].starts_with("┃   droite"), "{lines:#?}");
+        let helper = |line: &str, left: &str, time: &str| line.starts_with(left) && line.ends_with(time);
+        assert!(helper(card[3], "┃   ⧗ Explore · Lire le tableau de bord ", " 12s"), "{lines:#?}");
+        assert!(helper(card[4], "┃   ✓ Plan · Découper la tâche ", " 1m"), "{lines:#?}");
+        assert!(helper(card[5], "┃   ♙ critic ", " 1m"), "{lines:#?}");
+        assert_eq!(card[3].chars().count(), card[0].chars().count(), "{lines:#?}");
+        assert!(card[6].starts_with('╹'), "{lines:#?}");
+        // The card's zone holds them.
+        let drawn = render(&board(with_helpers()), 70, 30);
+        let zone = drawn.zones.iter().find(|z| z.member == "coordinateur" && z.kind == ZoneKind::Member).unwrap();
+        assert_eq!((zone.row, zone.rows), (top, 7));
+    }
+
+    #[test]
+    fn helpers_counted_then_left_before_what_they_do() {
+        let at = |height: usize| -> Vec<String> {
+            render(&board(with_helpers()), 70, height).lines.iter().map(|l| visible(l)).collect()
+        };
+        let middles = |lines: &[String]| {
+            let top = title(lines, "coordinateur").unwrap();
+            lines[top + 1..]
+                .iter()
+                .take_while(|l| l.starts_with('┃'))
+                .map(|l| l.trim_end().to_string())
+                .collect::<Vec<_>>()
+        };
+        let counted = format!(
+            "┃   ⧗ {}   ♙ {}",
+            t!("{} sous-agent{}", "{} subagent{}", 2, "s"),
+            t!("{} teammate{}", "{} teammate{}", 1, "")
+        );
+        // As the pane gets lower: one line each, then counted, then left out; what it does on two lines all along.
+        let mut seen = Vec::new();
+        for height in (10..=30).rev() {
+            let lines = at(height);
+            let Some(middles) = title(&lines, "coordinateur").map(|_| middles(&lines)) else { break };
+            let helpers = middles.len().saturating_sub(2);
+            if helpers > 0 || seen.last() != Some(&0) {
+                assert!(middles[0].starts_with("┃   Je relis") && middles[1].starts_with("┃   droite"), "{lines:#?}");
+            }
+            if helpers == 1 {
+                assert_eq!(middles[2], counted, "{lines:#?}");
+            }
+            if seen.last() != Some(&helpers) {
+                seen.push(helpers);
+            }
+        }
+        assert_eq!(seen[..3], [3, 1, 0], "{seen:?}");
+    }
+
+    fn helper(id: &str, teammate: Option<&str>, status: HelperStatus) -> Helper {
+        Helper {
+            id: id.into(),
+            kind: "Explore".into(),
+            description: format!("Lire {id}"),
+            teammate: teammate.map(String::from),
+            status,
+            started: 990,
+            since: 990,
+        }
+    }
+
+    /// Review's probe: the contact at work with six subagents, an agent at work on a task over two lines, one at rest.
+    fn probe() -> Vec<Card> {
+        let task = |now: &str| Some(Task { now: now.into(), done: None });
+        let mut contact =
+            Card { doing: task("Je répartis le travail"), ..sample_card("coordinateur", true, State::Working) };
+        contact.helpers = (0..6).map(|i| helper(&format!("f{i}"), None, HelperStatus::Running)).collect();
+        vec![
+            contact,
+            Card {
+                doing: task("Je corrige la route POST /api/links pour rendre le slug déjà donné à une URL connue"),
+                ..sample_card("backend", false, State::Working)
+            },
+            Card {
+                doing: Some(Task { now: "x".into(), done: Some("Version publiée".into()) }),
+                ..sample_card("dev", false, State::Idle)
+            },
+        ]
+    }
+
+    #[test]
+    fn helpers_never_take_what_the_next_ones_do() {
+        let doing = |lines: &[String], name: &str| -> Option<usize> {
+            let top = title(lines, name)?;
+            Some(lines[top + 1..].iter().take_while(|l| l.starts_with('┃')).filter(|l| !l.starts_with("┃   ⧗")).count())
+        };
+        let mut before: Option<(usize, Vec<Option<usize>>)> = None;
+        for height in 6..=40 {
+            let lines: Vec<String> = render(&board(probe()), 60, height).lines.iter().map(|l| visible(l)).collect();
+            let now: Vec<Option<usize>> = ["coordinateur", "backend", "dev"].map(|n| doing(&lines, n)).into();
+            // Never less of a task on a taller pane that shows the same cards (one more card, on a pane too low for all
+            // of them, comes in its barest form).
+            let same = |then: &[Option<usize>]| then.iter().zip(&now).all(|(a, b)| a.is_some() == b.is_some());
+            if let Some((was, then)) = before.as_ref().filter(|(_, then)| same(then)) {
+                for (i, (then, now)) in then.iter().zip(&now).enumerate() {
+                    if let (Some(then), Some(now)) = (then, now) {
+                        assert!(now >= then, "card {i}, {was} → {height} lines: {then} → {now}\n{lines:#?}");
+                    }
+                }
+            }
+            // The contact's subagents only once the agent at work, if it has a card, has its task whole. A pane too
+            // low for all the cards in their barest form shows the first ones only, before any subagent.
+            if lines.iter().any(|l| l.starts_with("┃   ⧗")) && now[1].is_some() {
+                assert_eq!(now[1], Some(2), "{height}: {lines:#?}");
+                assert!(!lines.iter().any(|l| l.starts_with('┃') && l.trim_end().ends_with('…')), "{lines:#?}");
+            }
+            before = Some((height, now));
+        }
+        // Tall enough, all of them.
+        let lines: Vec<String> = render(&board(probe()), 60, 40).lines.iter().map(|l| visible(l)).collect();
+        assert_eq!(lines.iter().filter(|l| l.starts_with("┃   ⧗")).count(), 6, "{lines:#?}");
+    }
+
+    #[test]
+    fn helper_line_as_wide_as_its_card() {
+        let mut cards = probe();
+        cards[0].helpers = vec![Helper {
+            description: "Lire tout le code du serveur et des tests pour trouver où les liens sont comptés".into(),
+            ..helper("long", None, HelperStatus::Running)
+        }];
+        let lines: Vec<String> = render(&board(cards), 60, 40).lines.iter().map(|l| visible(l)).collect();
+        let top = title(&lines, "coordinateur").unwrap();
+        let line = lines.iter().find(|l| l.starts_with("┃   ⧗")).unwrap();
+        // Cut before the time, which stays whole; as wide as the title.
+        assert!(line.trim_end().ends_with("… 10s"), "{line:?}");
+        assert_eq!(line.chars().count(), lines[top].chars().count(), "{lines:#?}");
+    }
+
+    #[test]
+    fn helpers_counted_as_the_line_holds() {
+        let mut card = sample_card("coordinateur", true, State::Working);
+        card.helpers = (0..12).map(|i| helper(&format!("f{i}"), None, HelperStatus::Running)).collect();
+        card.helpers.extend((0..3).map(|i| helper(&format!("m{i}"), Some("critic"), HelperStatus::Idle)));
+        let b = board(Vec::new());
+        let text = |card: &Card, width| -> String {
+            helpers_drawn(card, Helpers::Counted, width, &b).concat().into_iter().map(|(text, _)| text).collect()
+        };
+        let words = format!("⧗ 12 {}   ♙ 3 {}", t!("sous-agents", "subagents"), t!("teammates", "teammates"));
+        assert_eq!(text(&card, 60), words);
+        assert_eq!(text(&card, 20), "⧗ 12 · ♙ 3");
+        assert_eq!(text(&card, 8), "⧗ 12");
+        assert_eq!(text(&card, 4), "");
+        // Its color: yellow when one works, else red when one failed, else faded.
+        let paint = |card: &Card| helpers_drawn(card, Helpers::Counted, 60, &b)[0][0].1;
+        assert_eq!(paint(&card), Paint::Color(State::Working.color()));
+        let mut failed = card.clone();
+        failed.helpers = vec![helper("a", None, HelperStatus::Failed), helper("b", None, HelperStatus::Done)];
+        assert_eq!(paint(&failed), Paint::Color(State::Waiting.color()));
+        failed.helpers.remove(0);
+        assert_eq!(paint(&failed), Paint::Dim);
+    }
+
+    #[test]
+    fn helpers_only_while_the_mod_reports() {
+        let report = |at| Report {
+            at,
+            helpers: vec![
+                helper("a", None, HelperStatus::Running),
+                Helper { since: 900, ..helper("b", None, HelperStatus::Done) },
+            ],
+            ..Default::default()
+        };
+        // Done long ago: no longer shown.
+        assert_eq!(helpers_shown(&report(995), 1000).iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), ["a"]);
+        assert_eq!(helpers_shown(&report(1000 - FRESH_REPORT), 1000).len(), 1);
+        // A report older than that: the member stopped, they went with it.
+        assert!(helpers_shown(&report(1000 - FRESH_REPORT - 1), 1000).is_empty());
+    }
+
+    #[test]
+    fn teammate_gone_quiet_shows_unknown() {
+        let mut cards = with_helpers();
+        cards[0].helpers.clear();
+        cards[0].helpers.push(Helper {
+            id: "m".into(),
+            kind: "reviewer".into(),
+            description: String::new(),
+            teammate: Some("critic".into()),
+            status: HelperStatus::Running,
+            started: 0,
+            since: 1000 - bridge::TEAMMATE_UNKNOWN,
+        });
+        let lines: Vec<String> = render(&board(cards), 70, 30).lines.iter().map(|l| visible(l)).collect();
+        assert!(lines.iter().any(|l| l.starts_with("┃   ? critic")), "{lines:#?}");
+    }
+
     #[test]
     fn capsule_over_four_lines() {
         let right = Right { model: 4, effort: 7, time: 2 };
-        let lines: Vec<String> =
-            card(&long_and_short()[0], 50, 2, &right, &board(Vec::new())).iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = card(&long_and_short()[0], 50, 2, Helpers::Left, &right, &board(Vec::new()))
+            .iter()
+            .map(|l| visible(l))
+            .collect();
         let bars: Vec<char> = lines.iter().map(|l| l.chars().next().unwrap()).collect();
         assert_eq!(bars, ['╻', '┃', '┃', '╹']);
         assert_eq!(lines[1].trim_end(), "┃   Je relis la maquette des cartes et je corrige");
@@ -2048,7 +2428,8 @@ mod tests {
             }),
             ..sample_card("dev", false, State::Idle)
         };
-        let lines: Vec<String> = card(&done, 40, 2, &right, &board(Vec::new())).iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> =
+            card(&done, 40, 2, Helpers::Left, &right, &board(Vec::new())).iter().map(|l| visible(l)).collect();
         assert_eq!(lines[1].trim_end(), "┃   ✓ Version 0.6.2 publiée et poussée");
         assert_eq!(lines[2].trim_end(), "┃     dans le tap");
     }
@@ -2164,7 +2545,9 @@ mod tests {
     #[test]
     fn model_faded_effort_in_its_colors() {
         let right = Right { model: 6, effort: 7, time: 2 };
-        let title = card(&sample_card("dev", false, State::Working), 50, 0, &right, &board(Vec::new()))[0].clone();
+        let title = card(&sample_card("dev", false, State::Working), 50, 0, Helpers::Left, &right, &board(Vec::new()))
+            [0]
+        .clone();
         let dim = "\x1b[2m";
         assert!(title.contains(&format!("{dim}Opus")));
         let violet = "█".with(Color::AnsiValue(141)).to_string();
@@ -2654,7 +3037,7 @@ mod tests {
         let b = board(Vec::new());
         let column = |state| {
             let right = Right { model: 4, effort: 7, time: 2 };
-            let top = visible(&card(&sample_card("archi", false, state), 40, 0, &right, &b)[0]);
+            let top = visible(&card(&sample_card("archi", false, state), 40, 0, Helpers::Left, &right, &b)[0]);
             assert_eq!(top.chars().count(), 40);
             top.split("archi").next().unwrap().chars().count()
         };
