@@ -17,7 +17,7 @@ Avant de rendre un travail : `cargo fmt`, clippy sans avertissement, `cargo test
 
 ## Publier une version
 
-`scripts/release.sh X.Y.Z [notes.md]`, sur un Mac, depuis `main` propre et à jour : version dans Cargo.toml, vérifications, binaires macOS (chaîne d'Apple) et Linux musl statiques (cargo-zigbuild : `brew install zig cargo-zigbuild`), commit et étiquette `vX.Y.Z`, release GitHub par `gh` (connecté au compte ronalove) avec les archives et `SHA256SUMS`, puis formule régénérée et poussée dans le tap ronalove/homebrew-tap (son clone `../homebrew-tap`, ou `TAP_DIR`). `--dry-run` construit seulement, dans `target/dist/`. La formule ne s'édite pas à la main : son modèle est dans le script.
+`scripts/release.sh X.Y.Z [notes.md]`, sur un Mac, depuis `main` propre et à jour : version dans Cargo.toml, vérifications, binaires macOS (chaîne d'Apple) et Linux musl statiques (cargo-zigbuild : `brew install zig cargo-zigbuild`), commit et étiquette `vX.Y.Z`, release GitHub par `gh` (connecté au compte ronalove) avec les archives et `SHA256SUMS`, puis formule régénérée et poussée dans le tap ronalove/homebrew-tap (son clone `../homebrew-tap`, ou `TAP_DIR`). `--dry-run` construit seulement, dans `target/dist/`. La formule ne s'édite pas à la main : son modèle est dans le script. Avant toute publication, la formule et celles du tap passent la vérification de `brew tap` (fonction `check_formulae`, par `brew ruby`) : chaque formule doit se charger sur tous les systèmes et processeurs connus de Homebrew, sinon `brew tap ronalove/tap` refuse tout le tap et efface son clone (le 2026-10-09, `ccfaststatus.rb`, qui n'avait d'URL que dans `on_macos`). `brew install` et `brew update` ne la font pas : un tap cassé ne se voit qu'à un `brew tap` neuf.
 
 ## Organisation
 
