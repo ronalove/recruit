@@ -2,7 +2,7 @@
 
 recruit turns Claude Code into a lasting team of specialists. You set the direction; they split the work, build it, test it and ship it, day after day.
 
-![A team at work: the coordinator and the product lead on the left, who is on what on the right](site/src/assets/screenshots/team.png)
+![recruit at work: you ask the coordinator, it hands the work out, and the dashboard shows each specialist at work, then done](site/src/assets/screenshots/demo.gif)
 
 **[Website and documentation](https://ronalove.github.io/recruit/)** · [Version française](README.fr.md)
 

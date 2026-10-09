@@ -2,7 +2,7 @@
 
 recruit fait de Claude Code une équipe de spécialistes qui dure. Tu donnes le cap ; ils se répartissent le travail, le construisent, le testent et le livrent, jour après jour.
 
-![Une équipe au travail : le chef de projet et le chef de produit à gauche, qui fait quoi à droite](site/src/assets/screenshots/team-fr.png)
+![recruit au travail : tu demandes au chef de projet, il répartit le travail, et le tableau de bord montre chaque spécialiste au travail, puis la tâche finie](site/src/assets/screenshots/demo-fr.gif)
 
 **[Site et documentation](https://ronalove.github.io/recruit/fr/)** · [English version](README.md)
 

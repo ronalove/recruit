@@ -38,7 +38,7 @@ Avec la disposition par défaut, `layout = "auto"` :
 
 Dans une équipe en anglais, le premier onglet s'appelle « Contacts ». Le `tab` d'un membre peut prendre n'importe quel titre sauf ceux de recruit, dans les deux langues : « Interlocuteurs », « Contacts », « Agents (1) », « Agents (2) »… « Agents » seul est le groupe par défaut.
 
-![Un onglet d'agents de travail en grille 2 × 2, dont un qui attend une permission](../../../../assets/screenshots/agents-fr.png)
+![Un onglet d'agents de travail en grille 2 × 2, dont trois qui attendent une permission](../../../../assets/screenshots/agents-fr.png)
 
 ```toml
 [teams.web]

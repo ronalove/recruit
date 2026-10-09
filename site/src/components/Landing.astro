@@ -8,12 +8,12 @@ import '@fontsource-variable/schibsted-grotesk/wght.css';
 import '@fontsource-variable/jetbrains-mono/wght.css';
 import { strings, type Lang } from '../i18n/landing';
 
-import dashboardEn from '../assets/screenshots/dashboard.png';
-import dashboardFr from '../assets/screenshots/dashboard-fr.png';
 import journalEn from '../assets/screenshots/journal.png';
 import journalFr from '../assets/screenshots/journal-fr.png';
 import menuEn from '../assets/screenshots/menu.png';
 import menuFr from '../assets/screenshots/menu-fr.png';
+import agentsEn from '../assets/screenshots/agents.png';
+import agentsFr from '../assets/screenshots/agents-fr.png';
 import teamEn from '../assets/screenshots/team.png';
 import teamFr from '../assets/screenshots/team-fr.png';
 
@@ -34,12 +34,12 @@ const repo = 'https://github.com/ronalove/recruit';
 const brew = 'brew install ronalove/tap/recruit';
 
 const shots = {
-  en: { dashboard: dashboardEn, journal: journalEn, menu: menuEn, team: teamEn },
-  fr: { dashboard: dashboardFr, journal: journalFr, menu: menuFr, team: teamFr },
+  en: { journal: journalEn, menu: menuEn, agents: agentsEn, team: teamEn },
+  fr: { journal: journalFr, menu: menuFr, agents: agentsFr, team: teamFr },
 }[lang];
 
 // The first tab plays the animation; its still frame is the poster, and what reduced-motion users see.
-const poster = await getImage({ src: shots.dashboard, format: 'webp', width: 1000 });
+const poster = await getImage({ src: shots.team, format: 'webp', width: 1600 });
 const social = await getImage({ src: teamEn, format: 'png', width: 1200 });
 // The animation (public/media) is only written into the page when its files exist at build time: French prefers
 // demo-fr, and falls back to demo. Without any, the tab shows the still image.
@@ -189,23 +189,23 @@ const icons = {
                 {tab.id === 'dashboard' ? (
                   <>
                     {videoSources.length > 0 && (
-                      <video class="demo" autoplay muted loop playsinline preload="metadata" poster={poster.src} aria-label={tab.alt}>
+                      <video class="demo" width="1600" height="878" autoplay muted loop playsinline preload="metadata" poster={poster.src} aria-label={tab.alt}>
                         {videoSources.map((v) => <source src={v.src} type={v.type} />)}
                       </video>
                     )}
                     <Picture
                       class={videoSources.length > 0 ? 'still' : undefined}
-                      src={shots.dashboard}
+                      src={shots.team}
                       alt={tab.alt}
                       formats={["avif"]} fallbackFormat="webp"
-                      widths={[480, 720, 1000]}
-                      sizes="(min-width: 1000px) 640px, 100vw"
+                      widths={[640, 960, 1280, 1600, 2000]}
+                      sizes="(min-width: 1240px) 1192px, calc(100vw - 32px)"
                       loading="eager"
                     />
                   </>
                 ) : (
                   <Picture
-                    src={shots[tab.id]}
+                    src={shots[tab.id === 'dashboard' ? 'team' : tab.id]}
                     alt={tab.alt}
                     formats={["avif"]} fallbackFormat="webp"
                     widths={[640, 960, 1280, 1600, 2000]}
@@ -803,7 +803,7 @@ const icons = {
     min-height: 3.2em;
   }
   .stage {
-    height: clamp(220px, 56vw, 680px);
+    aspect-ratio: 1600 / 878;
     display: flex;
     align-items: center;
     justify-content: center;

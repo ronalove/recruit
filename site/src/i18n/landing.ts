@@ -37,7 +37,7 @@ export interface Strings {
   };
   tour: {
     title: string;
-    tabs: { id: 'dashboard' | 'journal' | 'menu' | 'team'; label: string; text: string; alt: string }[];
+    tabs: { id: 'dashboard' | 'journal' | 'menu' | 'agents'; label: string; text: string; alt: string }[];
   };
   perks: { icon: 'resume' | 'grow' | 'star'; title: string; text: string }[];
   proof: { title: string; text: string; members: string[] };
@@ -94,7 +94,7 @@ const en: Strings = {
         id: 'dashboard',
         label: "Who's on what",
         text: "Who's working, who's waiting for you, who just finished, and what each one is doing right now.",
-        alt: 'The recruit dashboard: one card per team member, with its state, model, effort and what it is doing.',
+        alt: 'A recruit team at work: the coordinator takes a request and hands it out, and the dashboard shows each member’s state and what it is doing.',
       },
       {
         id: 'journal',
@@ -109,10 +109,10 @@ const en: Strings = {
         alt: 'The recruit menu: a member’s card with its model, effort, role and instructions, next to the list of the team.',
       },
       {
-        id: 'team',
-        label: 'Your coordinator',
-        text: 'You talk to one member. It plans, delegates, follows up, and tells you when it’s done.',
-        alt: 'A recruit team in tmux: the coordinator on the left, the dashboard and the journal on the right.',
+        id: 'agents',
+        label: 'The specialists',
+        text: 'Each specialist works in its own pane. Watch any of them, or step in whenever you want.',
+        alt: 'The specialists tab of a recruit team: four panes side by side, one per member, each with its own conversation, its work and its pending question.',
       },
     ],
   },
@@ -197,7 +197,7 @@ const fr: Strings = {
         id: 'dashboard',
         label: 'Qui fait quoi',
         text: 'Qui travaille, qui t’attend, qui vient de finir, et ce que fait chacun en ce moment.',
-        alt: 'Le tableau de bord de recruit : une carte par membre, avec son état, son modèle, son effort et ce qu’il fait.',
+        alt: 'Une équipe recruit au travail : le coordinateur reçoit une demande et la répartit, et le tableau de bord montre l’état de chaque membre et ce qu’il fait.',
       },
       {
         id: 'journal',
@@ -212,10 +212,10 @@ const fr: Strings = {
         alt: 'Le menu de recruit : la fiche d’un membre avec son modèle, son effort, son rôle et ses instructions, à côté de la liste de l’équipe.',
       },
       {
-        id: 'team',
-        label: 'Ton coordinateur',
-        text: 'Tu parles à un seul membre. Il planifie, délègue, relance, et te dit quand c’est fait.',
-        alt: 'Une équipe recruit dans tmux : le coordinateur à gauche, le tableau de bord et le journal à droite.',
+        id: 'agents',
+        label: 'Les spécialistes',
+        text: 'Chaque spécialiste travaille dans son propre panneau. Regarde n’importe lequel, ou interviens quand tu veux.',
+        alt: 'L’onglet des spécialistes d’une équipe recruit : quatre panneaux côte à côte, un par membre, chacun avec sa conversation, son travail et sa question en attente.',
       },
     ],
   },

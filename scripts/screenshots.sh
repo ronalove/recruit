@@ -247,20 +247,19 @@ shoot_team() { # <lang> <sfx>
   local member message
   while IFS=$'\t' read -r member message; do send "$member" "$message"; done < <(tasks "$lang")
 
-  # Someone at work and someone waiting, once the first messages went round.
-  local given
+  # Someone at work and someone waiting, once the first messages went round; on a try again, someone at work.
+  local given try=1 taken=false
   given=$(date +%s)
-  scene() { (($(count working) >= 1 && $(count waiting) >= 1 && $(date +%s) - given >= 25)); }
+  scene() { (($(count working) >= 1 && ($(count waiting) >= 1 || try > 1) && $(date +%s) - given >= 12)); }
   local attach="tmux -L $SOCKET attach -t =$session"
-  local first try
+  local first
   first=$(t list-windows -t "=$session" -F '#{window_index}' | head -1)
 
   # The first tab: the contacts, the dashboard and the reduced journal. Filmed again, three times at most, when the
-  # scene changed meanwhile; not when it never came.
+  # scene changed meanwhile; when it does not come back, the image taken before stays.
   t select-window -t "=$session:$first"
   for try in 1 2 3; do
-    local came=true
-    wait_for 240 "working and waiting members at once" scene || came=false
+    if ! wait_for 240 "the scene (try $try)" scene && $taken; then break; fi
     film_clean team "$TEAM_SIZE" "$sfx" "$OUT/team$sfx.png" <<EOF || break
 Hide
 Type "$attach"
@@ -270,7 +269,8 @@ Show
 Sleep 500ms
 Screenshot "{{out}}/team{{sfx}}.png"
 EOF
-    if ! $came || scene; then break; fi
+    taken=true
+    scene && break
     echo "screenshots: the scene changed while filming, again ($try)" >&2
   done
   # The dashboard's close-up, out of the same image.
@@ -335,6 +335,24 @@ EOF
   $keep || t kill-session -t "=$session"
 }
 
+# The animation from its recording: the start as it was (the request typed, `typed` characters, and sent), the rest
+# sped up to fit about ANIM_LENGTH seconds, the last image held, the end word cut off (its last 2.5 s). Into
+# <video>.mp4 (H.264) and <video>.webm (VP9), VIDEO_WIDTH wide, and a GIF GIF_WIDTH wide.
+montage() { # <recording> <typed> <video> <gif>
+  local length start end fast
+  length=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$1")
+  read -r start end fast < <(awk -v l="$length" -v n="$2" -v a="$ANIM_LENGTH" 'BEGIN {
+    s = 1.5 + n * 0.03 + 0.7 + 2; e = l - 2.5; r = (e - s) / (a - s - 2); if (r < 1) r = 1
+    printf "%.2f %.2f %.3f\n", s, e, r }')
+  local cut="[0:v]trim=0:$start,setpts=PTS-STARTPTS[a];[0:v]trim=$start:$end,setpts=(PTS-STARTPTS)/$fast[b];"
+  cut+="[a][b]concat=n=2:v=1,tpad=stop_mode=clone:stop_duration=2"
+  ffmpeg -loglevel error -y -i "$1" -filter_complex "$cut,scale=$VIDEO_WIDTH:-2:flags=lanczos,fps=25" \
+    -c:v libx264 -preset slow -crf 26 -pix_fmt yuv420p -movflags +faststart -an "$3.mp4"
+  ffmpeg -loglevel error -y -i "$3.mp4" -c:v libvpx-vp9 -b:v 0 -crf 40 -row-mt 1 -an "$3.webm"
+  ffmpeg -loglevel error -y -i "$3.mp4" -vf "fps=10,scale=$GIF_WIDTH:-1:flags=lanczos,split[a][b];\
+[a]palettegen=max_colors=64:stats_mode=diff[p];[b][p]paletteuse=dither=none:diff_mode=rectangle" "$4"
+}
+
 # The animation: the request typed to the first contact, the work handed out, the cards at work and the messages in
 # the journal, until two working agents are done. Filmed whole, then the wait sped up to fit about ANIM_LENGTH seconds.
 shoot_anim() { # <lang> <sfx>
@@ -343,19 +361,24 @@ shoot_anim() { # <lang> <sfx>
   local lead request
   IFS=$'\t' read -r lead request < <(tasks "$lang" | head -1)
 
-  # Claude Code's welcome, which names the account's plan, out of the contacts' panes: the project's files shown
-  # there, as the user would before asking (`!` runs a command without Claude).
-  local contact file
+  # Claude Code's welcome, which names the account's plan, out of the contacts' panes: each does a first task before
+  # the recording, its own of the tasks file, or reading the project for the first one. (`!` and a command, typed by
+  # send-keys, reaches Claude as a message all the same.)
+  local contact first_task
+  first_task=$([[ $lang == fr ]] && echo "Lis README.md et TODO.md, puis attends ma demande." ||
+    echo "Read README.md and TODO.md, then wait for my request.")
   for contact in $(jq -r '.members[] | select(.contact) | .name' "$state/team.json"); do
-    for file in README.md TODO.md; do
-      private || break
-      # `!` on its own, as a key: typed with the rest at once, it reaches Claude as a message.
-      t send-keys -t "$(pane_of "$contact")" '!'
-      sleep 0.5
-      send "$contact" "cat $file"
-      sleep 2
-    done
+    if [[ $contact == "$lead" ]]; then
+      send "$contact" "$first_task"
+    else
+      send "$contact" "$(tasks "$lang" | awk -F '\t' -v m="$contact" '$1 == m { print $2 }' | grep . || echo "$first_task")"
+    fi
   done
+  t select-window -t "=$session:$(t list-windows -t "=$session" -F '#{window_index}' | head -1)"
+  sleep 5
+  rested() { (($(count working) == 0)); }
+  wait_for 180 "the contacts at rest" rested || true
+  sleep 4
   if private; then
     echo "screenshots: WARNING: no animation in $lang: the account's plan still shows" >&2
     $keep || t kill-session -t "=$session"
@@ -410,19 +433,7 @@ Wait+Screen@300s /$done_word/
 EOF
   wait
 
-  # The start as it was (the request typed and sent), the rest sped up, the last image held, the end word cut off.
-  local length start fast
-  length=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$tmp/anim.mp4")
-  start=$(awk -v n="${#request}" 'BEGIN { printf "%.2f", 1.5 + n * 0.03 + 0.7 + 2 }')
-  fast=$(awk -v l="$length" -v s="$start" -v a="$ANIM_LENGTH" \
-    'BEGIN { r = (l - 2.5 - s) / (a - s - 2); printf "%.3f", r < 1 ? 1 : r }')
-  local cut="[0:v]trim=0:$start,setpts=PTS-STARTPTS[a];[0:v]trim=$start:$length-2.5,setpts=(PTS-STARTPTS)/$fast[b];"
-  cut+="[a][b]concat=n=2:v=1,tpad=stop_mode=clone:stop_duration=2"
-  ffmpeg -loglevel error -y -i "$tmp/anim.mp4" -filter_complex "$cut,scale=$VIDEO_WIDTH:-2:flags=lanczos,fps=25" \
-    -c:v libx264 -preset slow -crf 26 -pix_fmt yuv420p -movflags +faststart -an "$MEDIA/demo$sfx.mp4"
-  ffmpeg -loglevel error -y -i "$MEDIA/demo$sfx.mp4" -c:v libvpx-vp9 -b:v 0 -crf 40 -row-mt 1 -an "$MEDIA/demo$sfx.webm"
-  ffmpeg -loglevel error -y -i "$MEDIA/demo$sfx.mp4" -vf "fps=10,scale=$GIF_WIDTH:-1:flags=lanczos,split[a][b];\
-[a]palettegen=max_colors=64:stats_mode=diff[p];[b][p]paletteuse=dither=none:diff_mode=rectangle" "$OUT/demo$sfx.gif"
+  montage "$tmp/anim.mp4" "${#request}" "$MEDIA/demo$sfx" "$OUT/demo$sfx.gif"
 
   $keep || t kill-session -t "=$session"
 }
@@ -449,7 +460,8 @@ for lang in "${langs[@]}"; do
   mkdir -p "$(dirname "$project")"
   cp -R "$DEMO/project" "$project"
   # Project settings, over the user's: the members answer in the demo's language, read none of the user's own
-  # instructions (paths and names would show), leave no memory behind, and run the tests without asking. The status
+  # instructions (paths and names would show), leave no memory behind, and read the project and run the tests without
+# asking (`bun outdated`, a task's, still asks: someone waits). The status
   # line is an empty one.
   language=English
   [[ $lang == fr ]] && language=French
@@ -459,7 +471,10 @@ for lang in "${langs[@]}"; do
     claudeMdExcludes: [($profile + "/CLAUDE.md"), ($profile + "/rules/**")],
     autoMemoryEnabled: false,
     autoDreamEnabled: false,
-    permissions: {allow: ["Bash(bun test)", "Bash(bun test:*)"]},
+    permissions: {allow: [
+      "Bash(bun test)", "Bash(bun test:*)", "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)",
+      "Bash(grep:*)", "Bash(find:*)", "Bash(wc:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)"
+    ]},
     statusLine: {type: "command", command: "true"}
   }' >"$project/.claude/settings.json"
   git -C "$project" init -q
