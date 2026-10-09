@@ -2,7 +2,7 @@
 name = "recruit"
 version = "1.1.2"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99"
 description = "Launch a team of Claude Code agents in tmux, each one knowing its role and its teammates"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/ronalove/recruit"
@@ -18,6 +18,9 @@ crossterm = "0.29.0"
 indexmap = { version = "2.14.2", features = ["serde"] }
 inquire = "0.9.4"
 libc = "0.2.190"
+# The multiplexer's terminal engine (src/mux/engine/ghostty.rs). Not on crates.io for Zig 0.16: a pinned revision,
+# whose Ghostty commit scripts/ghostty.sh builds (run it before cargo); kitty graphics left out.
+libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "8953a740bc378cec3e07e1f6ca949f0595eab19b", default-features = false }
 memchr = "2.8.3"
 memmap2 = "0.9.11"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -29,6 +32,8 @@ toml_edit = "0.25.15"
 unicode-width = "0.2.2"
 
 [dev-dependencies]
+# A terminal for the integration tests to read the screens back (tests/), not in the binary.
+alacritty_terminal = { version = "0.26.0", default-features = false }
 tempfile = "3.27.0"
 
 [profile.release]

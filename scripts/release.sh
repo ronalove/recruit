@@ -8,7 +8,8 @@
 #   scripts/release.sh --dry-run 0.2.0     build and package only, into target/dist/0.2.0/
 #   scripts/release.sh --formula 0.2.0     regenerate the tap's formula of a published release, from its SHA256SUMS
 #
-# Runs on a Mac: Apple's toolchain for macOS, cargo-zigbuild for Linux (brew install zig cargo-zigbuild).
+# Runs on a Mac: Apple's toolchain for macOS, cargo-zigbuild for Linux (brew install cargo-zigbuild). The terminal
+# engine, libghostty-vt, is built first by scripts/ghostty.sh, with its own Zig, which cargo-zigbuild then links with.
 # Needs gh logged in to GitHub, brew (it checks the formulae as `brew tap` does) and the tap (ronalove/homebrew-tap)
 # cloned next to this repository (or TAP_DIR=…).
 set -euo pipefail
@@ -175,7 +176,7 @@ if [[ $mode == formula ]]; then
 fi
 
 [[ $(uname) == Darwin ]] || die "run it on a Mac (Apple's toolchain builds the macOS binaries)"
-for tool in rustup cargo cargo-zigbuild zig gh shasum curl perl; do
+for tool in rustup cargo cargo-zigbuild gh shasum curl perl; do
   command -v "$tool" >/dev/null || die "$tool not found"
 done
 [[ -z $notes_file || -f $notes_file ]] || die "no such notes file: $notes_file"
@@ -198,6 +199,9 @@ echo "==> version $version"
 perl -0pi -e "s/^version = \"[^\"]*\"/version = \"$version\"/m" Cargo.toml
 cargo update -q --workspace --offline
 
+echo "==> libghostty-vt"
+scripts/ghostty.sh "${MAC_TARGETS[@]}" "${LINUX_TARGETS[@]}"
+
 echo "==> checks"
 cargo fmt --check
 cargo clippy -q --all-targets --locked -- -D warnings
@@ -214,7 +218,8 @@ for target in "${MAC_TARGETS[@]}"; do
 done
 for target in "${LINUX_TARGETS[@]}"; do
   # zig warns about every link; the filter keeps any other message.
-  cargo zigbuild -q --release --locked --target "$target" 2> >(grep -v -e "linker optimization setting" \
+  CARGO_ZIGBUILD_ZIG_PATH=$PWD/.ghostty/bin/zig cargo zigbuild -q --release --locked --target "$target" \
+    2> >(grep -v -e "linker optimization setting" \
     -e "linker_messages" -e "^ *|$" -e "^ *= note" -e "^warning: linker stderr" -e "^$" >&2)
 done
 native=target/aarch64-apple-darwin/release/recruit

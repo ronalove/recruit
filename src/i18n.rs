@@ -40,13 +40,12 @@ fn detect() -> Lang {
     let system = || sys_locale::get_locale().and_then(|l| from_locale(&l));
     let explicit = ["RECRUIT_LANG", "LC_ALL", "LC_MESSAGES"].into_iter().find_map(from_env);
     // On macOS, terminals set LANG themselves (Ghostty puts en_US.UTF-8 when it is missing), whatever the
-    // user's language: the system's preferred language says more.
-    let guessed = if cfg!(target_os = "macos") {
-        system().or_else(|| from_env("LANG"))
-    } else {
-        from_env("LANG").or_else(system)
+    // user's language: the system's preferred language says more. Asked only when nothing explicit answers: on
+    // macOS it starts threads (CoreFoundation), which `recruit _server` must not have before it forks.
+    let guessed = || {
+        if cfg!(target_os = "macos") { system().or_else(|| from_env("LANG")) } else { from_env("LANG").or_else(system) }
     };
-    explicit.or(guessed).unwrap_or(Lang::En)
+    explicit.or_else(guessed).unwrap_or(Lang::En)
 }
 
 /// "fr_FR.UTF-8", "fr-CA", "fr" → French; any other real locale → English; empty, "C" and "POSIX" say nothing.

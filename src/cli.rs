@@ -147,6 +147,20 @@ pub enum Command {
         #[arg(long, value_name = "MEMBER")]
         dismiss: Option<String>,
     },
+    /// Internal: a team's server, recruit's own multiplexer; detached, returns once it is ready
+    #[command(name = "_server", hide = true)]
+    Server {
+        /// The team's folder, under ~/.cache/recruit/teams/
+        state: std::path::PathBuf,
+    },
+    /// Internal: a team's server observed and driven without a terminal, for tests
+    #[command(name = "_ctl", hide = true)]
+    Ctl {
+        /// The team's folder, under ~/.cache/recruit/teams/
+        state: std::path::PathBuf,
+        #[command(subcommand)]
+        action: crate::mux::ctl::Action,
+    },
     /// Internal: the mod recruit puts in each member calls it, JSON in and out
     #[command(name = "_mod", hide = true)]
     Mod {

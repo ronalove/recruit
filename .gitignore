@@ -1,4 +1,7 @@
 /target
+# libghostty-vt and the Cargo configuration that links it, made by scripts/ghostty.sh.
+/.ghostty/
+/.cargo/config.toml
 /graft
 .DS_Store
 

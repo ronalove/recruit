@@ -296,7 +296,7 @@ impl Menu<'_> {
             option: cfg!(target_os = "macos"),
         };
         let drawn = draw::draw(sheet, &look, width, height);
-        let bytes = self.painter.frame(drawn.canvas.clone());
+        let bytes = self.painter.frame(&drawn.canvas);
         self.session.write(&bytes)?;
         Ok(drawn)
     }

@@ -11,16 +11,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::backend::{self, Backend, MenuOpened};
 use crate::config::{self, Edit, Field, Found, Origin, Team, TmuxSettings};
 use crate::state::{self, Snapshot};
-use crate::tmux::{self, Backend, Pane, Tmux};
+use crate::tmux::{self, Pane, Tmux};
 use crate::{board, bridge, claude, launch, layout, prompt, t};
 
 /// A running team, from its folder under `~/.cache/recruit/teams/`.
 pub struct Running {
     pub state: PathBuf,
     pub snapshot: Snapshot,
-    tmux: Tmux,
+    backend: Box<dyn Backend>,
 }
 
 /// How a member starts.
@@ -35,8 +36,8 @@ enum Start {
 impl Running {
     pub fn open(state: &Path) -> Result<Running> {
         let snapshot = Snapshot::read(state)?;
-        let tmux = Tmux::running(&TmuxSettings { socket: Some(snapshot.socket.clone()), ..Default::default() });
-        Ok(Running { state: state.to_path_buf(), snapshot, tmux })
+        let backend = backend::of(&snapshot);
+        Ok(Running { state: state.to_path_buf(), snapshot, backend })
     }
 
     /// A `--dry-run` trial starts no Claude: nothing to change in it.
@@ -150,12 +151,12 @@ impl Running {
 
     /// Detaches a client: the team keeps running.
     pub fn detach(&self, client: &str) -> Result<()> {
-        self.tmux.detach(client)
+        self.backend.detach(client)
     }
 
     /// Stops the team: its Claude sessions are closed, the menu with them.
     pub fn stop(&self) -> Result<()> {
-        self.tmux.stop(&self.snapshot.session)
+        self.backend.stop(&self.snapshot.session)
     }
 
     /// Refuses names that a Claude session open in the team's folder already has: messages by name would not know
@@ -189,7 +190,7 @@ impl Running {
         let session = self.snapshot.session.clone();
         let dir = self.snapshot.dir.clone();
         let exe = std::env::current_exe().context("recruit")?.to_string_lossy().into_owned();
-        let panes = self.tmux.panes(&session)?;
+        let panes = self.backend.panes(&session)?;
         let mut pane_of: HashMap<String, String> =
             panes.iter().filter(|p| p.role.is_empty()).map(|p| (p.member.clone(), p.id.clone())).collect();
 
@@ -205,7 +206,7 @@ impl Running {
             }
             bridge::rename(&state, from, to)?;
             if let Some(pane) = pane_of.remove(from) {
-                self.tmux.set_member(&pane, to)?;
+                self.backend.set_member(&pane, to)?;
                 pane_of.insert(to.clone(), pane);
             }
         }
@@ -250,7 +251,7 @@ impl Running {
         for name in &removed {
             if let Some(pane) = pane_of.remove(name) {
                 // Its supervisor gets the hang-up, as when the team stops: nothing starts again.
-                self.tmux.kill_pane(&pane)?;
+                self.backend.kill_pane(&pane)?;
             }
             let _ = fs::remove_file(session_file(&state, name));
             bridge::forget(&state, name)?;
@@ -268,7 +269,7 @@ impl Running {
         let mut started = Vec::new();
         for (name, start) in &starting {
             if !pane_of.contains_key(name) {
-                let pane = self.tmux.open_window(&session, &dir, &member_pane(name, *start))?;
+                let pane = self.backend.open_window(&session, &dir, &member_pane(name, *start))?;
                 pane_of.insert(name.clone(), pane);
                 started.push(name.clone());
             }
@@ -281,9 +282,9 @@ impl Running {
         }
         tabs.retain(|t| !t.members.is_empty());
         if named.dashboard {
-            let has_panels = self.tmux.panes(&session)?.iter().any(|p| p.role == tmux::DASHBOARD);
+            let has_panels = self.backend.panes(&session)?.iter().any(|p| p.role == tmux::DASHBOARD);
             if !panels {
-                self.tmux.close_panels(&session)?;
+                self.backend.close_panels(&session)?;
             } else if !has_panels && let Some(first) = tabs.first().and_then(|t| pane_of.get(&t.members[0])) {
                 let panel = |kind: &str, role, title: &str| Pane {
                     member: title.to_string(),
@@ -291,8 +292,8 @@ impl Running {
                     argv: launch::panel(&exe, lang, kind, &state),
                     env: Vec::new(),
                 };
-                self.tmux.close_panels(&session)?;
-                self.tmux.open_panels(
+                self.backend.close_panels(&session)?;
+                self.backend.open_panels(
                     &dir,
                     first,
                     &panel("dashboard", tmux::DASHBOARD, board::dashboard_title(lang)),
@@ -300,14 +301,14 @@ impl Running {
                 )?;
             }
         }
-        self.tmux.arrange(&session, &tabs, layout::columns(&view))?;
+        self.backend.arrange(&session, &tabs, layout::columns(&view))?;
 
         for (name, start) in &starting {
             if started.contains(name) {
                 continue;
             }
             if let Some(pane) = pane_of.get(name) {
-                self.tmux.respawn(pane, &dir, &member_pane(name, *start))?;
+                self.backend.respawn(pane, &dir, &member_pane(name, *start))?;
             }
         }
         Ok(())
@@ -530,7 +531,7 @@ pub fn fresh_argv(snapshot: &Snapshot, found: &Found, member: &str) -> Result<Ve
         .members
         .get(member)
         .with_context(|| t!("l'équipe n'a pas de membre « {} »", "the team has no member \"{}\"", member))?;
-    let text = prompt::build(&found.name, &snapshot.session, &found.team, member);
+    let text = prompt::build(&found.name, &snapshot.session, &found.team, member, snapshot.backend);
     let file = prompt::write(&snapshot.session, member, &text)?;
     let launch = claude::Launch {
         claude: &snapshot.claude,
@@ -553,17 +554,40 @@ pub fn prompt(state: &Path, member: &str) -> Result<String> {
     if !found.team.members.contains_key(member) {
         bail!(t!("l'équipe n'a pas de membre « {} »", "the team has no member \"{}\"", member));
     }
-    Ok(prompt::build(&found.name, &snapshot.session, &found.team, member))
+    let mut text = prompt::build(&found.name, &snapshot.session, &found.team, member, snapshot.backend);
+    // The exact addresses of the teammates whose name another session carries too: they change with each restart, and
+    // the note goes again when they do.
+    let refs: Vec<(String, String)> = addresses(state)
+        .into_iter()
+        .filter(|(name, _)| name != member && found.team.members.contains_key(name))
+        .collect();
+    if let Some(addresses) = prompt::addresses(&found.team, &refs) {
+        text.push('\n');
+        text.push_str(&addresses);
+        text.push('\n');
+    }
+    Ok(text)
+}
+
+/// Older than this, in seconds, what the dashboard wrote is no longer what runs: the refs change rarely, at a
+/// member's restart.
+const STALE: i64 = 10;
+
+/// The exact addresses of the members whose name another session carries too, as the dashboard saw them a moment ago;
+/// none when it did not lately. Never `claude agents` here: this runs at each message a member is sent, where nothing
+/// may be slow. So a team without a dashboard (`dashboard = false`) gets no exact addresses: its members fall back on
+/// the tmux line of ListAgents, then ask (the prompt's rule).
+fn addresses(state: &Path) -> std::collections::BTreeMap<String, String> {
+    board::read_states(state).filter(|s| (board::now() - s.at).abs() <= STALE).map(|s| s.refs).unwrap_or_default()
 }
 
 /// Opens the team's menu over a member's pane, on the client that shows it, without waiting for it to close: for
-/// `/recruit` typed in its session. False when no client shows the team.
-pub fn open_menu(state: &Path, member: &str) -> Result<bool> {
+/// `/recruit` typed in its session. With the multiplexer the team runs on, which tells what tmux can only leave to
+/// be seen ([`crate::backend::Kind`]).
+pub fn open_menu(state: &Path, member: &str) -> Result<(MenuOpened, backend::Kind)> {
     let snapshot = Snapshot::read(state)?;
-    let tmux = Tmux::running(&TmuxSettings { socket: Some(snapshot.socket.clone()), ..Default::default() });
-    let Some((client, _)) = tmux.client_of(&snapshot.session, member)? else { return Ok(false) };
-    popup(state, &client)?;
-    Ok(true)
+    let opened = backend::of(&snapshot).open_menu(state, &snapshot.session, Some(member), None)?;
+    Ok((opened, snapshot.backend))
 }
 
 /// Opens the team's menu in a popup on `client`, without waiting for it to close: Alt+r and the bar's button, by

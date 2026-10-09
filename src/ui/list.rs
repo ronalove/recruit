@@ -443,6 +443,47 @@ fn wrap(pieces: &[(&str, Paint)], width: usize) -> Vec<Row> {
         .collect()
 }
 
+/// The bytes of a frame of `rows` on a terminal `cols` wide, drawn over the frame before, whose rows took `up` lines
+/// above the last.
+fn frame(rows: &[Row], cols: usize, up: usize) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    queue!(out, terminal::BeginSynchronizedUpdate, cursor::MoveToColumn(0))?;
+    if up > 0 {
+        queue!(out, cursor::MoveUp(up.min(u16::MAX as usize) as u16))?;
+    }
+    // Cleared whole, the rows of the frame before lose the mark tmux leaves on a row it broke in two when the
+    // terminal got narrower: only written over, they would be joined again when it gets wider, the frame shorter
+    // than counted, and the lines above it erased. The first row is cleared alone, and the rest once it is
+    // written: cleared from the top left corner, the whole screen would go into tmux's history (scroll-on-clear),
+    // once more at each key.
+    queue!(out, terminal::Clear(terminal::ClearType::CurrentLine))?;
+    // The first row filling its last line leaves the cursor on its last cell, the wrap pending: ED would erase
+    // that cell (xterm, Ghostty and recruit's own multiplexer do). Cleared from the start of the next line instead.
+    let full = rows.first().is_some_and(|row| columns(row) > 0 && columns(row).is_multiple_of(cols.max(1)));
+    for (n, row) in rows.iter().enumerate() {
+        if n > 0 && !(n == 1 && full) {
+            queue!(out, Print("\r\n"))?;
+        }
+        for (text, paint) in row {
+            let styled = match paint.color() {
+                Some(color) => text.as_str().with(color),
+                None => text.as_str().stylize(),
+            };
+            queue!(out, PrintStyledContent(styled))?;
+        }
+        if n == 0 && full {
+            queue!(out, Print("\r\n"), terminal::Clear(terminal::ClearType::FromCursorDown))?;
+            if rows.len() == 1 {
+                queue!(out, cursor::MoveUp(1))?;
+            }
+        } else if n == 0 {
+            queue!(out, terminal::Clear(terminal::ClearType::FromCursorDown))?;
+        }
+    }
+    queue!(out, terminal::EndSynchronizedUpdate)?;
+    Ok(out)
+}
+
 /// How many rows up the first row of a frame is from its last, its rows `drawn` columns wide, on a terminal `cols`
 /// wide: one made narrower since may have broken them in several.
 fn rows_up(drawn: &[usize], cols: usize) -> usize {
@@ -528,33 +569,8 @@ impl Screen {
 
     /// Replaces the frame on screen with `rows`, on a terminal `cols` × `lines`.
     fn draw(&mut self, rows: &[Row], cols: usize, lines: usize) -> io::Result<()> {
-        queue!(self.out, terminal::BeginSynchronizedUpdate, cursor::MoveToColumn(0))?;
-        let up = rows_up(&self.drawn, cols);
-        if up > 0 {
-            queue!(self.out, cursor::MoveUp(up.min(u16::MAX as usize) as u16))?;
-        }
-        // Cleared whole, the rows of the frame before lose the mark tmux leaves on a row it broke in two when the
-        // terminal got narrower: only written over, they would be joined again when it gets wider, the frame shorter
-        // than counted, and the lines above it erased. The first row is cleared alone, and the rest once it is
-        // written: cleared from the top left corner, the whole screen would go into tmux's history (scroll-on-clear),
-        // once more at each key.
-        queue!(self.out, terminal::Clear(terminal::ClearType::CurrentLine))?;
-        for (n, row) in rows.iter().enumerate() {
-            if n > 0 {
-                queue!(self.out, Print("\r\n"))?;
-            }
-            for (text, paint) in row {
-                let styled = match paint.color() {
-                    Some(color) => text.as_str().with(color),
-                    None => text.as_str().stylize(),
-                };
-                queue!(self.out, PrintStyledContent(styled))?;
-            }
-            if n == 0 {
-                queue!(self.out, terminal::Clear(terminal::ClearType::FromCursorDown))?;
-            }
-        }
-        queue!(self.out, terminal::EndSynchronizedUpdate)?;
+        let frame = frame(rows, cols, rows_up(&self.drawn, cols))?;
+        self.out.write_all(&frame)?;
         self.drawn = rows.iter().map(columns).collect();
         // Past the bottom of the screen, what was on it went up.
         self.top = self.top.map(|top| top.min(lines.saturating_sub(rows.len())));
@@ -985,6 +1001,22 @@ mod tests {
         assert_eq!(rows[2][2], ("[x]".into(), Paint::Mark));
         assert_eq!(rows[2][4], ("choix 1".into(), Paint::Plain));
         assert!(rows[3].iter().all(|(_, p)| *p == Paint::Chosen), "the help");
+    }
+
+    /// A first row as wide as the terminal keeps its last cell: the rest is cleared from the next line, not from the
+    /// cursor left on that cell with the wrap pending.
+    #[test]
+    fn a_full_first_row_keeps_its_last_cell() {
+        let row = |text: &str| vec![(text.to_string(), Paint::Plain)];
+        let text = |bytes: Vec<u8>| String::from_utf8(bytes).unwrap();
+        let full = text(super::frame(&[row("0123456789"), row("next")], 10, 0).unwrap());
+        assert!(full.contains("0123456789\r\n\x1b[J"), "{full:?}");
+        assert!(full.contains("\x1b[Jnext"), "the second row right after, no blank line: {full:?}");
+        let short = text(super::frame(&[row("012345678"), row("next")], 10, 0).unwrap());
+        assert!(short.contains("012345678\x1b[J\r\nnext"), "{short:?}");
+        // Alone, the cursor goes back up to it.
+        let alone = text(super::frame(&[row("0123456789")], 10, 0).unwrap());
+        assert!(alone.contains("0123456789\r\n\x1b[J\x1b[1A"), "{alone:?}");
     }
 
     #[test]

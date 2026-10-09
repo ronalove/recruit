@@ -45,6 +45,9 @@ pub struct Snapshot {
     /// The members' settings give a status line (`claude::status_line`).
     #[serde(default)]
     pub status_line: bool,
+    /// What runs the team: tmux in a team launched before it.
+    #[serde(default)]
+    pub backend: crate::backend::Kind,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -168,6 +171,7 @@ mod tests {
             origin: Some(Origin::Local { root: "/tmp/web".into() }),
             plugin_dir: None,
             status_line: true,
+            backend: crate::backend::Kind::Tmux,
         };
         let lead = MemberInfo {
             name: "lead".into(),

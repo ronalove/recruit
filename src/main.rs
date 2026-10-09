@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
 mod app;
+mod backend;
 mod board;
 mod bridge;
 mod canvas;
@@ -15,6 +16,7 @@ mod live;
 mod look;
 mod member;
 mod menu;
+mod mux;
 mod prompt;
 mod state;
 mod templates;

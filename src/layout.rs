@@ -5,6 +5,7 @@
 
 use crate::config::{Layout, Team};
 use crate::i18n::{self, Lang};
+use crate::mux::Rect;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tab {
@@ -188,6 +189,34 @@ pub fn tmux_layout(
     columns: usize,
     side: Option<&SidePanes>,
 ) -> (String, Vec<String>) {
+    let root = tree(width, height, panes, columns, side, BORDER);
+    let mut body = String::new();
+    let mut order = Vec::new();
+    root.render(width, height, 0, 0, &mut body, &mut order);
+    (format!("{:04x},{body}", checksum(&body)), order)
+}
+
+/// Where each pane of a tab goes in recruit's own multiplexer, frame included: the grid of `tmux_layout`, the frames
+/// side by side with no line between them (direction « Cadres », CLAUDE.md), in a `width` × `height` area from its
+/// top left corner. Returns the panes (ids, as given) with their rectangles.
+pub(crate) fn rects(
+    width: usize,
+    height: usize,
+    panes: &[String],
+    columns: usize,
+    side: Option<&SidePanes>,
+) -> Vec<(String, Rect)> {
+    let mut out = Vec::new();
+    tree(width, height, panes, columns, side, 0).place(Rect { x: 0, y: 0, width, height }, 0, &mut out);
+    out
+}
+
+/// The line between two tmux panes.
+const BORDER: usize = 1;
+
+/// A tab's cells: the members' panes (ids, reading order) in a grid of at most `columns` columns, or in one column
+/// beside the panels'; `gap` cells between two (tmux's border, or none).
+fn tree(width: usize, height: usize, panes: &[String], columns: usize, side: Option<&SidePanes>, gap: usize) -> Node {
     let side_panes: Vec<(String, Option<usize>)> = side
         .map(|s| {
             s.dashboard
@@ -204,46 +233,46 @@ pub fn tmux_layout(
         (0..cols).map(|c| (0..heights[c]).map(|r| panes[r * cols + c].clone()).collect()).collect();
     let grid_node = |w: usize, h: usize| -> Node {
         let column = |members: &[String]| -> Node {
-            let sizes = shares(h, members.len());
+            let sizes = shares(h, members.len(), gap);
             Node::split(false, members.iter().zip(sizes).map(|(m, s)| (s, Node::Pane(m.clone()))).collect())
         };
-        let sizes = shares(w, cols);
+        let sizes = shares(w, cols, gap);
         Node::split(true, grid.iter().zip(sizes).map(|(members, s)| (s, column(members))).collect())
     };
-    let root = if side_panes.is_empty() {
-        grid_node(width, height)
-    } else {
-        let side_width = width * SIDE_PERCENT / 100;
-        let left = width.saturating_sub(side_width + 1);
-        let column = match side_panes.as_slice() {
-            [(dashboard, _), (journal, rows)] => {
-                let journal_rows = rows.unwrap_or(height / 2).min(height.saturating_sub(2));
-                let dashboard_rows = height.saturating_sub(journal_rows + 1);
-                Node::split(
-                    false,
-                    vec![(dashboard_rows, Node::Pane(dashboard.clone())), (journal_rows, Node::Pane(journal.clone()))],
-                )
-            }
-            [(only, _)] => Node::Pane(only.clone()),
-            _ => unreachable!("one or two panels"),
-        };
-        Node::split(true, vec![(left, grid_node(left, height)), (side_width, column)])
+    if side_panes.is_empty() {
+        return grid_node(width, height);
+    }
+    let side_width = width * SIDE_PERCENT / 100;
+    let left = width.saturating_sub(side_width + gap);
+    let column = match side_panes.as_slice() {
+        [(dashboard, _), (journal, rows)] => {
+            let journal_rows = rows.unwrap_or(height / 2).min(height.saturating_sub(2));
+            let dashboard_rows = height.saturating_sub(journal_rows + gap);
+            Node::split(
+                false,
+                vec![(dashboard_rows, Node::Pane(dashboard.clone())), (journal_rows, Node::Pane(journal.clone()))],
+            )
+        }
+        [(only, _)] => Node::Pane(only.clone()),
+        _ => unreachable!("one or two panels"),
     };
-    let mut body = String::new();
-    let mut order = Vec::new();
-    root.render(width, height, 0, 0, &mut body, &mut order);
-    (format!("{:04x},{body}", checksum(&body)), order)
+    Node::split(true, vec![(left, grid_node(left, height)), (side_width, column)])
 }
 
-/// `count` cells sharing `total` columns or rows, one between each two for the border, as `launch` splits them:
-/// each split gives the new pane its share of what is left (`-l 66%`, then `-l 50%`…), tmux rounding down.
-fn shares(total: usize, count: usize) -> Vec<usize> {
+/// `count` cells sharing `total` columns or rows, `gap` between each two. With tmux's border, as `launch` splits
+/// them: each split gives the new pane its share of what is left (`-l 66%`, then `-l 50%`…), tmux rounding down.
+/// Without, even shares.
+fn shares(total: usize, count: usize, gap: usize) -> Vec<usize> {
+    let count = count.max(1);
+    if gap == 0 {
+        return (0..count).map(|i| (i + 1) * total / count - i * total / count).collect();
+    }
     let mut sizes = Vec::new();
     let mut rest = total;
-    for k in 1..count.max(1) {
+    for k in 1..count {
         let percent = 100 * (count - k) / (count - k + 1);
         let split = rest * percent / 100;
-        sizes.push(rest.saturating_sub(split + 1));
+        sizes.push(rest.saturating_sub(split + gap));
         rest = split;
     }
     sizes.push(rest);
@@ -263,6 +292,25 @@ enum Node {
 impl Node {
     fn split(across: bool, mut children: Vec<(usize, Node)>) -> Node {
         if children.len() == 1 { children.remove(0).1 } else { Node::Split { across, children } }
+    }
+
+    /// The panes' rectangles in `area`, `gap` cells between two.
+    fn place(&self, area: Rect, gap: usize, out: &mut Vec<(String, Rect)>) {
+        match self {
+            Node::Pane(id) => out.push((id.clone(), area)),
+            Node::Split { across, children } => {
+                let mut at = if *across { area.x } else { area.y };
+                for (size, child) in children {
+                    let cell = if *across {
+                        Rect { x: at, width: *size, ..area }
+                    } else {
+                        Rect { y: at, height: *size, ..area }
+                    };
+                    child.place(cell, gap, out);
+                    at += size + gap;
+                }
+            }
+        }
     }
 
     fn render(&self, width: usize, height: usize, x: usize, y: usize, out: &mut String, order: &mut Vec<String>) {
@@ -298,6 +346,29 @@ fn checksum(layout: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ids(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("%{i}")).collect()
+    }
+
+    #[test]
+    fn native_rects_tile_the_area() {
+        // Five members, three columns at most: 3 + 2, no line between the frames.
+        let rects = rects(120, 40, &ids(5), 3, None);
+        let at = |id: &str| rects.iter().find(|(i, _)| i == id).unwrap().1;
+        assert_eq!(at("%0"), Rect { x: 0, y: 0, width: 40, height: 20 });
+        assert_eq!(at("%3"), Rect { x: 0, y: 20, width: 40, height: 20 });
+        assert_eq!(at("%2"), Rect { x: 80, y: 0, width: 40, height: 40 });
+        let area: usize = rects.iter().map(|(_, r)| r.width * r.height).sum();
+        assert_eq!(area, 120 * 40, "every cell has its pane, once");
+        // Beside the panels: the members in one column, the dashboard over the journal on the right.
+        let side = SidePanes { dashboard: Some("%d".into()), journal: Some(("%j".into(), Some(7))) };
+        let rects = super::rects(100, 30, &ids(2), 3, Some(&side));
+        let at = |id: &str| rects.iter().find(|(i, _)| i == id).unwrap().1;
+        assert_eq!(at("%0"), Rect { x: 0, y: 0, width: 65, height: 15 });
+        assert_eq!(at("%d"), Rect { x: 65, y: 0, width: 35, height: 23 });
+        assert_eq!(at("%j"), Rect { x: 65, y: 23, width: 35, height: 7 });
+    }
     use crate::config::Member;
 
     /// Members as (name, contact, tab).
@@ -517,7 +588,7 @@ mod tests {
         assert!(tmux_layout(200, 49, &ids(&[5]), 3, Some(&dashboard)).0.ends_with("{129x49,0,0,5,70x49,130,0,6}"));
         let half = SidePanes { journal: Some(("%7".into(), None)), ..side };
         assert!(tmux_layout(200, 49, &ids(&[5]), 3, Some(&half)).0.ends_with("[70x24,130,0,6,70x24,130,25,7]}"));
-        assert_eq!(shares(49, 3), [16, 15, 16]);
+        assert_eq!(shares(49, 3, BORDER), [16, 15, 16]);
     }
 
     #[test]

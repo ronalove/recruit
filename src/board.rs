@@ -23,12 +23,13 @@ use serde::{Deserialize, Serialize};
 use crate::bridge::{Helper, HelperStatus, Report, Task};
 use crate::canvas::PanicGuard;
 use crate::claude::{self, Running};
-use crate::config::{TmuxSettings, write_atomic};
+use crate::config::write_atomic;
 use crate::i18n::Lang;
 use crate::look::{self, FRAME, Glyphs, RAINBOW, State, duration, effort_color, effort_sign, family, frame};
+use crate::member;
 use crate::state::Snapshot;
-use crate::tmux::{self, ALT, Pane, Tmux};
-use crate::{bridge, t};
+use crate::tmux::{self, ALT, Pane};
+use crate::{backend, bridge, t};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Kind {
@@ -149,16 +150,30 @@ struct Sessions {
     by_pid: HashMap<u32, String>,
     /// Sessions open elsewhere under a member's name, with the folder they work in: messages by name could go astray.
     elsewhere: Vec<(String, Option<String>)>,
+    /// The exact addresses of the members whose name another session carries too (`claude::addresses`).
+    refs: BTreeMap<String, String>,
     /// The members at rest while a command they started still runs (see [`at_rest_with_a_command`]), and since when,
     /// when their file says it.
     shell: HashMap<String, Option<i64>>,
     error: Option<String>,
 }
 
-fn sessions(s: &Snapshot) -> Sessions {
+/// The sessions as `claude agents` gives them; with the exact addresses of the members whose name another session
+/// carries too when `refs` gives the team's state folder (the dashboard, for `STATES`; the journal has no use for them).
+fn sessions(s: &Snapshot, refs: Option<&Path>) -> Sessions {
     match claude::running(&s.claude, s.config_dir.as_deref()) {
         Ok(running) => {
-            let mut found = sorted(s, running);
+            let refs = refs.map_or_else(BTreeMap::new, |state| {
+                let names: Vec<&str> = s.members.iter().map(|m| m.name.as_str()).collect();
+                claude::addresses(
+                    &s.dir,
+                    &names,
+                    &running,
+                    |member| member::noted(state, member),
+                    |pid| claude::session_ref(s.config_dir.as_deref(), pid),
+                )
+            });
+            let mut found = Sessions { refs, ..sorted(s, running) };
             at_rest_with_a_command(&mut found, |pid| claude::session_status(s.config_dir.as_deref(), pid));
             found
         }
@@ -319,12 +334,12 @@ fn dashboard(first: &Snapshot, state: &Path) -> Result<()> {
         let (sender, news) = mpsc::channel();
         scope.spawn(move || {
             // The clients asked at each look: one can attach again from another terminal.
-            let tmux = Tmux::new(&TmuxSettings { socket: Some(first.socket.clone()), ..Default::default() }).ok();
-            let clients = || tmux.as_ref().map(|t| t.client_terminals(&first.session)).unwrap_or_default();
+            let backend = backend::of(first);
+            let clients = || backend.client_terminals(&first.session);
             let mut s = first.clone();
             loop {
                 reread(&mut s, state);
-                let look = (sessions(&s), Glyphs::of(&clients()));
+                let look = (sessions(&s, Some(state)), Glyphs::of(&clients()));
                 if sender.send((s.clone(), look)).is_err() {
                     break;
                 }
@@ -353,7 +368,8 @@ fn dashboard(first: &Snapshot, state: &Path) -> Result<()> {
                 board = Board { glyphs, ..memory.board(&s, state, &sessions) };
                 // A look that failed says nothing of the states: left to age, the file sends the menu to ask itself.
                 if board.error.is_none() {
-                    let _ = states.send(memory.states(&board, SystemTime::now(), Instant::now()));
+                    let refs = sessions.refs.clone();
+                    let _ = states.send(States { refs, ..memory.states(&board, SystemTime::now(), Instant::now()) });
                 }
             }
             for card in &mut board.cards {
@@ -422,7 +438,12 @@ impl Memory {
             let since = (at - seen.saturating_duration_since(*since).as_millis() as i64).div_euclid(1000);
             Some((card.name.clone(), MemberState { state: *state, since }))
         });
-        States { at: at.div_euclid(1000), members: members.collect(), absent: board.absent.clone() }
+        States {
+            at: at.div_euclid(1000),
+            members: members.collect(),
+            absent: board.absent.clone(),
+            refs: BTreeMap::new(),
+        }
     }
 
     /// The board for the sessions just found.
@@ -527,30 +548,63 @@ impl Screen {
     /// The board over the pane, each changed line written over the old one rather than cleared, so that nothing
     /// flickers.
     fn draw(&mut self, out: &mut impl Write, board: &Board) -> Result<()> {
-        let size = terminal::size().unwrap_or((80, 24));
+        let changes = self.changes(terminal::size().unwrap_or((80, 24)), board)?;
+        if !changes.is_empty() {
+            out.write_all(&changes)?;
+            out.flush()?;
+        }
+        Ok(())
+    }
+
+    /// What to write for `board` on a pane of `size`: the lines that changed, in one write.
+    fn changes(&mut self, size: (u16, u16), board: &Board) -> Result<Vec<u8>> {
         if size != self.size {
             *self = Screen { size, ..Default::default() };
         }
         let Drawn { lines, zones } = render(board, size.0 as usize, size.1 as usize);
-        // All the changes in one write.
         let mut changes = Vec::new();
         for (row, line) in lines.iter().enumerate() {
             if self.lines.get(row) != Some(line) {
                 queue!(changes, cursor::MoveTo(0, row as u16))?;
                 write!(changes, "{line}")?;
-                queue!(changes, terminal::Clear(ClearType::UntilNewLine))?;
+                // A line as wide as the pane leaves the cursor on its last cell, the wrap pending: EL would erase that
+                // cell (xterm, Ghostty and recruit's own multiplexer do; tmux does not).
+                if shown_columns(line) < size.0 as usize {
+                    queue!(changes, terminal::Clear(ClearType::UntilNewLine))?;
+                }
             }
         }
         if !changes.is_empty() {
             // Below the board, what was typed in the pane, if anything.
             queue!(changes, cursor::MoveTo(0, lines.len() as u16), terminal::Clear(ClearType::FromCursorDown))?;
-            out.write_all(&changes)?;
-            out.flush()?;
         }
         self.lines = lines;
         self.zones = zones;
-        Ok(())
+        Ok(changes)
     }
+}
+
+/// Columns a line of the board takes on screen: its text without its escape sequences.
+fn shown_columns(line: &str) -> usize {
+    crate::canvas::columns(&visible(line))
+}
+
+/// A painted line's text, its SGR sequences left out.
+fn visible(line: &str) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// The time before the clock's next second, and a little more so that it has moved on.
@@ -729,6 +783,10 @@ pub struct States {
     pub members: BTreeMap<String, MemberState>,
     /// Those without.
     pub absent: Vec<String>,
+    /// The exact addresses (`name [ref]`) of the members whose name another session carries too, for the team's note
+    /// (`live::prompt`); none most of the time.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub refs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1719,21 +1777,32 @@ impl Tail {
 /// Earlier messages shown when the journal opens.
 const BACKLOG: usize = 200;
 
+/// The journal's first line under tmux: its title, and the key that sizes it. None in recruit's own multiplexer, whose
+/// frame already bears the title.
+fn journal_head(backend: backend::Kind, width: usize) -> Option<String> {
+    if backend == backend::Kind::Native {
+        return None;
+    }
+    let hint = t!("{ALT}j taille", "{ALT}j size");
+    let title = " Journal ";
+    let gap = width.saturating_sub(title.len() + hint.chars().count() + 1).max(2);
+    Some(format!("{}{}{}", title.reverse().bold(), " ".repeat(gap), hint.dim()))
+}
+
 fn journal(mut s: Snapshot, state: &Path) -> Result<()> {
     let mut out = std::io::stdout();
     queue!(out, cursor::Hide)?;
     // What is typed there shows nowhere either (an Enter would leave an empty line between two messages).
     let _quiet = quiet_input(Arc::new(AtomicBool::new(false)));
     let width = terminal::size().map_or(80, |(w, _)| w as usize);
-    let hint = t!("{ALT}j taille", "{ALT}j size");
-    let title = " Journal ";
-    let gap = width.saturating_sub(title.len() + hint.chars().count() + 1).max(2);
-    writeln!(out, "{}{}{}\n", title.reverse().bold(), " ".repeat(gap), hint.dim())?;
+    if let Some(head) = journal_head(s.backend, width) {
+        writeln!(out, "{head}\n")?;
+    }
     let mut tails: HashMap<PathBuf, Tail> = HashMap::new();
     let mut first = true;
     loop {
         reread(&mut s, state);
-        let sessions = sessions(&s);
+        let sessions = sessions(&s, None);
         let mut fresh = Vec::new();
         for (name, session) in &sessions.members {
             let Some(id) = &session.session_id else { continue };
@@ -1829,16 +1898,50 @@ pub fn compaction_at(s: &Snapshot, state: &Path, x: usize, y: usize) -> Option<S
     s.members.iter().any(|m| m.name == name).then_some(name)
 }
 
+/// What a click on a panel reaches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Clicked {
+    /// A member: its pane, in its tab.
+    Show(String),
+    /// A member at rest, by its context on the dashboard: compacting it is offered, after confirmation.
+    Compact(String),
+}
+
+/// A member's context as its card shows it, in percent: for the compaction's confirmation. None while its mod has
+/// not measured it.
+pub fn context_percent(state: &Path, member: &str) -> Option<u8> {
+    let percent = bridge::report(state, member)?.context?.percent?;
+    percent.is_finite().then(|| percent.round().clamp(0.0, 100.0) as u8)
+}
+
+/// What a click on a panel reaches, under tmux (`recruit _click`) as in recruit's own multiplexer (the server): see
+/// [`compaction_at`], asked first, then [`member_at`].
+pub fn clicked(
+    s: &Snapshot,
+    state: &Path,
+    panel: Kind,
+    x: usize,
+    y: usize,
+    columns: usize,
+    line: &str,
+) -> Option<Clicked> {
+    if panel == Kind::Dashboard
+        && let Some(member) = compaction_at(s, state, x, y)
+    {
+        return Some(Clicked::Compact(member));
+    }
+    member_at(s, state, panel, x, y, columns, line).map(Clicked::Show)
+}
+
 /// Takes the journal to its next size: full, reduced, hidden, full again.
 pub fn toggle(s: &Snapshot) -> Result<tmux::JournalSize> {
-    let tmux = Tmux::new(&TmuxSettings { socket: Some(s.socket.clone()), ..Default::default() })?;
     let journal = Pane {
         member: journal_title(s.lang).to_string(),
         role: Some(tmux::JOURNAL),
         argv: s.journal.clone(),
         env: Vec::new(),
     };
-    tmux.toggle_journal(&s.session, &s.dir, &journal)
+    backend::of(s).toggle_journal(&s.session, &s.dir, &journal)
 }
 
 /// `text` cut to `width` characters, an ellipsis marking the cut.
@@ -1973,24 +2076,6 @@ mod tests {
             helpers: Vec::new(),
             shell: false,
         }
-    }
-
-    /// What a line shows, escape sequences left out.
-    fn visible(line: &str) -> String {
-        let mut out = String::new();
-        let mut chars = line.chars();
-        while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                for c in chars.by_ref() {
-                    if c.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
     }
 
     fn board(cards: Vec<Card>) -> Board {
@@ -2974,6 +3059,51 @@ mod tests {
         // On a new conversation: a new curve.
         let other = snapshot(&["qa"]);
         assert_eq!(samples(&memory.board(&other, state.path(), &look("qa", "s2"))), Some(1));
+    }
+
+    /// A line as wide as the pane keeps its last cell: no EL after it, which would erase it with the wrap pending.
+    #[test]
+    fn a_full_line_keeps_its_last_cell() {
+        let b = board(capture());
+        let width = 60;
+        let lines = render(&b, width, 23).lines;
+        let full: Vec<&String> = lines.iter().filter(|l| shown_columns(l) == width).collect();
+        assert!(
+            !full.is_empty(),
+            "the header fills the line: {:?}",
+            lines.iter().map(|l| visible(l)).collect::<Vec<_>>()
+        );
+        let changes = String::from_utf8(Screen::default().changes((width as u16, 23), &b).unwrap()).unwrap();
+        for line in &full {
+            let at = changes.find(line.as_str()).unwrap() + line.len();
+            assert!(!changes[at..].starts_with("\x1b[K"), "EL after a full line: {:?}", visible(line));
+        }
+        // A shorter one is cleared to its end, over what it covered before.
+        let short = lines.iter().find(|l| !l.is_empty() && shown_columns(l) < width).unwrap();
+        let at = changes.find(short.as_str()).unwrap() + short.len();
+        assert!(changes[at..].starts_with("\x1b[K"));
+    }
+
+    #[test]
+    fn the_journal_titled_once() {
+        let head = journal_head(backend::Kind::Tmux, 40).map(|line| visible(&line));
+        let hint = t!("{ALT}j taille", "{ALT}j size");
+        let gap = 40 - " Journal ".len() - hint.chars().count() - 1;
+        assert_eq!(head, Some(format!(" Journal {}{hint}", " ".repeat(gap))));
+        // Its frame already bears it.
+        assert_eq!(journal_head(backend::Kind::Native, 40), None);
+    }
+
+    #[test]
+    fn exact_addresses_in_the_states_only_when_some() {
+        let mut states = States { at: 5, ..Default::default() };
+        assert!(!serde_json::to_string(&states).unwrap().contains("refs"));
+        states.refs.insert("dev".into(), "a1b2c3".into());
+        let written = serde_json::to_string(&states).unwrap();
+        assert!(written.contains(r#""refs":{"dev":"a1b2c3"}"#), "{written}");
+        // Written by a recruit before them: none.
+        let older: States = serde_json::from_str(r#"{"at":5,"members":{},"absent":[]}"#).unwrap();
+        assert!(older.refs.is_empty());
     }
 
     #[test]

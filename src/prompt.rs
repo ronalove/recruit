@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::backend::Kind;
 use crate::config::{Team, cache_dir, write_atomic};
 use crate::i18n::{self, Lang};
 use crate::t;
@@ -42,8 +43,9 @@ fn fnv(text: &str) -> u64 {
     text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, b| (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
 }
 
-/// `session`: the team's tmux session, which ListAgents shows on each of its members' lines.
-pub fn build(team_name: &str, session: &str, team: &Team, member_name: &str) -> String {
+/// `session`: the team's tmux session, which ListAgents shows on each of its members' lines under tmux; `backend`:
+/// the multiplexer the team runs in, recruit's own showing no such line.
+pub fn build(team_name: &str, session: &str, team: &Team, member_name: &str, backend: Kind) -> String {
     let lang = team.lang.unwrap_or_else(i18n::lang);
     let member = &team.members[member_name];
     let description = team.description.as_deref().map(str::trim).filter(|d| !d.is_empty());
@@ -66,22 +68,46 @@ pub fn build(team_name: &str, session: &str, team: &Team, member_name: &str) -> 
              write to them with the SendMessage tool, using their name as the address (ListAgents lists them)."
         }
     });
-    // Another team may run members with the same names: its tmux session tells them apart. A reply needs nothing:
+    // Another team may run members with the same names: recruit gives the exact addresses of those teammates in the
+    // team's note (`addresses`), and the tmux session tells them apart when that fails. A reply needs nothing:
     // SendMessage answers the exact address the message came from.
     if team.members.len() > 1 {
+        let contact = team.contacts().contains(&member_name);
         out.push(' ');
-        let _ = match lang {
-            Lang::Fr => write!(
+        let who = match (lang, contact) {
+            (Lang::Fr, true) => "l'utilisateur",
+            (Lang::Fr, false) => "ton interlocuteur",
+            (Lang::En, true) => "the user",
+            (Lang::En, false) => "your contact",
+        };
+        let _ = match (lang, backend) {
+            (Lang::Fr, Kind::Tmux) => write!(
                 out,
-                "Ton équipe tourne dans la session tmux « {session} » : si ListAgents montre plusieurs sessions sous un \
-                 même nom (une autre équipe peut avoir les mêmes), écris à celle dont la ligne indique \
-                 « tmux {session}:… », à l'adresse « nom [ref] » de cette ligne."
+                "Ton équipe tourne dans la session tmux « {session} ». Si ListAgents montre plusieurs sessions sous un \
+                 même nom (une autre équipe peut avoir les mêmes), ou qu'un envoi par nom est refusé pour cette \
+                 raison, écris à l'adresse exacte « nom [ref] » que recruit te donne pour ce coéquipier ; si elle \
+                 échoue aussi, ou que recruit n'en donne pas, à celle de la ligne de ListAgents qui indique \
+                 « tmux {session}:… » ; à défaut, demande-la à {who}."
             ),
-            Lang::En => write!(
+            (Lang::En, Kind::Tmux) => write!(
                 out,
-                "Your team runs in the tmux session \"{session}\": if ListAgents shows several sessions under one name \
-                 (another team may use the same names), write to the one whose line shows \"tmux {session}:…\", at \
-                 that line's \"name [ref]\" address."
+                "Your team runs in the tmux session \"{session}\". If ListAgents shows several sessions under one name \
+                 (another team may use the same names), or a message by name is refused for that reason, write to \
+                 the exact \"name [ref]\" address recruit gives you for that teammate; if it fails too, or recruit \
+                 gives none, to the address on the ListAgents line that shows \"tmux {session}:…\"; failing that, \
+                 ask {who} for it."
+            ),
+            (Lang::Fr, Kind::Native) => write!(
+                out,
+                "Si ListAgents montre plusieurs sessions sous un même nom (une autre équipe peut avoir les mêmes), ou \
+                 qu'un envoi par nom est refusé pour cette raison, écris à l'adresse exacte « nom [ref] » que recruit \
+                 te donne pour ce coéquipier ; si elle échoue aussi, ou que recruit n'en donne pas, demande-la à {who}."
+            ),
+            (Lang::En, Kind::Native) => write!(
+                out,
+                "If ListAgents shows several sessions under one name (another team may use the same names), or a \
+                 message by name is refused for that reason, write to the exact \"name [ref]\" address recruit gives \
+                 you for that teammate; if it fails too, or recruit gives none, ask {who} for it."
             ),
         };
     }
@@ -163,6 +189,22 @@ pub fn build(team_name: &str, session: &str, team: &Team, member_name: &str) -> 
     out
 }
 
+/// For the team's note, when other sessions carry the names of some teammates: their exact addresses (`name [ref]`,
+/// as ListAgents writes them), in the team's language. None without any.
+pub fn addresses(team: &Team, refs: &[(String, String)]) -> Option<String> {
+    if refs.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = refs.iter().map(|(name, reference)| format!("{name} [{reference}]")).collect();
+    let list = list.join(", ");
+    Some(match team.lang.unwrap_or_else(i18n::lang) {
+        Lang::Fr => {
+            format!("Adresses exactes de tes coéquipiers dont le nom est porté par une autre session : {list}.")
+        }
+        Lang::En => format!("Exact addresses of your teammates whose name another session also carries: {list}."),
+    })
+}
+
 /// « a », « b » et « c » / "a", "b" and "c".
 fn list(lang: Lang, names: &[&str]) -> String {
     let quoted: Vec<String> = names
@@ -197,7 +239,7 @@ mod tests {
             team.members.insert(name.into(), Member { role: role.into(), ..Default::default() });
         }
         team.members["développeur"].instructions = Some("- Teste avant de rendre.".into());
-        let prompt = build("perso", "perso", &team, "développeur");
+        let prompt = build("perso", "perso", &team, "développeur", Kind::Tmux);
         assert!(prompt.starts_with("Tu es « développeur », membre de l'équipe « perso » (projet perso)."));
         assert!(prompt.contains("Tu es un agent de travail"));
         assert!(prompt.contains("des interlocuteurs de l'équipe (« coordinateur »)"));
@@ -208,7 +250,7 @@ mod tests {
         assert!(prompt.ends_with("## Règles communes\n\n- Personne ne commite sans demande.\n"));
 
         // With no member marked, the first one is the contact.
-        let lead = build("perso", "perso", &team, "coordinateur");
+        let lead = build("perso", "perso", &team, "coordinateur", Kind::Tmux);
         assert!(lead.contains("Tu es l'un des interlocuteurs de l'utilisateur"));
         assert!(lead.contains("- « coordinateur » (interlocuteur, toi) : Répartit le travail"));
     }
@@ -219,7 +261,7 @@ mod tests {
         for (name, contact) in [("coordinateur", true), ("dev", false), ("opérateur", true)] {
             team.members.insert(name.into(), Member { role: "r".into(), contact, ..Default::default() });
         }
-        assert!(build("t", "t", &team, "dev").contains("(« coordinateur » et « opérateur »)"));
+        assert!(build("t", "t", &team, "dev", Kind::Tmux).contains("(« coordinateur » et « opérateur »)"));
         assert_eq!(list(Lang::En, &["a", "b", "c"]), "\"a\", \"b\" and \"c\"");
     }
 
@@ -227,7 +269,7 @@ mod tests {
     fn english_prompt_without_optional_parts() {
         let mut team = Team { lang: Some(Lang::En), ..Default::default() };
         team.members.insert("solo".into(), Member { role: "Everything".into(), ..Default::default() });
-        let prompt = build("t", "t", &team, "solo");
+        let prompt = build("t", "t", &team, "solo", Kind::Tmux);
         assert!(prompt.starts_with("You are \"solo\", a member of the \"t\" team. Your teammates"));
         assert!(prompt.contains("You are one of the user's contacts"));
         assert!(prompt.ends_with("- \"solo\" (contact, you): Everything\n"));
@@ -257,23 +299,61 @@ mod tests {
         }
         team.lang = Some(Lang::Fr);
         for member in ["coordinateur", "dev"] {
-            assert!(build("omni.dex", "omni_dex", &team, member).contains(
-                "(ListAgents les liste). Ton équipe tourne dans la session tmux « omni_dex » : si ListAgents montre \
-                 plusieurs sessions sous un même nom (une autre équipe peut avoir les mêmes), écris à celle dont la \
-                 ligne indique « tmux omni_dex:… », à l'adresse « nom [ref] » de cette ligne.\n\n"
-            ));
+            let who = if member == "coordinateur" { "l'utilisateur" } else { "ton interlocuteur" };
+            assert!(build("omni.dex", "omni_dex", &team, member, Kind::Tmux).contains(&format!(
+                "(ListAgents les liste). Ton équipe tourne dans la session tmux « omni_dex ». Si ListAgents montre \
+                 plusieurs sessions sous un même nom (une autre équipe peut avoir les mêmes), ou qu'un envoi par nom \
+                 est refusé pour cette raison, écris à l'adresse exacte « nom [ref] » que recruit te donne pour ce \
+                 coéquipier ; si elle échoue aussi, ou que recruit n'en donne pas, à celle de la ligne de ListAgents \
+                 qui indique « tmux omni_dex:… » ; à défaut, demande-la à {who}.\n\n"
+            )));
         }
         team.lang = Some(Lang::En);
         for member in ["coordinateur", "dev"] {
-            assert!(build("omni.dex", "omni_dex", &team, member).contains(
-                "(ListAgents lists them). Your team runs in the tmux session \"omni_dex\": if ListAgents shows several \
-                 sessions under one name (another team may use the same names), write to the one whose line shows \
-                 \"tmux omni_dex:…\", at that line's \"name [ref]\" address.\n\n"
-            ));
+            let who = if member == "coordinateur" { "the user" } else { "your contact" };
+            assert!(build("omni.dex", "omni_dex", &team, member, Kind::Tmux).contains(&format!(
+                "(ListAgents lists them). Your team runs in the tmux session \"omni_dex\". If ListAgents shows \
+                 several sessions under one name (another team may use the same names), or a message by name is \
+                 refused for that reason, write to the exact \"name [ref]\" address recruit gives you for that \
+                 teammate; if it fails too, or recruit gives none, to the address on the ListAgents line that shows \
+                 \"tmux omni_dex:…\"; failing that, ask {who} for it.\n\n"
+            )));
         }
+
+        // In recruit's own multiplexer, no tmux line to fall back on: ask.
+        team.lang = Some(Lang::Fr);
+        let native = build("omni.dex", "omni_dex", &team, "dev", Kind::Native);
+        assert!(native.contains(
+            "(ListAgents les liste). Si ListAgents montre plusieurs sessions sous un même nom (une autre équipe peut \
+             avoir les mêmes), ou qu'un envoi par nom est refusé pour cette raison, écris à l'adresse exacte \
+             « nom [ref] » que recruit te donne pour ce coéquipier ; si elle échoue aussi, ou que recruit n'en donne \
+             pas, demande-la à ton interlocuteur.\n\n"
+        ));
+        assert!(!native.contains("tmux") && !native.contains("omni_dex"), "{native}");
+        team.lang = Some(Lang::En);
+        let native = build("omni.dex", "omni_dex", &team, "coordinateur", Kind::Native);
+        assert!(native.contains("if it fails too, or recruit gives none, ask the user for it.\n\n"), "{native}");
+        assert!(!native.contains("tmux"), "{native}");
 
         // Alone, no teammate to tell apart.
         team.members.shift_remove("dev");
-        assert!(!build("omni.dex", "omni_dex", &team, "coordinateur").contains("tmux"));
+        assert!(!build("omni.dex", "omni_dex", &team, "coordinateur", Kind::Tmux).contains("tmux"));
+    }
+
+    #[test]
+    fn exact_addresses_only_when_names_are_carried_twice() {
+        let mut team = Team { lang: Some(Lang::Fr), ..Default::default() };
+        assert_eq!(addresses(&team, &[]), None);
+        let refs = [("dev-rust".to_string(), "a1b2c3".to_string()), ("qa".to_string(), "d4e5f6".to_string())];
+        assert_eq!(
+            addresses(&team, &refs).unwrap(),
+            "Adresses exactes de tes coéquipiers dont le nom est porté par une autre session : dev-rust [a1b2c3], \
+             qa [d4e5f6]."
+        );
+        team.lang = Some(Lang::En);
+        assert_eq!(
+            addresses(&team, &refs[..1]).unwrap(),
+            "Exact addresses of your teammates whose name another session also carries: dev-rust [a1b2c3]."
+        );
     }
 }

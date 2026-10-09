@@ -5,15 +5,21 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
+use crate::backend::{self, Backend};
 use crate::config::{Found, Scope, Team, tilde};
 use crate::i18n::Lang;
 use crate::state::{self, Snapshot};
-use crate::tmux::{self, Backend, Pane, Plan, Side, TabPlan, Tmux};
+use crate::tmux::{self, Pane, Plan, Side, TabPlan};
 use crate::{board, bridge, claude, i18n, layout, prompt, t, ui};
+
+/// In a team's state folder: when its members last resumed after a crash, in seconds since the epoch.
+const RECOVERED: &str = "recovered";
+/// A crash this soon after a recovery asks before resuming again.
+const AGAIN: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Default, Clone)]
 pub struct Options {
@@ -40,11 +46,20 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
     if options.dry_run {
         session.push_str(DRY_RUN);
     }
-    let tmux = Tmux::new(&found.tmux)?;
+    // What the team last ran on, to say so when it starts again on the other one.
+    let launched = Snapshot::read(&state::dir(&session)).ok().map(|snapshot| snapshot.backend);
+    // The team's multiplexer stopped without being asked to: the members pick up their conversations (user's
+    // decision, spec §11), unless a new start is what is asked for.
+    let crashed = launched == Some(backend::Kind::Native)
+        && !options.print
+        && !options.restart
+        && !options.dry_run
+        && backend::crashed(&session);
+    let (mut kind, mut backend) = backend::for_session(&session, &found.tmux)?;
 
     let mut stopped = false;
-    if !options.print && tmux.has_session(&session) {
-        let running = tmux.running()?.into_iter().find(|r| r.session == session);
+    if !options.print && backend.has_session(&session) {
+        let running = backend.running()?.into_iter().find(|r| r.session == session);
         let running_dir = running.map(|r| r.dir).unwrap_or_default();
         if !running_dir.is_empty() && Path::new(&running_dir) != dir {
             // Two copies would share member names, and messages by name would not know which one to reach.
@@ -56,7 +71,7 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
             ));
         }
         if options.restart || options.dry_run {
-            tmux.stop(&session)?;
+            backend.stop(&session)?;
             stopped = true;
         } else {
             if options.resume {
@@ -76,14 +91,28 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
                     found.name
                 )
             );
-            if !repair(&tmux, found, &session)? {
-                return attach_or_hint(&tmux, &session, &found.name, options.detach);
+            if !repair(backend.as_ref(), found, &session)? {
+                return attach_or_hint(backend.as_ref(), &session, &found.name, options.detach);
             }
             // Panes are gone: the team is built again, each member on its conversation.
-            tmux.stop(&session)?;
+            backend.stop(&session)?;
             stopped = true;
             options.resume = true;
         }
+    }
+    // Stopped, the team starts again on what is asked for now, not on what it ran on.
+    if stopped && kind != backend::requested() {
+        kind = backend::requested();
+        backend = backend::new(kind, &found.tmux, &session)?;
+    }
+    if !options.print
+        && let Some(launched) = launched
+        && launched != kind
+    {
+        println!("{}", switched(&found.name, kind));
+    }
+    if crashed {
+        recover(&found.name, &state::dir(&session), &mut options, ui::interactive())?;
     }
 
     let command = found.claude.command();
@@ -155,7 +184,7 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
         let mut panes = Vec::new();
         for name in &tab.members {
             let member = &team.members[name];
-            let prompt_file = prompt::write(&session, name, &prompt::build(&found.name, &session, team, name))?;
+            let prompt_file = prompt::write(&session, name, &prompt::build(&found.name, &session, team, name, kind))?;
             let resume = resume.get(name).map(String::as_str);
             let argv = start.argv(name, member, &prompt_file, resume);
             let line = shlex::try_join(argv.iter().map(String::as_str))?;
@@ -220,7 +249,7 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
     };
 
     if options.print {
-        print_plan(&plan, &commands);
+        print_plan(&plan, &commands, kind);
         return Ok(());
     }
     let snapshot = Snapshot {
@@ -237,10 +266,15 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
         origin: Some(found.origin()),
         plugin_dir: plugin_dir.clone(),
         status_line: start.status_line,
+        backend: kind,
     };
     snapshot.write(&state)?;
     bridge::reset(&state)?;
-    tmux.launch(&plan)?;
+    backend.launch(&plan)?;
+    if crashed && options.resume {
+        note_recovery(&state);
+    }
+    backend::recovered(&session);
     println!(
         "{}",
         t!(
@@ -252,7 +286,7 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
             i18n::count(plan.tabs.len(), "onglet", "tab")
         )
     );
-    attach_or_hint(&tmux, &session, &found.name, options.detach)
+    attach_or_hint(backend.as_ref(), &session, &found.name, options.detach)
 }
 
 /// Suffix of the tmux session of a `--dry-run`, which may run next to the real team.
@@ -284,6 +318,68 @@ pub fn menu_line(exe: &str, lang: Lang, state: &Path, client: &str, nerd: bool) 
     )
 }
 
+/// A team whose multiplexer crashed: each member resumes its conversation, said so. A second crash soon after the last
+/// recovery ([`note_recovery`]) asks first, when `interactive` (a conversation may be what brings the multiplexer
+/// down); without a terminal, it stops there.
+fn recover(team: &str, state: &Path, options: &mut Options, interactive: bool) -> Result<()> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default();
+    let last = fs::read_to_string(state.join(RECOVERED)).ok().and_then(|text| text.trim().parse::<u64>().ok());
+    let again = last.is_some_and(|last| now.saturating_sub(last) < AGAIN.as_secs());
+    if !options.resume {
+        if again {
+            if !interactive {
+                bail!(t!(
+                    "l'équipe « {0} » s'est de nouveau arrêtée brutalement, peu après la dernière reprise. Relance-la depuis un terminal pour choisir, ou avec --resume pour reprendre les conversations.",
+                    "team \"{0}\" stopped abruptly again, soon after the last recovery. Launch it from a terminal to choose, or with --resume to resume the conversations.",
+                    team
+                ));
+            }
+            options.resume = ui::confirm(
+                &t!(
+                    "L'équipe « {} » s'est de nouveau arrêtée brutalement, peu après la dernière reprise. Reprendre encore les conversations ?",
+                    "Team \"{}\" stopped abruptly again, soon after the last recovery. Resume the conversations again?",
+                    team
+                ),
+                true,
+            )?;
+        } else {
+            println!(
+                "{}",
+                t!(
+                    "L'équipe « {} » s'est arrêtée brutalement : chaque membre reprend sa conversation.",
+                    "Team \"{}\" stopped abruptly: each member resumes its conversation.",
+                    team
+                )
+            );
+            options.resume = true;
+        }
+    }
+    Ok(())
+}
+
+/// The team is running again on its conversations after a crash: noted for the next one, once launched (a launch
+/// that fails is not a recovery). The time in the file, not the file's: it may come before now on Linux (CLAUDE.md).
+fn note_recovery(state: &Path) {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default();
+    let _ = crate::config::write_atomic(&state.join(RECOVERED), &now.to_string());
+}
+
+/// The note for a team that starts again on another multiplexer than the one it last ran on.
+fn switched(team: &str, now: backend::Kind) -> String {
+    match now {
+        backend::Kind::Tmux => t!(
+            "L'équipe « {} » tournait avec le multiplexeur de recruit : elle repart sous tmux (RECRUIT_BACKEND=native pour le garder).",
+            "Team \"{}\" ran on recruit's multiplexer: it starts again under tmux (RECRUIT_BACKEND=native to keep it).",
+            team
+        ),
+        backend::Kind::Native => t!(
+            "L'équipe « {} » tournait sous tmux : elle repart avec le multiplexeur de recruit.",
+            "Team \"{}\" ran under tmux: it starts again on recruit's multiplexer.",
+            team
+        ),
+    }
+}
+
 /// A panel's command line.
 pub fn panel(exe: &str, lang: Lang, kind: &str, state: &Path) -> Vec<String> {
     let state = state.to_string_lossy().into_owned();
@@ -301,10 +397,13 @@ fn click_command(exe: &str) -> String {
 }
 
 /// What a member's pane runs: `recruit _member`, which starts Claude again when it stops on its own, then the
-/// user's shell if it gives up.
+/// user's shell if it gives up. The script catches SIGINT and does nothing with it: a Ctrl-C during the pause before
+/// a restart reaches the whole foreground group, and dash or busybox ash (`/bin/sh` on Debian, Alpine) would end
+/// there, the pane with them, rather than go on to the shell. A caught signal goes back to its default in what the
+/// script runs, unlike an ignored one: `_member` and Claude get their Ctrl-C as before.
 pub fn member_script(exe: &str, state: &Path, name: &str, resume: bool) -> String {
     let resume = if resume { " --resume" } else { "" };
-    format!("{} _member{resume} {} {}; {SHELL}", quote(exe), quote(&state.to_string_lossy()), quote(name))
+    format!("trap : INT; {} _member{resume} {} {}; {SHELL}", quote(exe), quote(&state.to_string_lossy()), quote(name))
 }
 
 /// The environment of a member's pane: who it is; for the mod, who to call, where the team is, which language it
@@ -333,11 +432,11 @@ pub fn member_env(
 /// Puts a running team back in shape before joining it: a member whose Claude no longer runs starts again on its
 /// conversation, a closed dashboard opens again. True when members' panes are gone and the team should be built
 /// again, which the user agreed to.
-fn repair(tmux: &Tmux, found: &Found, session: &str) -> Result<bool> {
+fn repair(backend: &dyn Backend, found: &Found, session: &str) -> Result<bool> {
     let state = state::dir(session);
     // A team launched by an older recruit left nothing to go by.
     let Ok(snapshot) = Snapshot::read(&state) else { return Ok(false) };
-    let panes = tmux.panes(session)?;
+    let panes = backend.panes(session)?;
     let running = claude::running(&snapshot.claude, snapshot.config_dir.as_deref()).unwrap_or_default();
     let alive = |name: &str| {
         running
@@ -360,7 +459,11 @@ fn repair(tmux: &Tmux, found: &Found, session: &str) -> Result<bool> {
                     snapshot.config_dir.as_deref(),
                 );
                 let argv = vec!["/bin/sh".into(), "-c".into(), script];
-                tmux.respawn(&pane.id, &snapshot.dir, &Pane { member: member.name.clone(), role: None, argv, env })?;
+                backend.respawn(
+                    &pane.id,
+                    &snapshot.dir,
+                    &Pane { member: member.name.clone(), role: None, argv, env },
+                )?;
                 restarted.push(member.name.as_str());
             }
             Some(_) => {}
@@ -383,7 +486,7 @@ fn repair(tmux: &Tmux, found: &Found, session: &str) -> Result<bool> {
             argv: snapshot.dashboard.clone(),
             env: Vec::new(),
         };
-        tmux.restore_dashboard(session, &snapshot.dir, &dashboard)?;
+        backend.restore_dashboard(session, &snapshot.dir, &dashboard)?;
         println!("{}", t!("Tableau de bord rouvert.", "Dashboard opened again."));
     }
     if missing.is_empty() {
@@ -414,12 +517,12 @@ fn quote(text: &str) -> String {
     shlex::try_quote(text).map(|q| q.into_owned()).unwrap_or_else(|_| "''".into())
 }
 
-pub fn attach_or_hint(tmux: &Tmux, session: &str, team: &str, detach: bool) -> Result<()> {
+pub fn attach_or_hint(backend: &dyn Backend, session: &str, team: &str, detach: bool) -> Result<()> {
     if detach || !ui::interactive() {
         println!("{}", t!("Pour la rejoindre : recruit attach {}", "To join it: recruit attach {}", team));
         return Ok(());
     }
-    tmux.attach(session)
+    backend.attach(session)
 }
 
 /// A member's session is the one with its name in its directory (member.rs): two there could not be told apart.
@@ -493,11 +596,19 @@ fn check_trust(dir: &Path, config_dir: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn print_plan(plan: &Plan, commands: &[(String, String, std::path::PathBuf)]) {
-    println!(
-        "{}",
-        t!("Session tmux : {} (dossier {})", "tmux session: {} (directory {})", plan.session, tilde(&plan.dir))
-    );
+fn print_plan(plan: &Plan, commands: &[(String, String, std::path::PathBuf)], kind: backend::Kind) {
+    let head = match kind {
+        backend::Kind::Tmux => {
+            t!("Session tmux : {} (dossier {})", "tmux session: {} (directory {})", plan.session, tilde(&plan.dir))
+        }
+        backend::Kind::Native => t!(
+            "Équipe « {} », avec le multiplexeur de recruit (dossier {})",
+            "Team \"{}\", on recruit's multiplexer (directory {})",
+            plan.team,
+            tilde(&plan.dir)
+        ),
+    };
+    println!("{head}");
     for (i, tab) in plan.tabs.iter().enumerate() {
         let names: Vec<&str> = tab.panes.iter().map(|p| p.member.as_str()).collect();
         let side =
@@ -525,6 +636,46 @@ mod tests {
             assert_eq!((client.as_deref(), popup, read), (Some("/dev/ttys004"), false, nerd));
         }
     }
+    #[test]
+    fn a_ctrl_c_in_the_pause_leaves_the_shell() {
+        let script = member_script("/opt/re cruit", Path::new("/tmp/x"), "dev", true);
+        assert_eq!(script, r#"trap : INT; '/opt/re cruit' _member --resume /tmp/x dev; exec "${SHELL:-/bin/sh}" -l"#);
+        // dash behaves as busybox ash: a Ctrl-C to the group while it waits for `_member` (here a subshell that
+        // sends it) ends the script before its shell, unless it is caught. In a process group of its own: the
+        // signal reaches the script and what it runs, not the tests.
+        if !Path::new("/bin/dash").exists() {
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+        let script = "trap : INT; (kill -INT 0; sleep 1); echo after";
+        let out = std::process::Command::new("/bin/dash").args(["-c", script]).process_group(0).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("after"));
+    }
+
+    #[test]
+    fn a_crash_resumes_then_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let mut options = Options::default();
+        recover("x", state, &mut options, false).unwrap();
+        assert!(options.resume, "the first crash resumes without asking");
+        assert!(!state.join(RECOVERED).exists(), "noted once launched only");
+        note_recovery(state);
+        assert!(fs::read_to_string(state.join(RECOVERED)).unwrap().parse::<u64>().is_ok());
+        // Soon after: asked, and without a terminal to ask on, nothing starts.
+        let mut options = Options::default();
+        assert!(recover("x", state, &mut options, false).is_err());
+        // Unless --resume says so.
+        let mut options = Options { resume: true, ..Default::default() };
+        recover("x", state, &mut options, false).unwrap();
+        assert!(options.resume);
+        // Long after: as the first time.
+        fs::write(state.join(RECOVERED), "1000").unwrap();
+        let mut options = Options::default();
+        recover("x", state, &mut options, false).unwrap();
+        assert!(options.resume);
+    }
+
     #[test]
     fn click_command_as_bound() {
         let command = click_command("/opt/re cruit/recruit");

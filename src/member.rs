@@ -6,6 +6,7 @@
 //! once the member left the team. Each start again takes the member's settings as the team's files give them then.
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
@@ -55,6 +56,7 @@ pub fn run(state: &Path, member: &str, resume: bool) -> Result<()> {
         let started = Instant::now();
         let status =
             Command::new(&argv[0]).args(&argv[1..]).spawn().and_then(|child| watch(child, &snapshot, state, &info));
+        clear_status();
         let ended_by_team =
             status.as_ref().is_ok_and(|s| matches!(s.signal(), Some(libc::SIGHUP | libc::SIGTERM | libc::SIGKILL)));
         if HUNG_UP.load(Ordering::SeqCst) || ended_by_team {
@@ -102,6 +104,15 @@ pub fn run(state: &Path, member: &str, resume: bool) -> Result<()> {
         info = next;
         argv = resumed(&snapshot, state, &info);
     }
+}
+
+/// Ends the program status Claude gave its terminal (OSC 7501), whatever stopped it, a crash included: the native
+/// multiplexer then shows the pane without a state, and a status that a later program writes (a shell replaying old
+/// output) no longer counts. tmux ignores the sequence.
+fn clear_status() {
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(b"\x1b]7501;state=clear\x07");
+    let _ = out.flush();
 }
 
 /// Before a member starts again: its command line built again from the team's files (its model, its effort, its
@@ -173,6 +184,12 @@ fn note_session(snapshot: &Snapshot, state: &Path, info: &MemberInfo) {
 /// Where the session a member last ran is noted.
 fn session_file(state: &Path, member: &str) -> PathBuf {
     state.join("sessions").join(member)
+}
+
+/// The session a member last ran, as noted: none when it never ran, or the note is empty.
+pub fn noted(state: &Path, member: &str) -> Option<String> {
+    let id = fs::read_to_string(session_file(state, member)).ok()?;
+    Some(id.trim().to_string()).filter(|id| !id.is_empty())
 }
 
 /// The member's command line on the session it last ran; as launched when that session never got a word (no

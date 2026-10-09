@@ -1,7 +1,8 @@
 name: CI
 
 # Format, lint and tests on Linux and macOS, in both languages (the texts follow RECRUIT_LANG), and a build for the
-# Linux musl targets that releases ship. The binaries themselves are built by scripts/release.sh, on a Mac.
+# Linux musl targets that releases ship. The binaries themselves are built by scripts/release.sh, on a Mac. Before
+# Cargo, scripts/ghostty.sh builds the terminal engine (libghostty-vt) with its own pinned Zig, kept in a cache.
 on:
   push:
     branches: [main]
@@ -39,6 +40,11 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ghostty
+          key: ghostty-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ghostty.sh') }}
+      - run: scripts/ghostty.sh
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - name: Tests (English)
@@ -66,6 +72,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
-      - name: cargo-zigbuild (with zig, from PyPI)
-        run: pip install cargo-zigbuild==0.23.4 ziglang==0.17.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ghostty
+          key: ghostty-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('scripts/ghostty.sh') }}
+      - run: scripts/ghostty.sh ${{ matrix.target }}
+      - name: cargo-zigbuild (linking with the Zig that built libghostty-vt)
+        run: pip install cargo-zigbuild==0.23.4
       - run: cargo zigbuild --locked --target ${{ matrix.target }}
+        env:
+          CARGO_ZIGBUILD_ZIG_PATH: ${{ github.workspace }}/.ghostty/bin/zig

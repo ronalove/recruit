@@ -11,6 +11,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+use crate::backend::{Backend, MenuOpened};
 use crate::config::{TmuxSettings, cache_dir, home};
 use crate::i18n::Lang;
 use crate::layout::{self, Host, SidePanes, Tab, column_heights};
@@ -148,14 +149,6 @@ pub struct RunningTeam {
     pub team: String,
     pub dir: String,
     pub attached: bool,
-}
-
-pub trait Backend {
-    fn running(&self) -> Result<Vec<RunningTeam>>;
-    fn launch(&self, plan: &Plan) -> Result<()>;
-    /// Takes over the terminal; returns only on error or when switching from inside the same server.
-    fn attach(&self, session: &str) -> Result<()>;
-    fn stop(&self, session: &str) -> Result<()>;
 }
 
 pub struct Tmux {
@@ -348,15 +341,15 @@ impl Tmux {
         Ok(parse_click(&self.run(["display-message", "-p", "-t", pane, &format])?))
     }
 
-    /// Asks the user in a menu at the centre of `client`, over `pane`: `action` or `cancel`, `note` in grey between
-    /// them. Waits for the answer, a menu opened from outside a client returning once it closes: true when the action
-    /// was chosen.
+    /// Asks the user `choice` in a menu at the centre of `client`, over `pane`: its first option or its last (the
+    /// cancel), its note in grey between them, under its title. Waits for the answer, a menu opened from outside a
+    /// client returning once it closes: true when the first option was chosen.
     /// A menu already open on the client (another click's) stays alone: tmux returns at once without showing this
     /// one, which then counts as cancelled. Each menu answers with its own token, so that one never takes another's.
-    pub fn confirm(&self, client: &str, pane: &str, action: &str, note: &str, cancel: &str) -> Result<bool> {
+    pub fn confirm(&self, client: &str, pane: &str, choice: &crate::mux::chrome::Choice) -> Result<bool> {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
         let token = format!("{}-{now}", std::process::id());
-        self.run(confirm_menu(client, pane, &token, action, note, cancel))?;
+        self.run(confirm_menu(client, pane, &token, choice))?;
         Ok(self.run(["display-message", "-p", "-t", pane, &format!("#{{{CONFIRMED}}}")])? == token)
     }
 
@@ -715,6 +708,76 @@ impl Tmux {
 }
 
 impl Backend for Tmux {
+    fn has_session(&self, session: &str) -> bool {
+        Tmux::has_session(self, session)
+    }
+
+    fn panes(&self, session: &str) -> Result<Vec<PaneState>> {
+        Tmux::panes(self, session)
+    }
+
+    fn open_window(&self, session: &str, dir: &Path, pane: &Pane) -> Result<String> {
+        Tmux::open_window(self, session, dir, pane)
+    }
+
+    fn kill_pane(&self, id: &str) -> Result<()> {
+        Tmux::kill_pane(self, id)
+    }
+
+    fn set_member(&self, id: &str, member: &str) -> Result<()> {
+        Tmux::set_member(self, id, member)
+    }
+
+    fn respawn(&self, id: &str, dir: &Path, pane: &Pane) -> Result<()> {
+        Tmux::respawn(self, id, dir, pane)
+    }
+
+    fn arrange(&self, session: &str, tabs: &[Tab], columns: usize) -> Result<()> {
+        Tmux::arrange(self, session, tabs, columns)
+    }
+
+    fn open_panels(&self, dir: &Path, beside: &str, dashboard: &Pane, journal: &Pane) -> Result<()> {
+        Tmux::open_panels(self, dir, beside, dashboard, journal)
+    }
+
+    fn close_panels(&self, session: &str) -> Result<()> {
+        Tmux::close_panels(self, session)
+    }
+
+    fn restore_dashboard(&self, session: &str, dir: &Path, dashboard: &Pane) -> Result<()> {
+        Tmux::restore_dashboard(self, session, dir, dashboard)
+    }
+
+    fn toggle_journal(&self, session: &str, dir: &Path, journal: &Pane) -> Result<JournalSize> {
+        Tmux::toggle_journal(self, session, dir, journal)
+    }
+
+    fn focus(&self, session: &str, member: &str) -> Result<bool> {
+        Tmux::focus(self, session, member)
+    }
+
+    fn detach(&self, client: &str) -> Result<()> {
+        Tmux::detach(self, client)
+    }
+
+    fn open_menu(&self, state: &Path, session: &str, member: Option<&str>, client: Option<&str>) -> Result<MenuOpened> {
+        let client = match (client, member) {
+            (Some(client), _) => client.to_string(),
+            (None, Some(member)) => match self.client_of(session, member)? {
+                Some((client, _)) => client,
+                None => return Ok(MenuOpened::NoClient),
+            },
+            // Nobody to show it to: no one calls it so today.
+            (None, None) => return Ok(MenuOpened::NoClient),
+        };
+        crate::live::popup(state, &client)?;
+        Ok(MenuOpened::Opened)
+    }
+
+    fn client_terminals(&self, session: &str) -> String {
+        Tmux::client_terminals(self, session)
+    }
+
     fn running(&self) -> Result<Vec<RunningTeam>> {
         let output = self
             .command()
@@ -893,23 +956,35 @@ fn parse_click(text: &str) -> Option<Click> {
 /// Where the confirmation menu leaves its answer, in the pane's options.
 const CONFIRMED: &str = "@recruit_confirmed";
 
-/// `display-menu` arguments for a confirmation at the centre of `client`: `action` (key c), a `note` in grey that
-/// cannot be chosen, then `cancel` (key q). Choosing the action only sets an option on `pane` to `token` (digits and
-/// a dash): the caller reads it once the menu closes, nothing else it was given goes through a command. The menu
-/// reads its texts as formats.
+/// `display-menu` arguments for a confirmation at the centre of `client`: `choice`'s title, its first option (the
+/// action) with its key, its note in grey that cannot be chosen, then its last option (the cancel) with its key.
+/// Choosing the action only sets an option on `pane` to `token` (digits and a dash): the caller reads it once the
+/// menu closes, nothing else it was given goes through a command. The menu reads its texts as formats.
 ///
 /// Opened from outside a mouse binding, a menu ignores the mouse unless told (`-M`): a click on an item would close
 /// it unchosen. With the mouse, tmux reports every motion, and one outside the menu, where the pointer starts, would
 /// close it too: `-O` keeps it open until a click, on an item or outside.
-fn confirm_menu(client: &str, pane: &str, token: &str, action: &str, note: &str, cancel: &str) -> Vec<String> {
+///
+/// No `-C` to open it on the cancel, as `choice.selected` would have it: with `-M`, tmux (3.8) ignores `-C`, and
+/// `-M` is needed. Nothing is selected at the start, so ⏎ does nothing: only the action's key or a click compacts,
+/// which stays safe.
+fn confirm_menu(client: &str, pane: &str, token: &str, choice: &crate::mux::chrome::Choice) -> Vec<String> {
     let text = |t: &str| t.replace('#', "##");
     let chosen = format!("set-option -p -t {} {CONFIRMED} {}", tmux_quote(pane), tmux_quote(token));
-    let head = ["display-menu", "-M", "-O", "-c", client, "-t", pane, "-T", "#[align=centre] recruit "];
+    let title = format!("#[align=centre] {} ", text(&choice.title));
+    let head = ["display-menu", "-M", "-O", "-c", client, "-t", pane, "-T", &title];
     let head = head.into_iter().chain(["-x", "C", "-y", "C"]);
     let mut args: Vec<String> = head.map(String::from).collect();
+    let option =
+        |i: usize| choice.options.get(i).map(|(key, label)| (text(label), key.to_string())).unwrap_or_default();
+    let (action, action_key) = option(0);
+    let (cancel, cancel_key) = option(choice.options.len().saturating_sub(1));
+    args.extend([action, action_key, chosen]);
     // An item whose name starts with `-` is shown dim and cannot be chosen.
-    args.extend([text(action), "c".into(), chosen, format!("-{}", text(note)), String::new(), String::new()]);
-    args.extend([String::new(), text(cancel), "q".into(), String::new()]);
+    if let Some(note) = &choice.note {
+        args.extend([format!("-{}", text(note)), String::new(), String::new()]);
+    }
+    args.extend([String::new(), cancel, cancel_key, String::new()]);
     args
 }
 
@@ -1097,25 +1172,25 @@ mod tests {
 
     #[test]
     fn confirmation_menu() {
-        let menu = confirm_menu(
-            "/dev/ttys004",
-            "%3",
-            "812-1791390000",
-            "Compacter dev-cli",
-            "Relit tout #son contexte",
-            "Annuler",
-        );
+        let choice = crate::mux::chrome::Choice {
+            title: "Compacter dev-cli ?".into(),
+            note: Some("Résume #sa conversation (88 %).".into()),
+            options: vec![('c', "Compacter".into()), ('a', "Annuler".into())],
+            selected: 1,
+        };
+        let menu = confirm_menu("/dev/ttys004", "%3", "812-1791390000", &choice);
         // The mouse handled, and the menu kept open by a motion outside it.
-        let head = ["display-menu", "-M", "-O", "-c", "/dev/ttys004", "-t", "%3", "-T", "#[align=centre] recruit "];
+        let title = "#[align=centre] Compacter dev-cli ? ";
+        let head = ["display-menu", "-M", "-O", "-c", "/dev/ttys004", "-t", "%3", "-T", title];
         assert_eq!(menu[..9], head);
         assert_eq!(menu[9..13], ["-x", "C", "-y", "C"]);
         let items = &menu[13..];
         let chosen = r#"set-option -p -t "%3" @recruit_confirmed 812-1791390000"#;
-        assert_eq!(items[..3], ["Compacter dev-cli", "c", chosen]);
+        assert_eq!(items[..3], ["Compacter", "c", chosen]);
         // The note, dim and not to be chosen: its `#` shown as is, not read as a format.
-        assert_eq!(items[3..6], ["-Relit tout ##son contexte", "", ""]);
+        assert_eq!(items[3..6], ["-Résume ##sa conversation (88 %).", "", ""]);
         // A line, then cancelling, which does nothing.
-        assert_eq!(items[6..], ["", "Annuler", "q", ""]);
+        assert_eq!(items[6..], ["", "Annuler", "a", ""]);
         // Choosing sets an option and runs nothing else: no text given goes into a command.
         assert!(menu.iter().filter(|a| a.contains("set-option")).all(|a| !a.contains("dev-cli")));
     }
