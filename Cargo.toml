@@ -1,6 +1,6 @@
 [package]
 name = "recruit"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Launch a team of Claude Code agents in tmux, each one knowing its role and its teammates"
