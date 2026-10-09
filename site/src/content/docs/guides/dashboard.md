@@ -17,6 +17,8 @@ Both sit on the right of your contacts, in the first tab: the **dashboard** on t
 
 At the top: the time, how many members are in each state, and the shortcuts. In a narrow pane, the time goes first, then the shortcuts. Then a card per member.
 
+Typing in the dashboard or the journal does nothing. The dashboard redraws itself whole every 30 seconds and when the computer wakes up; `Ctrl-L`, in its pane, redraws it at once.
+
 ### A card
 
 A line on the card's left takes the color of the member's state, and the name says it too:
@@ -26,6 +28,9 @@ A line on the card's left takes the color of the member's state, and the name sa
 | At work | bright yellow | bold, with a spinner on its left |
 | Waiting for you in its terminal (a permission, a question) | bright red | bold, with the state's icon on its left, and the time in red |
 | At rest | grey | dimmed, with the state's icon on its left |
+| At rest, while a command it started still runs (a server, a watcher) | grey | dimmed, with a terminal sign on its left (❯, or a console icon where the terminal has Nerd Font symbols) |
+
+Claude Code counts a member whose command still runs past its turn as busy. Its turn is over, though, so the dashboard shows it at rest, under that sign; back at work, it shows at work again.
 
 The card also shows for how long the member has been in that state (12s, 22m, 1h05), a curve of its activity over the last half hour, and, in its title, its model and its effort, as far as the room allows: "Opus █ xhigh", else "Opus █", else "Opus". The model is always dimmed. The effort is always bright, in Claude Code's colors (low yellow, medium green, high and xhigh purple, max rainbow), with its level sign. Without the mod, these are the ones the team's file sets, when it sets them.
 

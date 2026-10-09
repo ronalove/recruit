@@ -100,6 +100,16 @@ impl Glyphs {
         }
     }
 
+    /// The sign of a member at rest while a command it started still runs: a terminal's prompt, one column wide (not
+    /// ⌨, which may be drawn as an emoji).
+    pub(crate) fn console(self) -> char {
+        match self {
+            // nf-md-console
+            Glyphs::Nerd => '\u{F018D}',
+            Glyphs::Unicode => '❯',
+        }
+    }
+
     /// The sign of a teammate of the session's own team: a person, one column wide (a pawn: ☺ and ♟ may be drawn as
     /// emoji, two columns).
     pub(crate) fn person(self) -> char {
@@ -237,6 +247,7 @@ mod tests {
         for glyphs in [Glyphs::Unicode, Glyphs::Nerd] {
             assert_eq!(glyphs.hourglass().width(), Some(1), "{glyphs:?}");
             assert_eq!(glyphs.person().width(), Some(1), "{glyphs:?}");
+            assert_eq!(glyphs.console().width(), Some(1), "{glyphs:?}");
         }
     }
 

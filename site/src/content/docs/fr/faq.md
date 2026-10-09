@@ -57,6 +57,10 @@ claude            # accepte, puis /exit
 recruit
 ```
 
+### Un membre reste au travail alors qu'il ne fait rien
+
+Une commande qu'il a lancée tourne peut-être encore après son tour : un serveur de développement, une surveillance de fichiers, une commande bloquée. Claude Code compte une telle session comme occupée. Avec un Claude Code récent, le tableau de bord fait la différence et montre le membre au repos, sous ❯, jusqu'à la fin de la commande. Avec un plus ancien, le membre reste « au travail » jusqu'à ce que la commande se termine ou que tu l'arrêtes dans son panneau.
+
 ### Un membre s'est arrêté et n'est pas relancé
 
 Quand le Claude d'un membre s'arrête deux fois de suite juste après son démarrage, son panneau cesse d'essayer et le dit. Regarde l'erreur dans le panneau, corrige la cause (un argument faux dans `args`, un profil non connecté…), puis :

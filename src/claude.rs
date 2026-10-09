@@ -76,6 +76,25 @@ pub fn running(claude: &Path, config_dir: Option<&Path>) -> Result<Vec<Running>>
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
+/// What a session's own file in the profile says of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionFile {
+    /// `busy`, `idle`, `shell` while a command it started runs past its turn…
+    pub status: String,
+    /// Since when, in seconds since the epoch, when it says it in a way read here.
+    pub since: Option<i64>,
+}
+
+/// A session's own file in the profile (`sessions/<pid>.json`); None when missing or without a status. Its time
+/// (`statusUpdatedAt`, in milliseconds, whole or not) may be missing: the status stands on its own.
+pub fn session_status(config_dir: Option<&Path>, pid: u32) -> Option<SessionFile> {
+    let file = profile_dir(config_dir).join("sessions").join(format!("{pid}.json"));
+    let session: serde_json::Value = serde_json::from_str(&fs::read_to_string(file).ok()?).ok()?;
+    let since =
+        session["statusUpdatedAt"].as_f64().filter(|ms| ms.is_finite() && *ms > 0.0).map(|ms| (ms / 1000.0) as i64);
+    Some(SessionFile { status: session["status"].as_str()?.to_string(), since })
+}
+
 /// Whether Claude Code trusts this folder, as recorded in its global configuration: the folder or one of its
 /// parents approved. None when the configuration cannot be read.
 pub fn trusted(dir: &Path, config_dir: Option<&Path>) -> Option<bool> {
@@ -276,6 +295,30 @@ impl Launch<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_status_from_its_file() {
+        let profile = tempfile::tempdir().unwrap();
+        let sessions = profile.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("42.json"), r#"{"pid":42,"status":"shell","statusUpdatedAt":1791530838682}"#).unwrap();
+        let file = |status: &str, since| Some(SessionFile { status: status.into(), since });
+        assert_eq!(session_status(Some(profile.path()), 42), file("shell", Some(1_791_530_838)));
+        // Its time written otherwise, or not at all: the status alone.
+        fs::write(sessions.join("45.json"), r#"{"pid":45,"status":"shell","statusUpdatedAt":1791530838682.5}"#)
+            .unwrap();
+        assert_eq!(session_status(Some(profile.path()), 45), file("shell", Some(1_791_530_838)));
+        fs::write(sessions.join("46.json"), r#"{"pid":46,"status":"shell","statusUpdatedAt":"soon"}"#).unwrap();
+        assert_eq!(session_status(Some(profile.path()), 46), file("shell", None));
+        fs::write(sessions.join("47.json"), r#"{"pid":47,"status":"shell"}"#).unwrap();
+        assert_eq!(session_status(Some(profile.path()), 47), file("shell", None));
+        // Missing, or not as expected: nothing.
+        assert_eq!(session_status(Some(profile.path()), 7), None);
+        fs::write(sessions.join("43.json"), r#"{"pid":43,"status":3}"#).unwrap();
+        assert_eq!(session_status(Some(profile.path()), 43), None);
+        fs::write(sessions.join("44.json"), r#"{"pid":44,"status":"idle""#).unwrap();
+        assert_eq!(session_status(Some(profile.path()), 44), None);
+    }
 
     #[test]
     fn project_keys() {

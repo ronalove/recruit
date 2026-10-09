@@ -57,6 +57,10 @@ claude            # accept, then /exit
 recruit
 ```
 
+### A member stays at work while it does nothing
+
+A command it started may still run past its turn: a development server, a watcher, a command that hangs. Claude Code counts such a session as busy. With a recent Claude Code, the dashboard tells the two apart and shows the member at rest, under ❯, until the command ends. With an older one, the member stays "at work" until the command ends or you stop it in its pane.
+
 ### A member stopped and is not started again
 
 When a member's Claude stops twice in a row just after starting, its pane stops trying and says so. Look at the error in the pane, fix the cause (a wrong argument in `args`, a profile not logged in…), then:

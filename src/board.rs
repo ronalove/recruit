@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -19,6 +21,7 @@ use crossterm::{cursor, queue};
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{Helper, HelperStatus, Report, Task};
+use crate::canvas::PanicGuard;
 use crate::claude::{self, Running};
 use crate::config::{TmuxSettings, write_atomic};
 use crate::i18n::Lang;
@@ -61,6 +64,84 @@ pub fn journal_title(_: Lang) -> &'static str {
 /// How often the panels look again: `claude agents --json`, the mod's reports, the activity samples.
 const TICK: Duration = Duration::from_secs(1);
 
+/// The key that asks for the whole board again, as everywhere in a terminal.
+const CTRL_L: u8 = 0x0c;
+
+/// A panel's keyboard, kept quiet: what is typed in its pane is neither echoed nor gathered into lines, so that
+/// nothing moves the screen (an Enter echoed on the last line would scroll every line up one, and the board, written
+/// by difference, would stay shifted). What comes is read on the side, and dropped; Ctrl-L asks for the whole board
+/// again (`redraw`). Signals stay as they were: Ctrl-C stops the panel. Nothing when the input is no terminal. The
+/// terminal is given back as it was once the guard goes, a panic included (a panel run by hand in a terminal).
+fn quiet_input(redraw: Arc<AtomicBool>) -> Option<QuietInput> {
+    let mut term: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut term) } != 0 {
+        return None;
+    }
+    let _ = ORIGINAL.set(term);
+    term.c_lflag &= !(libc::ECHO | libc::ICANON);
+    term.c_cc[libc::VMIN] = 1;
+    term.c_cc[libc::VTIME] = 0;
+    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term) } != 0 {
+        return None;
+    }
+    let guard = QuietInput { _panic: PanicGuard::install(loud_input) };
+    // Stopped by a signal (Ctrl-C, the pane closed): given back too, then stopped as the signal would.
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        unsafe { libc::signal(signal, on_signal as *const () as libc::sighandler_t) };
+    }
+    std::thread::spawn(move || {
+        let mut bytes = [0u8; 64];
+        let mut input = std::io::stdin();
+        while let Ok(read) = input.read(&mut bytes) {
+            if read == 0 {
+                break;
+            }
+            if bytes[..read].contains(&CTRL_L) {
+                redraw.store(true, Ordering::Relaxed);
+            }
+        }
+    });
+    Some(guard)
+}
+
+/// The terminal's settings before [`quiet_input`].
+static ORIGINAL: OnceLock<libc::termios> = OnceLock::new();
+
+/// The terminal's settings as they were before [`quiet_input`].
+fn loud_input() {
+    if let Some(term) = ORIGINAL.get() {
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, term) };
+    }
+}
+
+/// A signal that stops a panel: the terminal as it was, then the signal's own way (`tcsetattr` may run in a handler).
+extern "C" fn on_signal(signal: libc::c_int) {
+    loud_input();
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
+
+/// While it lives, the keyboard stays quiet (see [`quiet_input`]).
+struct QuietInput {
+    _panic: PanicGuard,
+}
+
+impl Drop for QuietInput {
+    fn drop(&mut self) {
+        // A panic: its hook did it already.
+        if !std::thread::panicking() {
+            loud_input();
+        }
+    }
+}
+
+/// However the pane may have moved without the board knowing (a terminal that drew it again, the computer asleep),
+/// the whole board is written again this often, and whenever the clock jumps further than `CLOCK_JUMP`.
+const WHOLE_EVERY: Duration = Duration::from_secs(30);
+const CLOCK_JUMP: i64 = 5;
+
 /// The members' sessions by name, and every session's name by process: replies are addressed to a process.
 #[derive(Default)]
 struct Sessions {
@@ -68,13 +149,33 @@ struct Sessions {
     by_pid: HashMap<u32, String>,
     /// Sessions open elsewhere under a member's name, with the folder they work in: messages by name could go astray.
     elsewhere: Vec<(String, Option<String>)>,
+    /// The members at rest while a command they started still runs (see [`at_rest_with_a_command`]), and since when,
+    /// when their file says it.
+    shell: HashMap<String, Option<i64>>,
     error: Option<String>,
 }
 
 fn sessions(s: &Snapshot) -> Sessions {
     match claude::running(&s.claude, s.config_dir.as_deref()) {
-        Ok(running) => sorted(s, running),
+        Ok(running) => {
+            let mut found = sorted(s, running);
+            at_rest_with_a_command(&mut found, |pid| claude::session_status(s.config_dir.as_deref(), pid));
+            found
+        }
         Err(error) => Sessions { error: Some(format!("{error:#}")), ..Default::default() },
+    }
+}
+
+/// `claude agents` says `busy` of a session whose turn is over while a command it started still runs (a server, or
+/// one that hangs): its own file says `shell` (2.1.294). Such a member is at rest, its card says the command runs.
+/// Back at work meanwhile, its file says `busy` again. No file, or not as expected: as `claude agents` says.
+fn at_rest_with_a_command(found: &mut Sessions, status: impl Fn(u32) -> Option<claude::SessionFile>) {
+    for (name, session) in &mut found.members {
+        let Some(pid) = session.pid.filter(|_| session.status.as_deref() == Some("busy")) else { continue };
+        if let Some(file) = status(pid).filter(|file| file.status == "shell") {
+            session.status = Some("idle".into());
+            found.shell.insert(name.clone(), file.since);
+        }
     }
 }
 
@@ -151,6 +252,8 @@ struct Card {
     samples: Vec<(i64, bool)>,
     /// The agents its session started: subagents, teammates.
     helpers: Vec<Helper>,
+    /// At rest while a command it started still runs.
+    shell: bool,
 }
 
 /// How near a session is to compacting on its own, which colors its context.
@@ -209,6 +312,8 @@ fn reread(s: &mut Snapshot, state: &Path) {
 fn dashboard(first: &Snapshot, state: &Path) -> Result<()> {
     let mut out = std::io::stdout();
     queue!(out, cursor::Hide)?;
+    let redraw = Arc::new(AtomicBool::new(false));
+    let _quiet = quiet_input(Arc::clone(&redraw));
     std::thread::scope(|scope| {
         // `claude agents --json` takes a tenth of a second or more: asked on the side, it does not stall the spinners.
         let (sender, news) = mpsc::channel();
@@ -241,6 +346,8 @@ fn dashboard(first: &Snapshot, state: &Path) -> Result<()> {
         // What the zones file says: nothing yet, it may be the last launch's.
         let mut saved: Option<Vec<Zone>> = None;
         let mut fresh = news.recv().ok();
+        let mut whole = Instant::now();
+        let mut clock = now();
         loop {
             if let Some((s, (sessions, glyphs))) = fresh.take() {
                 board = Board { glyphs, ..memory.board(&s, state, &sessions) };
@@ -256,6 +363,12 @@ fn dashboard(first: &Snapshot, state: &Path) -> Result<()> {
             }
             board.now = now();
             board.frame = frame(start.elapsed());
+            let jumped = (board.now - clock).abs() > CLOCK_JUMP;
+            clock = board.now;
+            if redraw.swap(false, Ordering::Relaxed) || jumped || whole.elapsed() >= WHOLE_EVERY {
+                screen.forget();
+                whole = Instant::now();
+            }
             screen.draw(&mut out, &board)?;
             if saved.as_ref() != Some(&screen.zones) {
                 // Not written, it is only the clicks that miss; tried again when the layout changes.
@@ -347,6 +460,11 @@ impl Memory {
             if entry.0 != st {
                 *entry = (st, seen);
             }
+            // At rest with a command running: since its file says, a panel opened again included.
+            if let Some(Some(at)) = sessions.shell.get(&member.name).filter(|_| st == State::Idle) {
+                let back = Duration::from_secs(now.saturating_sub(*at).max(0) as u64);
+                entry.1 = seen.checked_sub(back).unwrap_or(seen);
+            }
             let samples = self.activity.entry(member.name.clone()).or_default();
             samples.push_back((now, st == State::Working));
             while samples.front().is_some_and(|(at, _)| *at <= now - HISTORY) {
@@ -369,6 +487,7 @@ impl Memory {
                 doing: bridge::doing(state, &member.name),
                 samples: samples.iter().copied().collect(),
                 helpers,
+                shell: sessions.shell.contains_key(&member.name),
             });
         }
         // Those no longer in the team, forgotten; but for a while those whose session may come back under another name.
@@ -400,6 +519,11 @@ struct Screen {
 }
 
 impl Screen {
+    /// Forgets what the pane shows: the next frame writes every line.
+    fn forget(&mut self) {
+        self.lines.clear();
+    }
+
     /// The board over the pane, each changed line written over the old one rather than cleared, so that nothing
     /// flickers.
     fn draw(&mut self, out: &mut impl Write, board: &Board) -> Result<()> {
@@ -1244,7 +1368,7 @@ fn card(c: &Card, width: usize, lines: usize, helpers: Helpers, right: &Right, b
     let mut title = vec![
         bar(0),
         (" ".into(), Paint::Plain),
-        (c.state.icon(b.glyphs, b.frame).to_string(), sign),
+        (if c.shell { b.glyphs.console() } else { c.state.icon(b.glyphs, b.frame) }.to_string(), sign),
         (" ".into(), Paint::Plain),
         (shown, name),
         (" ".repeat(gap), Paint::Plain),
@@ -1598,6 +1722,8 @@ const BACKLOG: usize = 200;
 fn journal(mut s: Snapshot, state: &Path) -> Result<()> {
     let mut out = std::io::stdout();
     queue!(out, cursor::Hide)?;
+    // What is typed there shows nowhere either (an Enter would leave an empty line between two messages).
+    let _quiet = quiet_input(Arc::new(AtomicBool::new(false)));
     let width = terminal::size().map_or(80, |(w, _)| w as usize);
     let hint = t!("{ALT}j taille", "{ALT}j size");
     let title = " Journal ";
@@ -1845,6 +1971,7 @@ mod tests {
             doing: None,
             samples: (0..600).map(|i| (1000 - i, i % 3 == 0)).collect(),
             helpers: Vec::new(),
+            shell: false,
         }
     }
 
@@ -2394,6 +2521,25 @@ mod tests {
     }
 
     #[test]
+    fn forgotten_screen_written_whole() {
+        let b = board(vec![sample_card("dev", false, State::Idle)]);
+        let mut screen = Screen::default();
+        let mut out = Vec::new();
+        screen.draw(&mut out, &b).unwrap();
+        let whole = out.len();
+        assert!(whole > 0);
+        // The same board: nothing to write.
+        out.clear();
+        screen.draw(&mut out, &b).unwrap();
+        assert!(out.is_empty());
+        // Forgotten, as after Ctrl-L or a while: all of it again.
+        screen.forget();
+        out.clear();
+        screen.draw(&mut out, &b).unwrap();
+        assert_eq!(out.len(), whole);
+    }
+
+    #[test]
     fn teammate_gone_quiet_shows_unknown() {
         let mut cards = with_helpers();
         cards[0].helpers.clear();
@@ -2712,6 +2858,56 @@ mod tests {
             journal: Vec::new(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn at_rest_while_a_command_runs() {
+        let session = |status: &str, pid| Running {
+            name: None,
+            cwd: None,
+            status: Some(status.into()),
+            session_id: None,
+            pid: Some(pid),
+        };
+        let mut found = Sessions {
+            members: [
+                ("server", session("busy", 1)),
+                ("thinking", session("busy", 2)),
+                ("unknown", session("busy", 3)),
+                ("resting", session("idle", 4)),
+            ]
+            .map(|(name, session)| (name.to_string(), session))
+            .into(),
+            ..Default::default()
+        };
+        // Its own file: a command running past the turn, at work, none; one at rest is not asked.
+        let files = |pid| match pid {
+            1 | 4 => Some(claude::SessionFile { status: "shell".into(), since: Some(now() - 600) }),
+            2 => Some(claude::SessionFile { status: "busy".into(), since: None }),
+            _ => None,
+        };
+        at_rest_with_a_command(&mut found, files);
+        let status = |name: &str| found.members[name].status.clone().unwrap();
+        assert_eq!(
+            [status("server"), status("thinking"), status("unknown"), status("resting")],
+            ["idle", "busy", "busy", "idle"]
+        );
+        assert_eq!(found.shell.keys().collect::<Vec<_>>(), ["server"]);
+
+        // On the board, and for the menu: at rest, under a terminal's sign.
+        let s = snapshot(&["server", "thinking", "unknown", "resting"]);
+        let state = tempfile::tempdir().unwrap();
+        let mut memory = Memory::default();
+        let seen = memory.board(&s, state.path(), &found);
+        let server = seen.cards.iter().find(|c| c.name == "server").unwrap();
+        assert_eq!((server.state, server.shell), (State::Idle, true));
+        // Since its file says, ten minutes: not since the panel looked.
+        assert!((600..610).contains(&server.since), "{}", server.since);
+        let states = memory.states(&seen, SystemTime::now(), Instant::now());
+        assert_eq!(states.members["server"].state, State::Idle);
+        let right = Right::of([(server, 50)]);
+        let title = visible(&card(server, 50, 0, Helpers::Left, &right, &board(Vec::new()))[0]);
+        assert!(title.starts_with(&format!("╻ {} server", Glyphs::Unicode.console())), "{title:?}");
     }
 
     #[test]

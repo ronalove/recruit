@@ -17,6 +17,8 @@ Les deux sont à droite de tes interlocuteurs, dans le premier onglet : le **tab
 
 En haut : l'heure, combien de membres sont dans chaque état, et les raccourcis. Dans un panneau étroit, l'heure disparaît d'abord, puis les raccourcis. Puis une carte par membre.
 
+Ce que tu tapes dans le tableau de bord ou le journal ne fait rien. Le tableau de bord se redessine en entier toutes les 30 secondes et quand l'ordinateur sort de veille ; `Ctrl-L`, dans son panneau, le redessine aussitôt.
+
 ### Une carte
 
 Un trait à gauche de la carte prend la couleur de l'état du membre, et le nom le dit aussi :
@@ -26,6 +28,9 @@ Un trait à gauche de la carte prend la couleur de l'état du membre, et le nom 
 | Au travail | jaune vif | en gras, avec un indicateur animé à sa gauche |
 | T'attend dans son terminal (une permission, une question) | rouge vif | en gras, avec l'icône de l'état à sa gauche, et le temps en rouge |
 | Au repos | gris | atténué, avec l'icône de l'état à sa gauche |
+| Au repos, pendant qu'une commande qu'il a lancée tourne encore (un serveur, une surveillance de fichiers) | gris | atténué, avec un signe de terminal à sa gauche (❯, ou une icône de console là où le terminal a les symboles Nerd Font) |
+
+Claude Code compte comme occupé un membre dont une commande tourne encore après la fin de son tour. Son tour est pourtant fini : le tableau de bord le montre au repos, sous ce signe ; s'il se remet au travail, il repasse au travail.
 
 La carte montre aussi depuis combien de temps le membre est dans cet état (12s, 22m, 1h05), une courbe de son activité sur la dernière demi-heure et, dans son titre, son modèle et son effort, autant que la place le permet : « Opus █ xhigh », sinon « Opus █ », sinon « Opus ». Le modèle est toujours atténué. L'effort est toujours vif, dans les couleurs de Claude Code (low jaune, medium vert, high et xhigh violet, max arc-en-ciel), avec son signe de niveau. Sans le mod, ce sont ceux que fixe le fichier de l'équipe, s'il les fixe.
 
