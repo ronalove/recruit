@@ -625,20 +625,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_menu_line_reads_back() {
-        for nerd in [false, true] {
-            let line = menu_line("/opt/re cruit", Lang::Fr, Path::new("/tmp/équipe x"), "/dev/ttys004", nerd);
-            let words = shlex::split(&line).expect("a shell line");
-            assert_eq!(words[0], "/opt/re cruit");
-            let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(&words).unwrap();
-            let Some(crate::cli::Command::Menu { state, client, popup, nerd: read, .. }) = cli.command else {
-                panic!()
-            };
-            assert_eq!(state, Path::new("/tmp/équipe x"));
-            assert_eq!((client.as_deref(), popup, read), (Some("/dev/ttys004"), false, nerd));
-        }
-    }
-    #[test]
     fn a_ctrl_c_in_the_pause_leaves_the_shell() {
         let script = member_script("/opt/re cruit", Path::new("/tmp/x"), "dev", true);
         assert_eq!(script, r#"trap : INT; '/opt/re cruit' _member --resume /tmp/x dev; exec "${SHELL:-/bin/sh}" -l"#);
@@ -654,6 +640,20 @@ mod tests {
         assert!(String::from_utf8_lossy(&out.stdout).contains("after"));
     }
 
+    #[test]
+    fn the_menu_line_reads_back() {
+        for nerd in [false, true] {
+            let line = menu_line("/opt/re cruit", Lang::Fr, Path::new("/tmp/équipe x"), "/dev/ttys004", nerd);
+            let words = shlex::split(&line).expect("a shell line");
+            assert_eq!(words[0], "/opt/re cruit");
+            let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(&words).unwrap();
+            let Some(crate::cli::Command::Menu { state, client, popup, nerd: read, .. }) = cli.command else {
+                panic!()
+            };
+            assert_eq!(state, Path::new("/tmp/équipe x"));
+            assert_eq!((client.as_deref(), popup, read), (Some("/dev/ttys004"), false, nerd));
+        }
+    }
     #[test]
     fn a_crash_resumes_then_asks() {
         let dir = tempfile::tempdir().unwrap();
