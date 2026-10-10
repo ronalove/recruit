@@ -7,6 +7,9 @@ use std::time::Duration;
 
 use crossterm::style::Color;
 
+/// How the Alt key is written before a key in what recruit shows: the Option symbol on macOS, `Alt+` elsewhere.
+pub const ALT: &str = if cfg!(target_os = "macos") { "⌥" } else { "Alt+" };
+
 /// How often the dashboard redraws while a member works, for the spinners: ten images a second, one turn.
 pub(crate) const FRAME: Duration = Duration::from_millis(100);
 /// A working member's spinner, one image per frame.
@@ -127,8 +130,8 @@ impl Glyphs {
 pub(crate) const NERD_TERMINALS: [&str; 3] = ["ghostty", "kitty", "wezterm"];
 
 impl Glyphs {
-    /// From the clients attached to the team, one per line as `Tmux::client_terminals` gives them: their `TERM`, then
-    /// the terminal's name and version when it told tmux (`ghostty 1.3.1`, under a `TERM` that may well be
+    /// From the clients attached to the team, one per line as `Backend::client_terminals` gives them: their `TERM`,
+    /// a tab, then the terminal's name and version when it told it (`ghostty 1.3.1`, under a `TERM` that may well be
     /// `xterm-256color`).
     pub(crate) fn of(clients: &str) -> Self {
         let nerd = |client: &str| {

@@ -2,7 +2,7 @@
 
 recruit fait de Claude Code une équipe de spécialistes qui dure. Tu donnes le cap ; ils se répartissent le travail, le construisent, le testent et le livrent, jour après jour.
 
-![recruit au travail : tu demandes au chef de projet, il répartit le travail, et le tableau de bord montre chaque spécialiste au travail, puis la tâche finie](site/src/assets/screenshots/demo-fr.gif)
+![recruit au travail : tu demandes au coordinateur, il répartit le travail, et le tableau de bord montre qui prend quelle tâche, et qui attend ton feu vert](site/src/assets/screenshots/demo.gif)
 
 **[Site et documentation](https://ronalove.github.io/recruit/fr/)** · [English version](README.md)
 
@@ -27,7 +27,7 @@ Fait par sa propre équipe : un coordinateur, deux développeurs, un relecteur e
 brew install ronalove/tap/recruit
 ```
 
-Binaires précompilés pour macOS et Linux, par Homebrew ou dans les [releases](https://github.com/ronalove/recruit/releases). recruit a besoin de [Claude Code](https://claude.com/claude-code) et de tmux 3.5 ou plus récent. [Plus de détails sur l'installation](https://ronalove.github.io/recruit/fr/getting-started/installation/).
+Binaires précompilés pour macOS et Linux, par Homebrew ou dans les [releases](https://github.com/ronalove/recruit/releases). Un seul binaire, rien d'autre à installer : recruit n'a besoin que de [Claude Code](https://claude.com/claude-code). [Plus de détails sur l'installation](https://ronalove.github.io/recruit/fr/getting-started/installation/).
 
 ## Démarrer
 
@@ -42,7 +42,7 @@ recruit                                              # la lancer, et parler au c
 ## Documentation
 
 - Prise en main : [Installation](https://ronalove.github.io/recruit/fr/getting-started/installation/) · [Démarrage rapide](https://ronalove.github.io/recruit/fr/getting-started/quick-start/)
-- Guides : [Équipes](https://ronalove.github.io/recruit/fr/guides/teams/) · [Interlocuteurs et agents de travail](https://ronalove.github.io/recruit/fr/guides/contacts-and-agents/) · [Tableau de bord et journal](https://ronalove.github.io/recruit/fr/guides/dashboard/) · [Le menu de l'équipe](https://ronalove.github.io/recruit/fr/guides/menu/) · [Dans tmux](https://ronalove.github.io/recruit/fr/guides/tmux/) · [Avec Claude Code](https://ronalove.github.io/recruit/fr/guides/claude-code/)
+- Guides : [Équipes](https://ronalove.github.io/recruit/fr/guides/teams/) · [Interlocuteurs et agents de travail](https://ronalove.github.io/recruit/fr/guides/contacts-and-agents/) · [Tableau de bord et journal](https://ronalove.github.io/recruit/fr/guides/dashboard/) · [Le menu de l'équipe](https://ronalove.github.io/recruit/fr/guides/menu/) · [L'écran de l'équipe](https://ronalove.github.io/recruit/fr/guides/screen/) · [Avec Claude Code](https://ronalove.github.io/recruit/fr/guides/claude-code/)
 - Référence : [Commandes](https://ronalove.github.io/recruit/fr/reference/commands/) · [Configuration](https://ronalove.github.io/recruit/fr/reference/configuration/) · [Équipes intégrées](https://ronalove.github.io/recruit/fr/reference/templates/)
 - [FAQ et dépannage](https://ronalove.github.io/recruit/fr/faq/)
 

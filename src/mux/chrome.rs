@@ -19,9 +19,9 @@ use crossterm::style::Color;
 
 use super::Rect;
 use crate::canvas::{Canvas, Style, columns, fit};
+use crate::look::ALT;
 use crate::look::{Glyphs, Pressure, State};
 use crate::t;
-use crate::tmux::ALT;
 
 /// How the chrome draws its signs: Nerd Font or Unicode, and the spinner's image (`look::frame`) for the members at
 /// work. While a header or a tab shows one at work, the screen is drawn again every `look::FRAME`.
@@ -100,8 +100,7 @@ pub(crate) enum Zoom {
 pub(crate) enum Hint {
     /// The journal: ⌥j takes it to its next size.
     JournalSize,
-    /// The dashboard: how many members work, wait for the user and rest (« ⠹ 5  ⚑ 1  ◷ 3 », mock-up B1), what its
-    /// own header said under tmux.
+    /// The dashboard: how many members work, wait for the user and rest (« ⠹ 5  ⚑ 1  ◷ 3 », mock-up B1).
     Counts { working: usize, waiting: usize, idle: usize },
 }
 
@@ -371,8 +370,9 @@ fn plan(width: usize, header: &Header<'_>, metas: &[Vec<Piece>; 5]) -> Plan {
     // The right part's last blank, then a dash: before the zoom's blank, or before the frame's corner.
     let stop = if corner { end - 2 } else { end.saturating_sub(1) };
     let mut plan = Plan { corner, stop, ..Plan::default() };
-    // At least three columns of the name, and a blank.
-    if end < start + lead + 3 + 1 {
+    // At least three columns of the name, and a blank; no name, no header: the menu's layer, whose first line says
+    // « recruit » already (architect, 2026-10-10).
+    if end < start + lead + 3 + 1 || header.name.is_empty() {
         return plan;
     }
     let mut x = start + lead;
@@ -892,8 +892,7 @@ fn cancel_key() -> char {
 }
 
 /// ⌥q and the bar's « quitter »: Détacher (d), Quitter (q), Annuler (a); Detach (d), Quit (q), Cancel (c) in English
-/// (CLAUDE.md, 2026-10-08), with nothing more in the labels, under « recruit » as tmux's quit menu. Opens on the
-/// cancel. Its options' order is the server's: detach, quit, cancel.
+/// (CLAUDE.md, 2026-10-08), with nothing more in the labels, under « recruit ». Opens on the cancel. Its options' order is the server's: detach, quit, cancel.
 pub(crate) fn quit_choice(_team: &str) -> Choice {
     Choice {
         title: "recruit".into(),
@@ -907,8 +906,7 @@ pub(crate) fn quit_choice(_team: &str) -> Choice {
     }
 }
 
-/// The confirmation of a click on a member's context on the dashboard, under tmux (`app::compact`) as in recruit's own
-/// multiplexer (user's choice, 2026-10-09): « Compacter <membre> ? », what it does with the member's context as the
+/// The confirmation of a click on a member's context on the dashboard (user's choice, 2026-10-09): « Compacter <membre> ? », what it does with the member's context as the
 /// dashboard shows it (`percent`, left out unknown), then Compacter (c) and Annuler (a); Compact (o) and Cancel (c)
 /// in English. Opens on the cancel. Its options' order is the server's: compact, cancel.
 pub(crate) fn compact_choice(member: &str, percent: Option<u8>) -> Choice {
@@ -1249,6 +1247,16 @@ mod tests {
         frame(&mut canvas, area, &header, true, UNICODE);
         assert_eq!(canvas.style(0, 1), Style::fg(Color::Red).bold());
         assert_eq!(canvas.row(1).chars().next(), Some('┃'));
+    }
+
+    /// No name, no header in the border: the menu's layer, whose first line says « recruit ».
+    #[test]
+    fn no_name_no_header() {
+        let header = Header::default();
+        assert_eq!(framed(&header, 20, true), ["┏━━━━━━━━━━━━━━━━━━┓", "┃                  ┃", "┗━━━━━━━━━━━━━━━━━━┛"]);
+        assert_eq!(framed(&header, 20, false)[0], "╭──────────────────╮");
+        let mut canvas = Canvas::new(20, 3);
+        assert!(frame(&mut canvas, Rect { x: 0, y: 0, width: 20, height: 3 }, &header, true, UNICODE).is_empty());
     }
 
     #[test]

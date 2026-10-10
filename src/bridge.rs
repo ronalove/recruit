@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use crate::config::{cache_dir, write_atomic};
 use crate::i18n::Lang;
 use crate::state::{MemberInfo, Snapshot};
-use crate::{board, claude, live, menu, t};
+use crate::{board, claude, live, t};
 
 /// Claude Code loads mods from 2.1.287 on.
 pub const MIN_CLAUDE: (u32, u32, u32) = (2, 1, 287);
@@ -906,50 +906,22 @@ fn command_text(snapshot: &Snapshot, state: &Path, member: &str, command: &str) 
     if command != MENU_COMMAND {
         bail!("recruit _mod: {command}");
     }
-    let before = menu::last_opened(state);
-    let (opened, kind) = live::open_menu(state, member)?;
-    if let Some(said) = menu_said(opened, kind) {
-        return Ok(said);
-    }
-    // tmux opens the window on the side, and says nothing when it refuses it: the menu, once started, says so.
-    let until = std::time::Instant::now() + MENU_WAIT;
-    while std::time::Instant::now() < until {
-        if menu::opened_since(state, before.as_deref()) {
-            return Ok(t!("Menu de l'équipe ouvert.", "Team menu opened."));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    Ok(t!(
-        "tmux n'a pas ouvert le menu : une autre fenêtre est sans doute déjà ouverte sur ce terminal (Échap la ferme).",
-        "tmux did not open the menu: another window is likely open on this terminal already (Esc closes it)."
-    ))
+    Ok(menu_said(live::open_menu(state, member)?))
 }
 
-/// What `/recruit` answers once the menu was asked for: `None` while tmux opens its window on the side, to wait for
-/// it. recruit's own multiplexer says at once whether it opened the menu, and its words name no tmux.
-fn menu_said(opened: crate::backend::MenuOpened, kind: crate::backend::Kind) -> Option<String> {
-    use crate::backend::{Kind, MenuOpened};
-    match (opened, kind) {
-        (MenuOpened::AlreadyOpen, _) => {
-            Some(t!("Le menu de l'équipe est déjà ouvert.", "The team menu is already open."))
-        }
-        (MenuOpened::Opened, Kind::Native) => Some(t!("Menu de l'équipe ouvert.", "Team menu opened.")),
-        (MenuOpened::Opened, Kind::Tmux) => None,
-        (MenuOpened::NoClient, Kind::Native) => Some(t!(
+/// What `/recruit` answers once the menu was asked for: the server says at once whether it opened it.
+fn menu_said(opened: crate::backend::MenuOpened) -> String {
+    use crate::backend::MenuOpened;
+    match opened {
+        MenuOpened::AlreadyOpen => t!("Le menu de l'équipe est déjà ouvert.", "The team menu is already open."),
+        MenuOpened::Opened => t!("Menu de l'équipe ouvert.", "Team menu opened."),
+        MenuOpened::NoClient => t!(
             "Aucun terminal n'affiche l'équipe : `recruit attach` la rouvre, puis {}r ouvre le menu.",
             "No terminal shows the team: `recruit attach` opens it again, then {}r opens the menu.",
-            crate::tmux::ALT
-        )),
-        (MenuOpened::NoClient, Kind::Tmux) => Some(t!(
-            "Aucun client tmux n'affiche ce panneau : {}r ouvre le menu depuis le terminal de l'équipe.",
-            "No tmux client shows this pane: {}r opens the menu from the team's terminal.",
-            crate::tmux::ALT
-        )),
+            crate::look::ALT
+        ),
     }
 }
-
-/// How long `/recruit` waits for the menu to start in its window.
-const MENU_WAIT: std::time::Duration = std::time::Duration::from_millis(2000);
 
 /// What a member's next requests use: the model and effort recruit puts on them, else the session's own, with the
 /// effort its last request had on that model; or, before any (or without the mod), those its settings give.
@@ -976,7 +948,6 @@ mod tests {
         Snapshot {
             team: "web".into(),
             session: "web".into(),
-            socket: "recruit".into(),
             dir: "/tmp/web".into(),
             claude: "/bin/claude".into(),
             config_dir: None,
@@ -998,21 +969,15 @@ mod tests {
     }
 
     #[test]
-    fn menu_said_as_the_multiplexer_tells() {
-        use crate::backend::{Kind, MenuOpened};
-        // tmux opens its window on the side: wait for it.
-        assert_eq!(menu_said(MenuOpened::Opened, Kind::Tmux), None);
+    fn menu_said_as_the_server_tells() {
+        use crate::backend::MenuOpened;
+        assert_eq!(menu_said(MenuOpened::Opened), t!("Menu de l'équipe ouvert.", "Team menu opened."));
         assert_eq!(
-            menu_said(MenuOpened::Opened, Kind::Native),
-            Some(t!("Menu de l'équipe ouvert.", "Team menu opened."))
+            menu_said(MenuOpened::AlreadyOpen),
+            t!("Le menu de l'équipe est déjà ouvert.", "The team menu is already open.")
         );
-        let already = t!("Le menu de l'équipe est déjà ouvert.", "The team menu is already open.");
-        for kind in [Kind::Tmux, Kind::Native] {
-            assert_eq!(menu_said(MenuOpened::AlreadyOpen, kind).as_deref(), Some(already.as_str()));
-        }
-        assert!(menu_said(MenuOpened::NoClient, Kind::Tmux).unwrap().contains("tmux"));
-        let native = menu_said(MenuOpened::NoClient, Kind::Native).unwrap();
-        assert!(!native.contains("tmux") && native.contains("recruit attach"), "{native}");
+        let none = menu_said(MenuOpened::NoClient);
+        assert!(!none.contains("tmux") && none.contains("recruit attach"), "{none}");
     }
 
     #[test]

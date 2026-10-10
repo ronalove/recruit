@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! The menu of a running team (`recruit _menu <state> [--client <name>] [--nerd]`), in a tmux popup opened by
-//! `/recruit`, ⌥r or the bar's button: the members on the left as on the dashboard, the chosen one's sheet on the
+//! The menu of a running team (`recruit _menu <state> [--client <id>] [--nerd] [--member <m> [--field <f>]]`), in a
+//! layer over the team opened by `/recruit`, ⌥r, the bar's button or a click on a header: the members on the left as on the dashboard, the chosen one's sheet on the
 //! right, the team's actions at the bottom (direction A of the mockups). Every change is written to the team's files
 //! and applied at once to the running team.
 //!
-//! What it is quick to show comes first: nothing slow before the first frame (no `claude`, no `tmux`), the members'
+//! What it is quick to show comes first: nothing slow before the first frame (no `claude`, no question to the
+//! multiplexer), the members'
 //! states from what the dashboard last saw, then kept up to date on the side. Each frame sends only the cells that
 //! changed (`canvas`). Team files that do not read still open it: the members as launched, to detach or stop.
 
@@ -37,8 +38,6 @@ use sheet::{Done, Effect, Env, Key, Person, Said, Sheet, Team};
 /// The menu of the team whose folder is `state`, on `member`'s sheet if given (else the first member's), its `field`
 /// focused: `name`, `model` or `effort`; another word is left out.
 pub fn run(state: &Path, client: Option<&str>, nerd: bool, member: Option<&str>, field: Option<&str>) -> Result<()> {
-    // For `/recruit`, which cannot tell otherwise whether tmux opened the window.
-    mark_opened(state);
     let mut running = Running::open(state)?;
     let mut sheet = Sheet::new(load(&running, client.is_some()));
     if let Some(member) = member {
@@ -75,29 +74,6 @@ fn field_of(name: &str) -> Option<sheet::Fid> {
         "effort" => Some(sheet::Fid::Effort),
         _ => None,
     }
-}
-
-/// Written in the team's folder each time the menu starts, with a token of its own.
-const OPENED: &str = "menu.opened";
-
-/// A token no other start of the menu writes: its process, its clock, and a count for two starts in one process
-/// within the clock's resolution. Compared as it is, never as a time: on Linux, a file's modification time comes
-/// from a coarser clock than `SystemTime::now()`, a file written after a moment may look older than it.
-fn mark_opened(state: &Path) {
-    static STARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    let count = STARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let _ = config::write_atomic(&state.join(OPENED), &format!("{} {nanos} {count}", std::process::id()));
-}
-
-/// The token of the menu's last start, read before asking for a new one: `opened_since` waits for another.
-pub fn last_opened(state: &Path) -> Option<String> {
-    fs::read_to_string(state.join(OPENED)).ok()
-}
-
-/// Whether the menu started in the team's folder since `last_opened` gave `before`.
-pub fn opened_since(state: &Path, before: Option<&str>) -> bool {
-    last_opened(state).is_some_and(|now| Some(now.as_str()) != before)
 }
 
 /// Further than this from now, `states.json` is not looked after: the dashboard is off or stopped, or the clock moved.
@@ -263,7 +239,7 @@ enum News {
 
 struct Menu<'a> {
     running: &'a mut Running,
-    /// The tmux client the menu was opened from: the one that detaches.
+    /// The multiplexer's client the menu was opened from: the one that detaches.
     client: Option<&'a str>,
     session: Session,
     painter: Painter,
@@ -604,20 +580,6 @@ fn edit_text(state: &Path, text: &str, editor: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn menu_opened_since_asked() {
-        let dir = tempfile::tempdir().unwrap();
-        let before = last_opened(dir.path());
-        assert!(!opened_since(dir.path(), before.as_deref()), "never opened");
-        mark_opened(dir.path());
-        assert!(opened_since(dir.path(), before.as_deref()));
-        let before = last_opened(dir.path());
-        assert!(!opened_since(dir.path(), before.as_deref()), "nothing new since");
-        // However soon after, whatever the clocks: the file's time is not looked at.
-        mark_opened(dir.path());
-        assert!(opened_since(dir.path(), before.as_deref()));
-    }
 
     #[test]
     fn states_from_the_dashboard_while_fresh() {

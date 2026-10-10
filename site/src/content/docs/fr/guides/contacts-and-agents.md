@@ -38,7 +38,7 @@ Avec la disposition par défaut, `layout = "auto"` :
 
 Dans une équipe en anglais, le premier onglet s'appelle « Contacts ». Le `tab` d'un membre peut prendre n'importe quel titre sauf ceux de recruit, dans les deux langues : « Interlocuteurs », « Contacts », « Agents (1) », « Agents (2) »… « Agents » seul est le groupe par défaut.
 
-![Un onglet d'agents de travail en grille 2 × 2, dont trois qui attendent une permission](../../../../assets/screenshots/agents-fr.png)
+![Un onglet d'agents de travail en grille 2 × 2, dont deux qui attendent une permission](../../../../assets/screenshots/agents.png)
 
 ```toml
 [teams.web]
@@ -64,4 +64,4 @@ Le [menu de l'équipe](/recruit/fr/guides/menu/) fait d'un membre un interlocute
 
 ## Passer d'un onglet à l'autre
 
-`Alt+1`…`Alt+9` mènent à un onglet, `Alt+Maj+←` / `Alt+Maj+→` au précédent ou au suivant, et un clic sur la carte d'un membre dans le tableau de bord mène à son panneau. Voir [Dans tmux](/recruit/fr/guides/tmux/).
+`Alt+1`…`Alt+9` mènent à un onglet, `Alt+Maj+←` / `Alt+Maj+→` au précédent ou au suivant, `Alt+n` au membre suivant de l'onglet, et un clic sur la carte d'un membre dans le tableau de bord mène à son panneau. Quand un membre que tu ne vois pas t'attend, une notification te le dit, et `Alt+g` t'y mène. Voir [L'écran de l'équipe](/recruit/fr/guides/screen/).

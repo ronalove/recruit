@@ -1,37 +1,34 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Ronan Lamour
-# Screenshots for the documentation site and the README: a demo team, with real Claude sessions, in a test tmux server,
-# filmed by vhs.
+# Screenshots for the documentation site and the README: a demo team, with real Claude sessions, in recruit's own
+# multiplexer, filmed by vhs.
 #
 #   scripts/screenshots.sh                 everything, in English then in French
 #   scripts/screenshots.sh --lang en       one language (en, fr)
 #   scripts/screenshots.sh --only team     only the team's screenshots; `cli`, the tapes of scripts/demo/tapes (no
 #                                          team); `anim`, the animation
-#   scripts/screenshots.sh --keep          leave the demo team running at the end, to look at it (tmux -L rtest-shots,
-#                                          or `recruit attach demo` for the native multiplexer)
-#   scripts/screenshots.sh --backend native   on recruit's own multiplexer (RECRUIT_BACKEND=native) instead of tmux
-#                                          (the default until the switch); the same files, to compare the two sets
+#   scripts/screenshots.sh --keep          leave the demo team running at the end, to look at it (`recruit attach demo`)
+#   RECRUIT_BIN=target/day5/recruit scripts/screenshots.sh   a recruit already built, in place of a `cargo build`
+#   SHOTS_OUT=… SHOTS_MEDIA=… scripts/screenshots.sh         other folders than the site's, to try without replacing it
 #
 # Writes into site/src/assets/screenshots/: team.png, dashboard.png, journal.png, menu.png, agents.png, those of
-# scripts/demo/tapes/*.tape and demo.gif (for the README); into site/public/media/: demo.mp4 and demo.webm. With a -fr
+# notice.png, zoom.png, scripts/demo/tapes/*.tape and demo.gif (for the README); into site/public/media/: demo.mp4 and demo.webm. With a -fr
 # suffix in French. The screenshots are rendered at twice the size (Retina): show them at half.
 #
 # The demo (scripts/demo/project, its team in .recruit/settings.toml, the tasks in scripts/demo/tasks.<lang>.tsv) runs
-# in a copy under /tmp/recruit-shots, with XDG_CONFIG_HOME and XDG_CACHE_HOME of its own, in the tmux server named by
-# its team file (rtest-shots), never recruit's. Its members use the user's Claude Code profile, on light models: a few
-# minutes of sonnet and haiku per language. The profile's settings.json is checked to be the same at the end, and the
+# in a copy under /tmp/recruit-shots, with XDG_CONFIG_HOME and XDG_CACHE_HOME of its own, never the user's teams. Its
+# members use the user's Claude Code profile, on light models: a few minutes of sonnet and haiku per language. The profile's settings.json is checked to be the same at the end, and the
 # demo's conversations are removed from it. An image that shows the account's plan or a home folder is not kept.
 #
-# Needs vhs (brew install vhs), ffmpeg, jq, claude, and tmux for the tmux backend. What each backend answers is in
+# Needs vhs (brew install vhs), ffmpeg, jq, python3 and claude. What it asks of the multiplexer is in
 # scripts/shots-backend.sh.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DEMO=$ROOT/scripts/demo
-OUT=$ROOT/site/src/assets/screenshots
-MEDIA=$ROOT/site/public/media
-SOCKET=rtest-shots
+OUT=${SHOTS_OUT:-$ROOT/site/src/assets/screenshots}
+MEDIA=${SHOTS_MEDIA:-$ROOT/site/public/media}
 
 # Size of the terminal (columns × rows) for the team's window and the command line tapes.
 TEAM_SIZE=180x48
@@ -52,13 +49,11 @@ die() {
 langs=(en fr)
 only=all
 keep=false
-backend=tmux
 while (($#)); do
   case $1 in
     --lang) langs=("$2"); shift ;;
     --only) only=$2; shift ;;
     --keep) keep=true ;;
-    --backend) backend=$2; shift ;;
     -h | --help) sed -n '4,26s/^# \{0,1\}//p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -66,20 +61,21 @@ while (($#)); do
 done
 for lang in "${langs[@]}"; do [[ $lang == en || $lang == fr ]] || die "unknown language: $lang"; done
 [[ $only =~ ^(all|team|cli|anim)$ ]] || die "--only takes team, cli or anim"
-[[ $backend =~ ^(tmux|native)$ ]] || die "--backend takes tmux or native"
 
-tools=(vhs ffmpeg claude jq python3)
-[[ $backend == tmux ]] && tools+=(tmux)
-for tool in "${tools[@]}"; do command -v "$tool" >/dev/null || die "$tool not found"; done
-if [[ $backend == tmux ]]; then
-  grep -q "^socket = \"$SOCKET\"" "$DEMO/project/.recruit/settings.toml" || die "the demo team must run in tmux -L $SOCKET"
-fi
+for tool in vhs ffmpeg claude jq python3; do command -v "$tool" >/dev/null || die "$tool not found"; done
 
 profile=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 settings_sum() { shasum "$profile/settings.json" 2>/dev/null || echo none; }
 before=$(settings_sum)
 
-(cd "$ROOT" && cargo build --quiet)
+# The recruit to film: the one given (`RECRUIT_BIN`, a copy kept apart, say), or a fresh debug build.
+if [[ -n ${RECRUIT_BIN:-} ]]; then
+  RECRUIT_BIN=$(cd "$(dirname "$RECRUIT_BIN")" && pwd)/$(basename "$RECRUIT_BIN")
+  [[ -x $RECRUIT_BIN ]] || die "RECRUIT_BIN is not an executable: $RECRUIT_BIN"
+else
+  (cd "$ROOT" && cargo build --quiet)
+  RECRUIT_BIN=$ROOT/target/debug/recruit
+fi
 mkdir -p "$OUT" "$MEDIA"
 # Always the same folder: Claude Code asks once whether to trust it, and the screenshots show its name.
 tmp=/tmp/recruit-shots
@@ -89,15 +85,21 @@ running=$(cat "$tmp/.recruit-shots" 2>/dev/null || true)
 rm -rf "$tmp"
 mkdir -p "$tmp"
 echo $$ >"$tmp/.recruit-shots"
+# Where the films write: an image goes to its place in the site once it is known to show nothing private, so that a
+# try that fails never takes away the image that was there.
+STAGE=$tmp/stage
+mkdir -p "$STAGE"
 export XDG_CONFIG_HOME=$tmp/config XDG_CACHE_HOME=$tmp/cache
-export PATH=$ROOT/target/debug:$PATH
-OWN_RECRUIT=$ROOT/target/debug/recruit
-if [[ $backend == native ]]; then
-  # Short: the server's socket lives there (a path of 100 characters at most).
-  export RECRUIT_BACKEND=native RECRUIT_TMPDIR=$tmp/run
-  mkdir -p "$RECRUIT_TMPDIR"
-fi
-# What is asked of the multiplexer, for tmux and for the native one.
+# `recruit` on the PATH is the one filmed: a link to it, under the name it is run by.
+mkdir -p "$tmp/bin"
+ln -sf "$RECRUIT_BIN" "$tmp/bin/recruit"
+export PATH=$tmp/bin:$PATH
+OWN_RECRUIT=$tmp/bin/recruit
+# Short: the server's socket lives there (a path of 100 characters at most). RECRUIT_BACKEND: a recruit that still
+# has tmux needs it; one that has not ignores it.
+export RECRUIT_BACKEND=native RECRUIT_TMPDIR=$tmp/run
+mkdir -p "$RECRUIT_TMPDIR"
+# What is asked of the multiplexer.
 # shellcheck source=scripts/shots-backend.sh
 source "$ROOT/scripts/shots-backend.sh"
 # The dashboard leaves out the usage of the account, the user's and not the demo's.
@@ -120,7 +122,7 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 # A tape for vhs: the shared settings, the size, then the steps (stdin), and a second at the end: vhs could leave
-# before writing a screenshot that ends a tape. `{{out}}` and `{{sfx}}` are replaced.
+# before writing a screenshot that ends a tape. `{{out}}` (the staging folder) and `{{sfx}}` are replaced.
 tape() { # <file> <cols>x<rows> <sfx>
   local cols=${2%x*} rows=${2#*x}
   {
@@ -136,7 +138,7 @@ tape() { # <file> <cols>x<rows> <sfx>
     echo 'Set BorderRadius 16'
     echo 'Set TypingSpeed 0'
     echo 'Set Theme "Builtin Dark"'
-    sed -e "s#{{out}}#$OUT#g" -e "s#{{sfx}}#$3#g"
+    sed -e "s#{{out}}#$STAGE#g" -e "s#{{sfx}}#$3#g"
     echo 'Sleep 1s'
   } >"$1"
 }
@@ -144,9 +146,29 @@ PADDING=24
 BAR=56
 
 # Films a tape from its steps (stdin), in the demo's project.
+# With `FILM_WATCH=1` (a team runs), the screen the client shows is read while the film is taken, and what is taken is
+# never kept if the account's plan, a tip about it or a home folder showed at any moment of it: the image itself is
+# checked, not the screen before or after. Returns 3 then.
 film() { # <name> <size> <sfx>
   tape "$tmp/$1.tape" "$2" "$3"
-  (cd "$project" && vhs "$tmp/$1.tape" >/dev/null 2>&1)
+  local seen="$tmp/private-seen" over="$tmp/film-over" watcher="" rc=0
+  rm -f "$seen" "$over"
+  if [[ ${FILM_WATCH:-} == 1 ]]; then
+    (
+      while [[ ! -e $over ]]; do
+        ctl capture 2>/dev/null | grep -qE "$PRIVATE" && touch "$seen"
+        sleep 0.3
+      done
+    ) &
+    watcher=$!
+  fi
+  (cd "$project" && vhs "$tmp/$1.tape" >/dev/null 2>&1) || rc=$?
+  if [[ -n $watcher ]]; then
+    touch "$over"
+    wait "$watcher" 2>/dev/null || true
+  fi
+  [[ ! -e $seen ]] || return 3
+  return $rc
 }
 
 # Cuts a pane out of a screenshot of its whole tab, with its title row above it, and frames it with the padding of the
@@ -185,31 +207,40 @@ trust() {
 }
 
 # Whether the tab on screen shows what a public image must not: the account's plan (in Claude Code's welcome, on top
-# of a conversation that has not said much yet), its usage (Claude Code's warning near a limit), or a home folder.
-PRIVATE="Claude (Max|Pro|Team|Enterprise|API)|% of your [a-z0-9 -]*limit|/Users/|/home/|$HOME"
-private() {
-  local pane
-  for pane in $(shown_panes); do
-    pane_text "$pane" | grep -qE "$PRIVATE" && return 0
-  done
-  return 1
-}
+# of a conversation that has not said much yet), its usage (Claude Code's warning near a limit), a tip that names a
+# paid plan (guest passes), or a home folder.
+PRIVATE="Claude (Max|Pro|Team|Enterprise|API)|% of your [a-z0-9 -]*limit|guest passes|/passes|/Users/|/home/|$HOME"
+private() { ctl capture | grep -qE "$PRIVATE"; }
 
-# Films a screenshot of the tab on screen once nothing private shows, before and after: four tries, 15 s apart; an
-# image that still shows something is removed.
+# Films a screenshot of the tab on screen once nothing private shows and each member's header and card say the same
+# state (the card comes from `claude agents`, a second or two late), before and after: four tries, 15 s apart; an image
+# that still shows something is removed.
 film_clean() { # <name> <size> <sfx> <image>  (steps on stdin)
   local steps try
   steps=$(cat)
   for try in 1 2 3 4; do
-    if ! private; then
-      film "$1" "$2" "$3" <<<"$steps" || die "vhs failed on $1"
-      private || return 0
+    # A try again: what was at work has probably finished, so it is given work again (`REFRESH`, a command).
+    [[ $try -eq 1 || -z ${REFRESH:-} ]] || $REFRESH
+    if ! private && wait_for 30 "the headers and the cards to agree" states_agree; then
+      local vector
+      vector=$(states_vector)
+      # What the client starts on, set again for each try: a client that left takes the next one back to the tab it had.
+      # shellcheck disable=SC2086
+      [[ -z ${VIEW:-} ]] || view $VIEW
+      local rc=0
+      film "$1" "$2" "$3" <<<"$steps" || rc=$?
+      [[ $rc -eq 0 || $rc -eq 3 ]] || die "vhs failed on $1"
+      # Nothing private showed while the film was taken, and nothing changed state.
+      if [[ $rc -eq 0 ]] && ! private && states_agree && [[ $(states_vector) == "$vector" ]]; then
+        mv -f "$STAGE/$(basename "$4")" "$4"
+        return 0
+      fi
     fi
-    echo "screenshots: $1 would show the account's plan or a home folder, again in 15 s ($try)" >&2
-    sleep 15
+    echo "screenshots: $1 would show the account's plan, a home folder or states that differ, again ($try)" >&2
+    [[ -n ${REFRESH:-} ]] || sleep 15
   done
-  rm -f "$4"
-  echo "screenshots: WARNING: no $4: it showed the account's plan or a home folder" >&2
+  rm -f "$STAGE/$(basename "$4")"
+  echo "screenshots: WARNING: no new $4: it showed the account's plan, a home folder or states that differ" >&2
   return 1
 }
 
@@ -244,15 +275,11 @@ send() { # <member> <message>
   pane_type "$pane" "$2"
 }
 
-# What the next film of the team starts on: the first tab or the second, and the menu opened over it when asked. tmux:
-# the window of the session (a new client opens on it), the menu once vhs's terminal is attached (Alt+r typed by vhs
-# reaches tmux as a plain r). native: a client keeps the tab it was on, so the keys go to it once attached, in the
-# background (about two minutes to wait for it at most).
-view() { # <first|second> [menu <lang>]
-  if [[ $backend == tmux ]]; then
-    if [[ $1 == first ]]; then select_first; else select_second; fi
-    [[ ${2:-} == menu ]] || return 0
-  fi
+# What the next film of the team starts on: the first tab or the second, and then one of `menu` (the /recruit menu opened
+# over it), `zoom` (the focused member zoomed) or a member's name (the focus on it, in its tab). A client keeps the tab
+# it was on, so the keys go to it once vhs's terminal is attached, in the background (about two minutes to wait for it
+# at most).
+view() { # <first|second> [menu|zoom|<member>]
   (
     local waited=0
     until has_client; do
@@ -260,11 +287,14 @@ view() { # <first|second> [menu <lang>]
       ((++waited < 240)) || exit 0
     done
     sleep 1
-    if [[ $backend == native ]]; then
-      if [[ $1 == first ]]; then ctl key alt+1; else ctl key alt+2; fi
-      sleep 0.5
-    fi
-    [[ ${2:-} == menu ]] && open_menu "$3"
+    if [[ $1 == first ]]; then select_first; else select_second; fi
+    sleep 0.5
+    case ${2:-} in
+      "") ;;
+      menu) open_menu ;;
+      zoom) ctl key alt+z ;;
+      *) focus_member "$2" || true ;;
+    esac
     true
   ) &
 }
@@ -272,26 +302,88 @@ view() { # <first|second> [menu <lang>]
 # The tasks of scripts/demo/tasks.<lang>.tsv: `member<TAB>message`, one a line; `#` starts a comment.
 tasks() { grep -v '^#' "$DEMO/tasks.$1.tsv" | grep .; }
 
+# The members of one state among the working agents (not the contacts), one a line.
+agents_in() { # <state>
+  jq -r --arg s "$1" --slurpfile team "$state/team.json" '
+    ($team[0].members | map(select(.contact) | .name)) as $contacts
+    | .members | to_entries[] | select(.key | IN($contacts[]) | not) | select(.value.state == $s) | .key' \
+    "$states" 2>/dev/null
+}
+
+# What the dashboard last saw of every member, in one line: it changes when any of them changes state.
+states_vector() { jq -c '[.members | to_entries[] | [.key, .value.state]]' "$states" 2>/dev/null; }
+
+# The state the dashboard last saw of a member.
+state_of() { jq -r --arg m "$1" '.members[$m].state // empty' "$states" 2>/dev/null; }
+
+# Gives work to what is at rest among `members` (and the lead), so that it is at work when the next film is taken: a
+# long enough reading of the project, with nothing to ask permission for.
+stir() { # <lang> <member…>
+  local lang=$1 member task
+  shift
+  task="Read every file of src/, test/ and public/ one at a time, each with a command of its own, then read them all a second time in reverse order, then say in one line what each does. Do not hurry."
+  [[ $lang == fr ]] && task="Lis chaque fichier de src/, test/ et public/ l'un après l'autre, chacun par sa propre commande, puis relis-les tous une seconde fois en sens inverse, puis dis en une ligne ce que chacun fait. Ne te presse pas."
+  for member in "$@"; do
+    [[ $(state_of "$member") == idle ]] && send "$member" "$task"
+  done
+  return 0
+}
+
 # The team at work: launched, given its tasks, and filmed once its members are working, idle and waiting.
 shoot_team() { # <lang> <sfx>
   local lang=$1 sfx=$2
   launch "$lang"
+  FILM_WATCH=1
   local member message
   while IFS=$'\t' read -r member message; do send "$member" "$message"; done < <(tasks "$lang")
 
-  # Someone at work and someone waiting, once the first messages went round; on a try again, someone at work.
-  local given try=1 taken=false
+  # The lead at work (the focus is on it, where one types), an agent waiting in another tab (the ⚑ in the bar), once the
+  # first messages went round; on a try again, someone at work.
+  local given try=1 taken=false lead
+  lead=$(tasks "$lang" | head -1 | cut -f1)
   given=$(date +%s)
-  scene() { (($(count working) >= 1 && ($(count waiting) >= 1 || try > 1) && $(date +%s) - given >= 12)); }
+  # The scene: the lead and an agent at work, another agent waiting, and no state changed for four seconds, so that the
+  # header and the card of each say the same when the film is taken.
+  local last_vec="" last_change=0
+  scene() {
+    (($(date +%s) - given >= 12)) || return 1
+    local vec
+    vec=$(states_vector)
+    if [[ $vec != "$last_vec" ]]; then
+      last_vec=$vec
+      last_change=$(date +%s)
+      return 1
+    fi
+    (($(date +%s) - last_change >= 4)) || return 1
+    [[ $(state_of "$lead") == working && -n $(agents_in waiting) && -n $(agents_in working) ]]
+  }
+  # The work the tasks gave comes to an end: what rests is given some more, until the lead and an agent are at work.
+  local stirred=0
+  scene_or_stir() {
+    scene && return 0
+    # Not again before the last work has shown in the states.
+    if (($(date +%s) - stirred >= 25)); then
+      stir "$lang" "$lead" $(agents_in idle | head -2)
+      stirred=$(date +%s)
+    fi
+    return 1
+  }
+  # Before each of the next films: the lead and two agents at work again (up to a minute).
+  at_work_again() {
+    stirred=0
+    given=0
+    wait_for 90 "the lead and an agent at work" scene_or_stir || true
+  }
   local attach dash_title=Dashboard
   attach=$(attach_command)
   [[ $lang == fr ]] && dash_title="Tableau de bord"
 
   # The first tab: the contacts, the dashboard and the reduced journal. Filmed again, three times at most, when the
   # scene changed meanwhile; when it does not come back, the image taken before stays.
+  VIEW="first"
+  REFRESH=at_work_again
   for try in 1 2 3; do
-    view first
-    if ! wait_for 240 "the scene (try $try)" scene && $taken; then break; fi
+    if ! wait_for 240 "the scene (try $try)" scene_or_stir && $taken; then break; fi
     film_clean team "$TEAM_SIZE" "$sfx" "$OUT/team$sfx.png" <<EOF || break
 Hide
 Type "$attach"
@@ -305,18 +397,18 @@ EOF
     scene && break
     echo "screenshots: the scene changed while filming, again ($try)" >&2
   done
-  # The dashboard's close-up, out of the same image.
-  [[ -e $OUT/team$sfx.png ]] && crop "$OUT/team$sfx.png" "$OUT/dashboard$sfx.png" "$(pane_of dashboard)" "$dash_title"
+  # The dashboard's close-up, out of the same image: its whole frame.
+  $taken && crop "$OUT/team$sfx.png" "$OUT/dashboard$sfx.png" "$(pane_of dashboard)" "$dash_title"
 
-  # The /recruit menu, on the sheet of the second member. Opened as Alt+r does, once vhs's terminal is attached.
-  view first menu "$lang"
+  # The /recruit menu over the team, on the sheet of the member who has the focus (the lead). Opened as Alt+r does, once
+  # vhs's terminal is attached.
+  at_work_again
+  VIEW="first menu"
   film_clean menu "$TEAM_SIZE" "$sfx" "$OUT/menu$sfx.png" <<EOF || true
 Hide
 Type "$attach"
 Enter
 Sleep 5s
-Down
-Sleep 1s
 Show
 Sleep 500ms
 Screenshot "{{out}}/menu{{sfx}}.png"
@@ -324,14 +416,18 @@ Escape
 EOF
   wait
 
-  # A tab of working agents, in a grid.
+  # A tab of agents, in a grid: the focus on one at work, so that its thick frame and the red one of the agent that
+  # waits show together.
   if has_second_tab; then
-    view second
+    at_work_again
+    local at_work
+    at_work=$(agents_in working | head -1)
+    VIEW="second $at_work"
     film_clean agents "$TEAM_SIZE" "$sfx" "$OUT/agents$sfx.png" <<EOF || true
 Hide
 Type "$attach"
 Enter
-Sleep 4s
+Sleep 6s
 Show
 Sleep 500ms
 Screenshot "{{out}}/agents{{sfx}}.png"
@@ -342,7 +438,7 @@ EOF
   # The journal in full (reduced at launch: hidden, then full), cut out of the first tab.
   recruit _panel toggle "$state" >/dev/null
   recruit _panel toggle "$state" >/dev/null
-  view first
+  VIEW="first"
   film_clean full "$TEAM_SIZE" "$sfx" "$tmp/full.png" <<EOF &&
 Hide
 Type "$attach"
@@ -350,10 +446,73 @@ Enter
 Sleep 3s
 Show
 Sleep 500ms
-Screenshot "$tmp/full.png"
+Screenshot "{{out}}/full.png"
 EOF
     crop "$tmp/full.png" "$OUT/journal$sfx.png" "$(pane_of journal)" Journal
+  wait
 
+  VIEW=""
+  REFRESH=""
+
+  # The notice: an agent out of view (the first tab is on screen) is asked for something that needs a permission; once
+  # it waits, the notice shows for six seconds at the top right, and the badge stays on its tab.
+  local idle task
+  has_idle_agent() { [[ -n $(agents_in idle) ]]; }
+  wait_for 150 "an agent at rest" has_idle_agent || true
+  idle=$(agents_in idle | head -1)
+  task=$(tasks "$lang" | awk -F '\t' '/outdated/ { print $2; exit }')
+  [[ -n $task ]] || task='Run `bun outdated` and tell me what it says.' # shellcheck disable=SC2016
+  if [[ -n $idle ]]; then
+    view first
+    (
+      until has_client; do sleep 0.5; done
+      sleep 4
+      send "$idle" "$task"
+    ) &
+    local rc=0
+    film notice "$TEAM_SIZE" "$sfx" <<EOF || rc=$?
+Hide
+Type "$attach"
+Enter
+Sleep 2s
+Show
+Wait+Screen@120s /(attend ta réponse|needs your answer)/
+Sleep 300ms
+Screenshot "{{out}}/notice{{sfx}}.png"
+EOF
+    if [[ $rc -eq 0 && -e $STAGE/notice$sfx.png ]]; then
+      mv -f "$STAGE/notice$sfx.png" "$OUT/notice$sfx.png"
+    else
+      rm -f "$STAGE/notice$sfx.png"
+      echo "screenshots: no new notice$sfx.png (film status $rc: 3 is a private text on screen)" >&2
+    fi
+    wait
+  else
+    echo "screenshots: no agent at rest for the notice, none taken" >&2
+  fi
+
+  # A member zoomed, full screen: « ⤢ name » in the bar.
+  at_work_again
+  view first zoom
+  rc=0
+  film zoom "$TEAM_SIZE" "$sfx" <<EOF || rc=$?
+Hide
+Type "$attach"
+Enter
+Sleep 4s
+Show
+Sleep 500ms
+Screenshot "{{out}}/zoom{{sfx}}.png"
+EOF
+  if [[ $rc -eq 0 && -e $STAGE/zoom$sfx.png ]]; then
+    mv -f "$STAGE/zoom$sfx.png" "$OUT/zoom$sfx.png"
+  else
+    rm -f "$STAGE/zoom$sfx.png"
+    echo "screenshots: no new zoom$sfx.png (film status $rc: 3 is a private text on screen)" >&2
+  fi
+  wait
+
+  FILM_WATCH=0
   $keep || stop_team
 }
 
@@ -433,10 +592,10 @@ shoot_anim() { # <lang> <sfx>
   local attach
   attach=$(attach_command)
   view first
-  # The request goes to the focused pane: the lead's (tmux: made so; native: the first contact has the focus when a
-  # client attaches, and the lead is the first of the demo's contacts).
-  [[ $backend == tmux ]] && t select-pane -t "$(pane_of "$lead")"
-  film anim "$TEAM_SIZE" "$sfx" <<EOF || die "vhs failed on the animation"
+  # The request goes to the focused pane: the first contact's, the lead, when a client attaches.
+  local rc=0
+  FILM_WATCH=1
+  film anim "$TEAM_SIZE" "$sfx" <<EOF || rc=$?
 Output "$tmp/anim.mp4"
 Set Framerate 10
 Hide
@@ -450,7 +609,14 @@ Sleep 700ms
 Enter
 Wait+Screen@300s /$done_word/
 EOF
+  FILM_WATCH=0
   wait
+  if [[ $rc -ne 0 ]]; then
+    [[ $rc -eq 3 ]] || die "vhs failed on the animation"
+    echo "screenshots: WARNING: no new animation: the account's plan or a home folder showed while it was filmed" >&2
+    $keep || stop_team
+    return 0
+  fi
 
   montage "$tmp/anim.mp4" "${#request}" "$MEDIA/demo$sfx" "$OUT/demo$sfx.gif"
 
@@ -469,6 +635,8 @@ shoot_cli() { # <lang> <sfx>
     # A tape that fails (one that waits on Claude, say) leaves its screenshot out, not the others.
     RECRUIT_LANG=$1 film "$(basename "$file" .tape)" "${size:-$CLI_SIZE}" "$2" <"$file" ||
       echo "screenshots: vhs failed on $file" >&2
+    # What the tape took, from the staging folder to the site.
+    find "$STAGE" -maxdepth 1 -name '*.png' -exec mv -f {} "$OUT/" \;
   done
 }
 

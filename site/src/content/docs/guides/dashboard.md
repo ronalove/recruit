@@ -15,7 +15,7 @@ Both sit on the right of your contacts, in the first tab: the **dashboard** on t
 
 ![The dashboard: a card per member, with its state, what it does, its model and its effort](../../../assets/screenshots/dashboard.png)
 
-At the top: the time, how many members are in each state, and the shortcuts. In a narrow pane, the time goes first, then the shortcuts. Then a card per member.
+The top border of its frame counts the members in each state; the shortcuts are in the bar at the bottom of the screen. Below, a card per member.
 
 Typing in the dashboard or the journal does nothing. The dashboard redraws itself whole every 30 seconds and when the computer wakes up; `Ctrl-L`, in its pane, redraws it at once.
 
@@ -56,7 +56,7 @@ They only get the room left once every card shows what its member does: they nev
 
 ### Compacting a conversation
 
-A click on the context of a member at rest, marked ⟳, offers to compact its conversation, once you confirm. It is what Claude Code would do on its own at the threshold, and costs as much: the member's model rereads its whole context to sum it up. A member that went back to work meanwhile refuses. Until the member's next answer, the card then shows the context as Claude Code counts it, like `/context`.
+A click on the context of a member at rest, marked ⟳, offers to compact its conversation, once you confirm. The same ⟳ shows in the top border of the member's own frame. It is what Claude Code would do on its own at the threshold, and costs as much: the member's model rereads its whole context to sum it up. A member that went back to work meanwhile refuses. Until the member's next answer, the card then shows the context as Claude Code counts it, like `/context`.
 
 ### Order and room
 

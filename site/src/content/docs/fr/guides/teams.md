@@ -91,7 +91,7 @@ recruit new web -m "pilote:Coordonne" -m "dev:Écrit le code"            # membr
 
 Les noms d'équipe et de membre suivent les mêmes règles, que recruit te les demande ou que tu les écrives dans le fichier :
 
-- **Le nom d'une équipe** devient un nom de fichier et de session tmux : lettres (accents compris) et chiffres, `-` et `_`, 40 caractères au plus, sans `-` au début. Ce ne peut pas être une commande de recruit : `new`, `list`, `attach`, `stop`, `edit`, `templates`, `help`, ni les commandes internes qui commencent par `_`.
+- **Le nom d'une équipe** devient un nom de fichier : lettres (accents compris) et chiffres, `-` et `_`, 40 caractères au plus, sans `-` au début. Ce ne peut pas être une commande de recruit : `new`, `list`, `attach`, `stop`, `edit`, `templates`, `help`, ni les commandes internes qui commencent par `_`.
 - **Le nom d'un membre** est l'adresse à laquelle lui écrivent ses coéquipiers : lettres et chiffres, `-`, `_` et `.`, sans espace, 40 caractères au plus, sans `-` ni `.` au début. Deux membres d'une équipe ne peuvent pas porter des noms qui ne diffèrent que par la casse.
 
 Un nom écrit à la main qui ne suit pas ces règles empêche l'équipe de se lancer : recruit nomme le fichier, le nom et la raison (voir [la FAQ](/recruit/fr/faq/#-ne-peut-pas-porter-ce-nom-)). Le menu de l'équipe refuse aussi un nom que porte déjà une session Claude ouverte dans le dossier de l'équipe.
@@ -109,8 +109,7 @@ Ce que fait une équipe lancée des changements faits à la main :
 | Le modèle, l'effort, le mode de permission, les arguments d'un membre | au prochain démarrage de ce membre |
 | Un membre ajouté ou retiré | au lancement suivant, ou dès que tu changes quoi que ce soit dans le menu de l'équipe |
 | Disposition, onglets, grille, tableau de bord, langue | au lancement suivant |
-| `[tmux]` | au démarrage du serveur tmux de recruit |
 
-`recruit --restart --resume` applique tout sauf `[tmux]` tout de suite, chaque membre reprenant sa conversation.
+`recruit --restart --resume` applique tout tout de suite, chaque membre reprenant sa conversation.
 
 Chaque clé est décrite dans la [référence de la configuration](/recruit/fr/reference/configuration/).

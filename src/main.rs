@@ -20,7 +20,6 @@ mod mux;
 mod prompt;
 mod state;
 mod templates;
-mod tmux;
 mod ui;
 mod wizard;
 

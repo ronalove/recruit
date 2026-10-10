@@ -99,7 +99,7 @@ pub(crate) fn attach(state: &Path) -> Result<()> {
         bail!(t!(
             "tu es déjà dans cette équipe : détache-toi d'abord ({}q)",
             "you are already inside this team: detach first ({}q)",
-            crate::tmux::ALT
+            crate::look::ALT
         ));
     }
     let Some((mut stream, welcome)) = hello(state, Kind::Attach)? else {

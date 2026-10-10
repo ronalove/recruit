@@ -43,13 +43,13 @@ recruit new mon-equipe --template personal --size small --launch
 recruit
 ```
 
-Dans un projet qui a une équipe, `recruit` la lance. L'équipe s'ouvre dans tmux : tes interlocuteurs dans le premier onglet, le tableau de bord et le journal à leur droite, les agents de travail dans les onglets suivants.
+Dans un projet qui a une équipe, `recruit` la lance. L'équipe s'ouvre dans ton terminal : tes interlocuteurs dans le premier onglet, le tableau de bord et le journal à leur droite, les agents de travail dans les onglets suivants.
 
 :::tip[Approuver le dossier une fois]
 Claude Code demande à chaque nouvelle session s'il peut faire confiance à un dossier qu'il n'a jamais approuvé, et Entrée seule répond « No, exit ». recruit te prévient avant de lancer. Pour approuver le dossier une fois pour toute l'équipe, lance d'abord `claude` dans ce dossier et accepte.
 :::
 
-![Le premier onglet d'une équipe lancée : deux interlocuteurs à gauche, le tableau de bord et le journal à droite](../../../../assets/screenshots/team-fr.png)
+![Le premier onglet d'une équipe lancée : deux interlocuteurs à gauche, le tableau de bord et le journal à droite](../../../../assets/screenshots/team.png)
 
 ## 3. Parler à tes interlocuteurs
 
@@ -59,7 +59,7 @@ Pour regarder un agent, clique sur sa carte dans le tableau de bord, ou va dans 
 
 ## 4. Partir et revenir
 
-`Alt+q` (`⌥q` sous macOS), ou le bouton « quitter » à droite de la barre tmux, propose de se détacher (`d`) ou de quitter, ce qui arrête l'équipe (`q`). Détachée, l'équipe continue de travailler, même si tu fermes le terminal :
+`Alt+q` (`⌥q` sous macOS), ou le bouton « quitter » en bas à droite, propose de se détacher (`d`) ou de quitter, ce qui arrête l'équipe (`q`). Détachée, l'équipe continue de travailler, même si tu fermes le terminal :
 
 ```sh
 recruit          # retour là où tu l'as laissée, depuis n'importe quel terminal, même en SSH
@@ -70,5 +70,5 @@ recruit stop     # ferme la session de chaque membre
 
 - [Équipes](/recruit/fr/guides/teams/) : locale ou globale, réglages personnels, les façons de composer une équipe.
 - [Le menu de l'équipe](/recruit/fr/guides/menu/) : changer le modèle, le rôle ou l'onglet d'un membre pendant que l'équipe tourne.
-- [Dans tmux](/recruit/fr/guides/tmux/) : les raccourcis, et Option sous macOS.
+- [L'écran de l'équipe](/recruit/fr/guides/screen/) : partir et revenir, suivre un membre en plein écran, les raccourcis, et Option sous macOS.
 - [Configuration](/recruit/fr/reference/configuration/) : chaque clé du fichier de l'équipe.

@@ -3,18 +3,13 @@
 
 default = "demo"
 
-# A test tmux server, never the user's `-L recruit`, and none of their tmux configuration.
-[tmux]
-socket = "rtest-shots"
-user_config = false
-# A quiet status line: without a user configuration, tmux draws it bright green.
-options = ["set -g status-style 'bg=#303030,fg=#bcbcbc'"]
-
 [teams.demo]
 description = "shorty: a tiny link shortener in TypeScript on Bun. Two contacts (lead, product) and four agents."
 lang = "en"
 model = "haiku"
 permission_mode = "acceptEdits"
+# No MCP server of the user's profile in the demo's sessions (a Home Assistant one, say, would run for each member).
+args = ["--strict-mcp-config"]
 instructions = """
 - lead is the user's entry point: they break the work down, hand it out and check what comes back. product answers questions about what to build.
 - Only change your own area; anything else goes through lead.

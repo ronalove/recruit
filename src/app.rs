@@ -17,13 +17,10 @@ use serde_json::json;
 
 use crate::backend::{self, Backend};
 use crate::cli::{Cli, Command, NewArgs};
-use crate::config::{
-    self, Catalog, Found, Member, Scope, Team, TmuxSettings, tilde, validate_member_name, validate_team_name,
-};
+use crate::config::{self, Catalog, Found, Member, Scope, Team, tilde, validate_member_name, validate_team_name};
 use crate::launch::{self, Options};
-use crate::state::Snapshot;
 use crate::templates::Templates;
-use crate::tmux::{self, Tmux};
+
 use crate::ui::{self, Choice};
 use crate::{board, bridge, claude, generate, i18n, live, member, menu, mux, t, wizard};
 
@@ -47,8 +44,6 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Command::Server { state }) => mux::server::run(&state),
         Some(Command::Ctl { state, action }) => mux::ctl::run(&state, action),
         Some(Command::Member { state, member, resume }) => member::run(&state, &member, resume),
-        Some(Command::Click { state, pane }) => click(&state, &pane),
-        Some(Command::Menu { state, client: Some(client), popup: true, .. }) => live::popup(&state, &client),
         Some(Command::Menu { state, client, nerd, member, field, .. }) => {
             menu::run(&state, client.as_deref(), nerd, member.as_deref(), field.as_deref())
         }
@@ -260,11 +255,14 @@ fn list(cwd: &Path, as_json: bool) -> Result<()> {
     let catalog = Catalog::load(cwd)?;
     let local = catalog.local_teams();
     let global = catalog.global_teams();
-    let settings = local.first().or(global.first()).map(|f| f.tmux.clone()).unwrap_or_default();
-    let running: Vec<_> = backend::running(&settings).into_iter().map(|(_, team)| team).collect();
-    let state = |name: &str| running.iter().find(|r| r.session == tmux::session_name(name));
+    let running = backend::running();
+    let state = |name: &str| running.iter().find(|r| r.session == backend::session_name(name));
     let trial =
-        |name: &str| running.iter().any(|r| r.session == format!("{}{}", tmux::session_name(name), launch::DRY_RUN));
+        |name: &str| running.iter().any(|r| r.session == format!("{}{}", backend::session_name(name), launch::DRY_RUN));
+    // A team still under recruit 1's tmux, after an upgrade: not stopped, `recruit <team>` takes it over.
+    let legacy = |f: &Found| {
+        state(&f.name).is_none() && launch::legacy::running(f.tmux.socket(), &backend::session_name(&f.name))
+    };
     let default = catalog.local.as_ref().and_then(|(_, s)| s.default.clone());
 
     if as_json {
@@ -281,6 +279,7 @@ fn list(cwd: &Path, as_json: bool) -> Result<()> {
                     "running": run.is_some(),
                     "attached": run.is_some_and(|r| r.attached),
                     "dir": run.map(|r| r.dir.clone()),
+                    "tmux": legacy(f),
                 })
             })
             .collect();
@@ -296,6 +295,7 @@ fn list(cwd: &Path, as_json: bool) -> Result<()> {
                 Some(r) if r.attached => t!("en cours, attachée", "running, attached"),
                 Some(_) => t!("en cours", "running"),
                 None if trial(&f.name) => t!("essai en cours (--dry-run)", "trial running (--dry-run)"),
+                None if legacy(f) => t!("en cours sous recruit 1 (tmux)", "running under recruit 1 (tmux)"),
                 None => t!("arrêtée", "stopped"),
             };
             let pad = " ".repeat(width - f.name.chars().count());
@@ -323,7 +323,9 @@ fn list(cwd: &Path, as_json: bool) -> Result<()> {
     let known: Vec<String> = local
         .iter()
         .chain(&global)
-        .flat_map(|f| [tmux::session_name(&f.name), format!("{}{}", tmux::session_name(&f.name), launch::DRY_RUN)])
+        .flat_map(|f| {
+            [backend::session_name(&f.name), format!("{}{}", backend::session_name(&f.name), launch::DRY_RUN)]
+        })
         .collect();
     let others: Vec<String> =
         running
@@ -344,22 +346,29 @@ fn list(cwd: &Path, as_json: bool) -> Result<()> {
 }
 
 /// The session `attach` and `stop` act on, and what runs it: the named team, this project's team, or the only one
-/// running.
+/// running. A team still under recruit 1's tmux server is named in the error, with what to do.
 fn target(cwd: &Path, team: Option<&str>) -> Result<(Box<dyn Backend>, String, String)> {
     let catalog = Catalog::load(cwd)?;
     let found = match team {
         Some(name) => catalog.find(name),
         None => catalog.default_local(),
     };
-    let settings = found.as_ref().map(|f| f.tmux.clone()).unwrap_or_else(TmuxSettings::default);
     if let Some(name) = team.or(found.as_ref().map(|f| f.name.as_str())) {
-        let session = tmux::session_name(name);
+        let session = backend::session_name(name);
         let trial = format!("{session}{}", launch::DRY_RUN);
-        for session in [session, trial] {
-            let (_, backend) = backend::for_session(&session, &settings)?;
+        for session in [session.clone(), trial] {
+            let backend = backend::for_session(&session);
             if backend.has_session(&session) {
                 return Ok((backend, session, name.to_string()));
             }
+        }
+        let socket = found.as_ref().map(|f| f.tmux.socket().to_string()).unwrap_or_else(|| "recruit".into());
+        if launch::legacy::running(&socket, &session) {
+            bail!(t!(
+                "l'équipe « {0} » tourne encore sous tmux, lancée par recruit 1. « recruit {0} » propose de l'arrêter et de la relancer ici, chaque membre sur sa conversation.",
+                "team \"{0}\" still runs under tmux, launched by recruit 1. \"recruit {0}\" offers to stop it and launch it again here, each member on its conversation.",
+                name
+            ));
         }
         bail!(t!(
             "l'équipe « {} » ne tourne pas. Pour la lancer : recruit {}",
@@ -368,22 +377,20 @@ fn target(cwd: &Path, team: Option<&str>) -> Result<(Box<dyn Backend>, String, S
             name
         ));
     }
-    let mut running = backend::running(&settings);
-    let (kind, session, team) = match running.len() {
+    let mut running = backend::running();
+    let (session, team) = match running.len() {
         0 => bail!(t!("aucune équipe ne tourne", "no team is running")),
         1 => {
-            let (kind, r) = running.remove(0);
-            (kind, r.session, r.team)
+            let r = running.remove(0);
+            (r.session, r.team)
         }
         _ if ui::interactive() => {
-            let choices = running
-                .into_iter()
-                .map(|(kind, r)| Choice::new((kind, r.session.clone(), r.team.clone()), r.session))
-                .collect();
+            let choices =
+                running.into_iter().map(|r| Choice::new((r.session.clone(), r.team.clone()), r.session)).collect();
             ui::select(&t!("Quelle équipe ?", "Which team?"), choices)?
         }
         _ => {
-            let names: Vec<String> = running.into_iter().map(|(_, r)| r.session).collect();
+            let names: Vec<String> = running.into_iter().map(|r| r.session).collect();
             bail!(t!(
                 "plusieurs équipes tournent ({}) : précise laquelle",
                 "several teams are running ({}): say which",
@@ -391,7 +398,41 @@ fn target(cwd: &Path, team: Option<&str>) -> Result<(Box<dyn Backend>, String, S
             ))
         }
     };
-    Ok((backend::new(kind, &settings, &session)?, session, team))
+    Ok((backend::for_session(&session), session, team))
+}
+
+/// `recruit stop` of a team that still runs under recruit 1's tmux server, and not here: stopped there, after the same
+/// question. The team's name when it was.
+fn stop_legacy(cwd: &Path, team: Option<&str>, yes: bool) -> Result<Option<String>> {
+    let catalog = Catalog::load(cwd)?;
+    let found = match team {
+        Some(name) => catalog.find(name),
+        None => catalog.default_local(),
+    };
+    let Some(name) = team.or(found.as_ref().map(|f| f.name.as_str())) else { return Ok(None) };
+    let session = backend::session_name(name);
+    let socket = found.as_ref().map(|f| f.tmux.socket().to_string()).unwrap_or_else(|| "recruit".into());
+    if backend::for_session(&session).has_session(&session) || !launch::legacy::running(&socket, &session) {
+        return Ok(None);
+    }
+    if !yes && ui::interactive() {
+        let sure = ui::confirm(
+            &t!(
+                "Arrêter l'équipe « {} », qui tourne encore sous tmux (recruit 1) ? Ses sessions Claude seront fermées (recruit {} --resume les reprendra).",
+                "Stop team \"{}\", still running under tmux (recruit 1)? Its Claude sessions will be closed (recruit {} --resume picks them up again).",
+                name,
+                name
+            ),
+            true,
+        )?;
+        if !sure {
+            return Err(ui::Cancelled.into());
+        }
+    }
+    if !launch::legacy::stop(&socket, &session) {
+        bail!(t!("tmux n'a pas arrêté l'équipe « {} »", "tmux did not stop team \"{}\"", name));
+    }
+    Ok(Some(name.to_string()))
 }
 
 fn attach(cwd: &Path, team: Option<&str>) -> Result<()> {
@@ -400,6 +441,10 @@ fn attach(cwd: &Path, team: Option<&str>) -> Result<()> {
 }
 
 fn stop(cwd: &Path, team: Option<&str>, yes: bool) -> Result<()> {
+    if let Some(stopped) = stop_legacy(cwd, team, yes)? {
+        println!("{}", t!("Équipe « {} » arrêtée.", "Team \"{}\" stopped.", stopped));
+        return Ok(());
+    }
     let (backend, session, name) = target(cwd, team)?;
     if !yes && ui::interactive() {
         let sure = ui::confirm(
@@ -417,40 +462,6 @@ fn stop(cwd: &Path, team: Option<&str>, yes: bool) -> Result<()> {
     }
     backend.stop(&session)?;
     println!("{}", t!("Équipe « {} » arrêtée.", "Team \"{}\" stopped.", name));
-    Ok(())
-}
-
-/// A click on a panel, bound in recruit's tmux server: the member clicked gets the focus, in its tab. A click that
-/// falls on no one does nothing.
-fn click(state: &Path, pane: &str) -> Result<()> {
-    let snapshot = Snapshot::read(state)?;
-    let tmux = Tmux::new(&TmuxSettings { socket: Some(snapshot.socket.clone()), ..Default::default() })?;
-    let Some(click) = tmux.click(pane)? else { return Ok(()) };
-    let panel = match click.role.as_str() {
-        tmux::DASHBOARD => board::Kind::Dashboard,
-        tmux::JOURNAL => board::Kind::Journal,
-        _ => return Ok(()),
-    };
-    match board::clicked(&snapshot, state, panel, click.x, click.y, click.columns, &click.line) {
-        Some(board::Clicked::Compact(member)) => {
-            compact(state, &member, |choice| tmux.confirm(&click.client, pane, choice))
-        }
-        Some(board::Clicked::Show(member)) => tmux.focus(&snapshot.session, &member).map(drop),
-        None => Ok(()),
-    }
-}
-
-/// Offers to compact a member's context, in a menu over the dashboard: the member's model reads it all again, which
-/// the user sees before choosing. Once confirmed, the member's mod takes the request; a member gone back to work by
-/// then refuses it.
-/// `confirm` asks the user the choice recruit's own multiplexer shows too (`mux::chrome::compact_choice`): true for
-/// its first option.
-fn compact(state: &Path, member: &str, confirm: impl FnOnce(&mux::chrome::Choice) -> Result<bool>) -> Result<()> {
-    // The name makes a file name: a member's, nothing else.
-    validate_member_name(member).map_err(anyhow::Error::msg)?;
-    if confirm(&mux::chrome::compact_choice(member, board::context_percent(state, member)))? {
-        bridge::request_compaction(state, member)?;
-    }
     Ok(())
 }
 
@@ -544,29 +555,6 @@ fn templates() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn compaction_asked_once_confirmed() {
-        let state = tempfile::tempdir().unwrap();
-        let asked = |name: &str| state.path().join("compact").join(name).exists();
-        // Not a member's name: refused before asking, nothing written.
-        for name in ["../escape", "dev cli", "-dev", "a#{pane_id}", ""] {
-            assert!(compact(state.path(), name, |_| panic!("asked for {name:?}")).is_err(), "{name:?}");
-        }
-        assert!(!state.path().join("compact").exists());
-        // Cancelled, then confirmed.
-        compact(state.path(), "dev-cli", |_| Ok(false)).unwrap();
-        assert!(!asked("dev-cli"));
-        let mut shown = None;
-        compact(state.path(), "dev-cli", |choice| {
-            shown = Some(choice.clone());
-            Ok(true)
-        })
-        .unwrap();
-        assert!(asked("dev-cli"));
-        // The native multiplexer's words, its context unknown here.
-        assert_eq!(shown, Some(mux::chrome::compact_choice("dev-cli", None)));
-    }
 
     #[test]
     fn edit_opens_files_that_do_not_read() {

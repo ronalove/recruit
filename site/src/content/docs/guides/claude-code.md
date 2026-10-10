@@ -16,7 +16,7 @@ Its name, given with `claude -n`, and an added system prompt (`--append-system-p
 - its role and its instructions;
 - whether it is a contact or a working agent. A working agent asks the contacts when it is stuck rather than waiting in its terminal, and follows you when you step in;
 - the list of its teammates, with their roles and the contacts marked;
-- its team's tmux session, to tell its teammates from sessions of the same name elsewhere (from two members on);
+- when another session carries a teammate's name, the exact address to write to it, "name [ref]";
 - the team's shared rules.
 
 recruit writes this prompt in the team's language (`lang`). The prompt files are in `~/.cache/recruit/prompts/`. To see each member's command line and prompt file without launching anything:

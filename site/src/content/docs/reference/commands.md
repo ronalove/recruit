@@ -28,7 +28,7 @@ When the team is already running, `recruit` joins it. It also starts again the m
 | Option | Effect |
 |---|---|
 | `-r`, `--resume` | Each member resumes the last conversation that carries its name in this folder. Ignored when the team is running. |
-| `--dry-run` | Opens the layout only, in a separate tmux session (`<team>-dry-run`): each pane shows its member and role and the command it would run, and Claude is not started. `recruit stop <team>` closes the trial. |
+| `--dry-run` | Opens the layout only, as a separate trial (`<team>-dry-run`): each pane shows its member and role and the command it would run, and Claude is not started. `recruit stop <team>` closes the trial. |
 | `-d`, `--detach` | Launches without attaching to the team. |
 | `--restart` | Stops the team first if it is running. |
 | `--print` | Prints the tabs, each member's command line and its prompt file, and launches nothing. |
@@ -73,7 +73,7 @@ A team created with `--member` alone gets recruit's shared rules as its instruct
 recruit list [--json]
 ```
 
-Lists the project's teams and your global teams, each with its number of members and its state: stopped, running, running and attached, or trial running (`--dry-run`). A `*` marks the project's `default` team. Sessions of recruit's tmux server that belong to none of them come last, as other running teams.
+Lists the project's teams and your global teams, each with its number of members and its state: stopped, running, running and attached, trial running (`--dry-run`), or running under recruit 1 (tmux), for a team that recruit 1 left running (see [the FAQ](/recruit/faq/#a-team-still-runs-under-recruit-1)). A `*` marks the project's `default` team. Running teams that belong to none of them come last.
 
 ```
 Teams of this project (~/code/my-app/.recruit)
@@ -83,7 +83,7 @@ Global teams (~/.config/recruit)
     tools    2 members  stopped
 ```
 
-`--json` prints one object per team: `name`, `scope` (`local` or `global`), `file`, `members`, `running`, `attached` and `dir`, the folder it runs in.
+`--json` prints one object per team: `name`, `scope` (`local` or `global`), `file`, `members`, `running`, `attached`, `dir`, the folder it runs in, and `tmux`, true for a team still running under recruit 1.
 
 ## `recruit attach`
 

@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-recruit is a single binary. It needs [Claude Code](https://claude.com/claude-code) and tmux 3.5 or newer.
+recruit is a single binary, with nothing else to install. It needs [Claude Code](https://claude.com/claude-code).
 
 ## Homebrew
 
@@ -15,7 +15,7 @@ On macOS and Linux:
 brew install ronalove/tap/recruit
 ```
 
-Homebrew downloads a prebuilt binary, for macOS (Apple Silicon, Intel) or Linux (x86_64, arm64, static), and installs tmux along with it.
+Homebrew downloads a prebuilt binary, for macOS (Apple Silicon, Intel) or Linux (x86_64, arm64, static).
 
 To update:
 
@@ -34,21 +34,23 @@ Each [release](https://github.com/ronalove/recruit/releases) holds the same bina
 | `recruit-<version>-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64, static |
 | `recruit-<version>-aarch64-unknown-linux-musl.tar.gz` | Linux arm64, static |
 
-Extract `recruit` and put it somewhere on your `PATH`. Install tmux yourself in that case.
+Extract `recruit` and put it somewhere on your `PATH`.
 
 ## From source
 
-With Rust 1.88 or newer:
+With Rust 1.99 or newer, curl and tar. recruit's terminal engine, [libghostty-vt](https://github.com/ghostty-org/ghostty), is built with Zig 0.16: `scripts/ghostty.sh` fetches Zig and Ghostty's sources once, checks them, and builds it.
 
 ```sh
-cargo install --git https://github.com/ronalove/recruit
+git clone https://github.com/ronalove/recruit
+cd recruit
+scripts/ghostty.sh
+cargo install --path .
 ```
 
 ## What recruit needs
 
 - **Claude Code**, installed and logged in: recruit runs `claude` from your `PATH`, or the command given by [`[claude] command`](/recruit/reference/configuration/). With Claude Code 2.1.287 or newer, each member also loads [recruit's mod](/recruit/guides/claude-code/), which adds the model, the context and the usage to the dashboard, and the `/recruit` command. Older versions work without these.
-- **tmux 3.5 or newer.** recruit checks it at launch and says so when it is older.
-- **On macOS**, a terminal that sends Option as Alt, for recruit's shortcuts: see [Option on macOS](/recruit/guides/tmux/#option-on-macos).
+- **On macOS**, a terminal that sends Option as Alt, for recruit's shortcuts: see [Option on macOS](/recruit/guides/screen/#option-on-macos).
 - **No special font.** In Ghostty, kitty and WezTerm, which carry the Nerd Font symbols themselves, the dashboard and the menu draw their icons with them; elsewhere, with plain Unicode signs.
 
 Check the installation:

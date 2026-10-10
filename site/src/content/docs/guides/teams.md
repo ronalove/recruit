@@ -91,7 +91,7 @@ recruit new web -m "lead:Coordinates" -m "dev:Writes the code"   # member by mem
 
 Team and member names follow the same rules, whether recruit asks for them or you write them in the file:
 
-- **A team's name** becomes a file name and a tmux session name: letters (accents included) and digits, `-` and `_`, 40 characters at most, not starting with `-`. It cannot be one of recruit's commands: `new`, `list`, `attach`, `stop`, `edit`, `templates`, `help`, or the internal ones that start with `_`.
+- **A team's name** becomes a file name: letters (accents included) and digits, `-` and `_`, 40 characters at most, not starting with `-`. It cannot be one of recruit's commands: `new`, `list`, `attach`, `stop`, `edit`, `templates`, `help`, or the internal ones that start with `_`.
 - **A member's name** is the address its teammates write to: letters and digits, `-`, `_` and `.`, no spaces, 40 characters at most, not starting with `-` or `.`. Two members of a team cannot have names that differ only by case.
 
 A name written by hand that breaks these rules stops the team from launching: recruit names the file, the name and the reason (see [the FAQ](/recruit/faq/#cannot-have-this-name)). The team's menu also refuses a name that a Claude session open in the team's folder already has.
@@ -109,8 +109,7 @@ What a running team does with changes made by hand:
 | A member's model, effort, permission mode, arguments | when that member next starts |
 | A member added or removed | at the next launch, or as soon as you change anything in the team's menu |
 | Layout, tabs, grid, dashboard, language | at the next launch |
-| `[tmux]` | when recruit's tmux server starts |
 
-`recruit --restart --resume` applies everything but `[tmux]` at once, each member resuming its conversation.
+`recruit --restart --resume` applies everything at once, each member resuming its conversation.
 
 Every key is described in the [configuration reference](/recruit/reference/configuration/).

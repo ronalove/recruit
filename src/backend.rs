@@ -1,26 +1,113 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! What recruit asks of what runs a team: tmux, or its own multiplexer (specs/multiplexeur.md, `RECRUIT_BACKEND=native`
-//! until it is the default). The trait grows by primitives until tmux leaves (step 4); the types it carries live in
-//! `tmux.rs` until then.
+//! What runs a team: recruit's own multiplexer (specs/multiplexeur.md), a server per team, which the [`Backend`] trait
+//! drives; and what a launch asks of it ([`Plan`]).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::config::TmuxSettings;
+use crate::i18n::Lang;
 use crate::layout::Tab;
 use crate::mux::native::Native;
 use crate::mux::socket;
 use crate::state::{self, Snapshot};
-use crate::tmux::Tmux;
-pub use crate::tmux::{JournalSize, Pane, PaneState, Plan, RunningTeam};
+use crate::t;
+
+/// What a launch asks the multiplexer to open.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    pub session: String,
+    pub team: String,
+    pub dir: PathBuf,
+    pub columns: usize,
+    pub tabs: Vec<TabPlan>,
+    /// The team's language, for what the multiplexer writes itself.
+    pub lang: Lang,
+}
+
+#[derive(Debug, Clone)]
+pub struct TabPlan {
+    pub title: String,
+    pub panes: Vec<Pane>,
+    /// The dashboard over the journal, in a column on the right; the members then stack in one column.
+    pub side: Option<Side>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Side {
+    pub dashboard: Pane,
+    pub journal: Pane,
+}
+
+#[derive(Debug, Clone)]
+pub struct Pane {
+    /// Shown in the pane's frame: the member's name, or the panel's title.
+    pub member: String,
+    /// A panel's kind (`DASHBOARD`, `JOURNAL`); none for a member.
+    pub role: Option<&'static str>,
+    /// Run directly, without a shell in between.
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+pub const DASHBOARD: &str = "dashboard";
+pub const JOURNAL: &str = "journal";
+
+/// The journal's sizes, which Alt+j goes through in turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalSize {
+    /// Half of the panels' column.
+    Full,
+    /// Its last messages only, the rest of the column to the dashboard. The journal opens so.
+    Reduced,
+    Hidden,
+}
+
+impl JournalSize {
+    /// What the user is told once the journal took this size.
+    pub fn said(self) -> String {
+        match self {
+            JournalSize::Full => t!("Journal complet.", "Journal at full size."),
+            JournalSize::Reduced => {
+                t!("Journal réduit à ses derniers messages.", "Journal reduced to its last messages.")
+            }
+            JournalSize::Hidden => t!("Journal masqué.", "Journal hidden."),
+        }
+    }
+}
+
+/// A pane of a running team, as its server lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaneState {
+    pub id: String,
+    /// The member's name, or the panel's title.
+    pub member: String,
+    /// A panel's kind; empty for a member.
+    pub role: String,
+    /// Its tab.
+    pub window: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunningTeam {
+    pub session: String,
+    pub team: String,
+    pub dir: String,
+    pub attached: bool,
+}
+
+/// A team's session name, which names its state folder and its server's socket: the team's name, `.` and `:` made
+/// `_` (the names of recruit 1's tmux sessions, kept so that a team keeps its state).
+pub fn session_name(team: &str) -> String {
+    team.replace(['.', ':'], "_")
+}
 
 /// Whether the menu could be opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuOpened {
     Opened,
-    /// It was open already, on that terminal: recruit's own multiplexer knows it (tmux opens nothing and says nothing).
+    /// It was open already, on that terminal.
     AlreadyOpen,
     /// No terminal shows the team.
     NoClient,
@@ -31,8 +118,7 @@ pub trait Backend {
     fn running(&self) -> Result<Vec<RunningTeam>>;
     fn has_session(&self, session: &str) -> bool;
     fn launch(&self, plan: &Plan) -> Result<()>;
-    /// Takes over the terminal; returns only on error, when the client leaves, or when switching from inside the
-    /// same tmux server.
+    /// Takes over the terminal; returns only on error, or when the client leaves.
     fn attach(&self, session: &str) -> Result<()>;
     fn stop(&self, session: &str) -> Result<()>;
 
@@ -48,18 +134,13 @@ pub trait Backend {
     /// Puts the panes in `tabs`, in their order, without stopping any.
     fn arrange(&self, session: &str, tabs: &[Tab], columns: usize) -> Result<()>;
 
-    // The dashboard and the journal, while they are programs in panes (until step 2).
+    // The dashboard and the journal, programs in panes.
     fn open_panels(&self, dir: &Path, beside: &str, dashboard: &Pane, journal: &Pane) -> Result<()>;
     fn close_panels(&self, session: &str) -> Result<()>;
     fn restore_dashboard(&self, session: &str, dir: &Path, dashboard: &Pane) -> Result<()>;
     fn toggle_journal(&self, session: &str, dir: &Path, journal: &Pane) -> Result<JournalSize>;
 
     // Clients.
-    /// Shows `member`'s pane, in its tab; false when it has none.
-    // No caller: under tmux, `recruit _click` focuses by tmux itself; recruit's server focuses within itself. Goes with
-    // tmux, at step 4, unless something outside the server needs it by then.
-    #[allow(dead_code)]
-    fn focus(&self, session: &str, member: &str) -> Result<bool>;
     fn detach(&self, client: &str) -> Result<()>;
     /// Opens the team's menu (its state in `state`): on the terminal that shows `member`, or on `client`, or on the
     /// only one.
@@ -68,53 +149,9 @@ pub trait Backend {
     fn client_terminals(&self, session: &str) -> String;
 }
 
-/// What runs a team.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Kind {
-    /// recruit's tmux server; the teams launched before the field existed.
-    #[default]
-    Tmux,
-    /// recruit's own multiplexer.
-    Native,
-}
-
-/// What a team launched now runs on: recruit's own multiplexer with `RECRUIT_BACKEND=native`, hidden, until it is the
-/// default (step 4); tmux otherwise.
-pub fn requested() -> Kind {
-    match std::env::var("RECRUIT_BACKEND") {
-        Ok(backend) if backend == "native" => Kind::Native,
-        _ => Kind::Tmux,
-    }
-}
-
-/// The backend of a team that may be running as `session`: the one it was launched on while it runs, whatever is
-/// asked for now (a second copy of a running team must never start on the other one); else the one asked for now.
-pub fn for_session(session: &str, settings: &TmuxSettings) -> Result<(Kind, Box<dyn Backend>)> {
-    let launched = Snapshot::read(&state::dir(session)).map(|s| s.backend).unwrap_or_default();
-    match launched {
-        Kind::Native => {
-            let native = Native { state: state::dir(session) };
-            if native.has_session(session) {
-                return Ok((Kind::Native, Box::new(native)));
-            }
-        }
-        // Without a tmux recruit can use, no team of its runs there: recruit's own multiplexer needs none.
-        Kind::Tmux => {
-            if let Ok(tmux) = Tmux::new(settings)
-                && tmux.has_session(session)
-            {
-                return Ok((Kind::Tmux, Box::new(tmux)));
-            }
-        }
-    }
-    let kind = requested();
-    Ok((kind, new(kind, settings, session)?))
-}
-
-/// Whether recruit's own multiplexer ran `session` and crashed (itself, or the machine): a server removes
-/// `server.json` when it stops, even when `stop` has to kill it; a dead one's is left, and becomes the `crashed` mark
-/// once cleaned. Dead, not slow: its lock is free.
+/// Whether the multiplexer ran `session` and crashed (itself, or the machine): a server removes `server.json` when it
+/// stops, even when `stop` has to kill it; a dead one's is left, and becomes the `crashed` mark once cleaned. Dead,
+/// not slow: its lock is free.
 pub fn crashed(session: &str) -> bool {
     let state = state::dir(session);
     let left = socket::read_info(&state).is_some() || socket::crashed_file(&state).exists();
@@ -126,33 +163,17 @@ pub fn recovered(session: &str) {
     let _ = std::fs::remove_file(socket::crashed_file(&state::dir(session)));
 }
 
-/// A backend of `kind` for `session`; tmux's version is checked.
-pub fn new(kind: Kind, settings: &TmuxSettings, session: &str) -> Result<Box<dyn Backend>> {
-    Ok(match kind {
-        Kind::Tmux => Box::new(Tmux::new(settings)?),
-        Kind::Native => Box::new(Native { state: state::dir(session) }),
-    })
+/// What runs `session`, or will.
+pub fn for_session(session: &str) -> Box<dyn Backend> {
+    Box::new(Native { state: state::dir(session) })
 }
 
-/// The teams running, on either backend.
-pub fn running(settings: &TmuxSettings) -> Vec<(Kind, RunningTeam)> {
-    let mut teams: Vec<(Kind, RunningTeam)> = Tmux::new(settings)
-        .and_then(|tmux| tmux.running())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|team| (Kind::Tmux, team))
-        .collect();
-    let native = Native { state: std::path::PathBuf::new() };
-    teams.extend(native.running().unwrap_or_default().into_iter().map(|team| (Kind::Native, team)));
-    teams
+/// The teams running.
+pub fn running() -> Vec<RunningTeam> {
+    Native { state: PathBuf::new() }.running().unwrap_or_default()
 }
 
-/// The backend of a running team, as it was launched.
+/// What runs a team, as it was launched.
 pub fn of(snapshot: &Snapshot) -> Box<dyn Backend> {
-    match snapshot.backend {
-        Kind::Tmux => {
-            Box::new(Tmux::running(&TmuxSettings { socket: Some(snapshot.socket.clone()), ..Default::default() }))
-        }
-        Kind::Native => Box::new(Native { state: state::dir(&snapshot.session) }),
-    }
+    for_session(&snapshot.session)
 }

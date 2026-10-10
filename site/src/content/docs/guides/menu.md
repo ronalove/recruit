@@ -12,10 +12,11 @@ Every change is saved in the team's files, and most reach the running team at on
 ## Opening it
 
 - `Alt+r` (`⌥r` on macOS) in any pane of the team;
-- the "menu" button on the right of the status line;
+- the "menu" button at the bottom right;
+- a click on a member's name, model or effort, in the top border of its frame: the menu opens on that setting;
 - `/recruit`, typed in a member's prompt, with [recruit's mod](/recruit/guides/claude-code/#recruits-mod).
 
-The menu opens in a tmux popup over the team. It needs a window of 50 × 14 at least.
+The menu opens over the team, the rest dimmed; `Alt+r` and the button open it on the sheet of the member you are in. It needs a window of 50 × 14 at least.
 
 ![The team's menu, open on a member's sheet](../../../assets/screenshots/menu.png)
 

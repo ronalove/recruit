@@ -20,6 +20,7 @@ use crossterm::terminal::{self, ClearType};
 use crossterm::{cursor, queue};
 use serde::{Deserialize, Serialize};
 
+use crate::backend::Pane;
 use crate::bridge::{Helper, HelperStatus, Report, Task};
 use crate::canvas::PanicGuard;
 use crate::claude::{self, Running};
@@ -30,7 +31,6 @@ use crate::look::{
 };
 use crate::member;
 use crate::state::Snapshot;
-use crate::tmux::{self, ALT, Pane};
 use crate::{backend, bridge, t};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -287,8 +287,6 @@ struct Board {
     glyphs: Glyphs,
     /// Sessions open elsewhere under a member's name, with their folder.
     elsewhere: Vec<(String, Option<String>)>,
-    /// In recruit's own multiplexer: no header, its frame says the counts and the bar the keys (mock-up B1).
-    native: bool,
 }
 
 /// The team as it stands, `team.json` read again: members added, removed or renamed while it runs. As it was, when the
@@ -340,8 +338,7 @@ fn dashboard(first: &Snapshot, state: &Path) -> Result<()> {
         let mut clock = now();
         loop {
             if let Some((s, (sessions, glyphs))) = fresh.take() {
-                let native = s.backend == backend::Kind::Native;
-                board = Board { glyphs, native, ..memory.board(&s, state, &sessions) };
+                board = Board { glyphs, ..memory.board(&s, state, &sessions) };
                 // A look that failed says nothing of the states: left to age, the file sends the menu to ask itself.
                 if board.error.is_none() {
                     let refs = sessions.refs.clone();
@@ -507,7 +504,7 @@ impl Memory {
 }
 
 /// What the pane shows, so that a frame writes only the lines that changed: with the spinners turning ten times a
-/// second, rewriting the whole board each time would keep tmux busy for nothing.
+/// second, rewriting the whole board each time would keep the multiplexer busy for nothing.
 #[derive(Default)]
 struct Screen {
     size: (u16, u16),
@@ -544,7 +541,7 @@ impl Screen {
                 queue!(changes, cursor::MoveTo(0, row as u16))?;
                 write!(changes, "{line}")?;
                 // A line as wide as the pane leaves the cursor on its last cell, the wrap pending: EL would erase that
-                // cell (xterm, Ghostty and recruit's own multiplexer do; tmux does not).
+                // cell (xterm, Ghostty and recruit's own multiplexer do).
                 if shown_columns(line) < size.0 as usize {
                     queue!(changes, terminal::Clear(ClearType::UntilNewLine))?;
                 }
@@ -621,15 +618,13 @@ fn windows(reports: &[Report], now: i64) -> Vec<(String, f64, Option<u64>)> {
         .collect()
 }
 
-/// The dashboard's lines for a pane of `width` × `height`: the header, the cards right under it, each in the form
-/// the room leaves it (see [`arrange`]), the account's usage at the bottom.
+/// The dashboard's lines for a pane of `width` × `height`: the cards from the top, each in the form the room leaves
+/// it (see [`arrange`]), the account's usage at the bottom; no header, its frame says the counts and the bar the keys
+/// (mock-up B1). An error first, if any.
 fn render(b: &Board, width: usize, height: usize) -> Drawn {
-    let mut top = if b.native { Vec::new() } else { vec![header(b, width), String::new()] };
+    let mut top = Vec::new();
     if let Some(error) = &b.error {
-        top.insert(usize::from(!b.native), fit(error, width).red().to_string());
-        if b.native {
-            top.push(String::new());
-        }
+        top.extend([fit(error, width).red().to_string(), String::new()]);
     }
     let mut bottom = Vec::new();
     if !b.usage.is_empty() {
@@ -659,15 +654,14 @@ fn render(b: &Board, width: usize, height: usize) -> Drawn {
     drawn.append(middle);
     drawn.append(Drawn::from(vec![String::new(); filler]));
     drawn.append(Drawn::from(bottom));
-    // A pane too low for all that: the header, and the usage at the bottom if it holds.
+    // A pane too low for all that: the usage at the bottom only, if it holds.
     let rows = height.saturating_sub(1);
     if drawn.len() > rows {
-        let mut low = if b.native { Vec::new() } else { vec![header(b, width)] };
-        if !b.usage.is_empty() && rows >= 2 {
-            low.extend(vec![String::new(); rows - 1 - low.len()]);
+        let mut low = Vec::new();
+        if !b.usage.is_empty() && rows >= 1 {
+            low.extend(vec![String::new(); rows - 1]);
             low.push(usage_line(&b.usage, width));
         }
-        low.truncate(rows);
         drawn = Drawn::from(low);
     }
     drawn
@@ -813,50 +807,6 @@ pub fn read_states(state: &Path) -> Option<States> {
 /// Written in one go: the menu never reads half a file.
 fn save_states(state: &Path, states: &States) -> Result<()> {
     write_atomic(&state.join(STATES), &serde_json::to_string(states)?)
-}
-
-/// The keys the header shows: the menu, the journal's size, quitting.
-fn keys() -> String {
-    t!("{ALT}r menu · {ALT}j journal · {ALT}q quitter", "{ALT}r menu · {ALT}j journal · {ALT}q quit")
-}
-
-/// ` 14:32:05  ⠹ 2  ⚑ 1  ◷ 3    ⌥r menu · ⌥j journal · ⌥q quitter`: the time, how many work, wait for the user and
-/// rest, the keys; tmux's status line names the team. Too narrow, the time goes first, then the keys; the counts stay.
-fn header(b: &Board, width: usize) -> String {
-    let count = |state: State| b.cards.iter().filter(|c| c.state == state).count();
-    let counts: Vec<(String, Color)> = [State::Working, State::Waiting, State::Idle]
-        .into_iter()
-        .filter(|state| count(*state) > 0)
-        .map(|state| (format!("{} {}", state.badge(b.glyphs, b.frame), count(state)), state.color()))
-        .collect();
-    let counted: usize =
-        counts.iter().map(|(text, _)| text.chars().count()).sum::<usize>() + 2 * counts.len().saturating_sub(1);
-    let time = clock(b.now);
-    let keys = keys();
-    let mut used = 1 + counted;
-    let with_time = time.chars().count() + if counts.is_empty() { 0 } else { 2 };
-    let with_keys = 2 + keys.chars().count();
-    let (show_time, show_keys) =
-        if used + with_time + with_keys <= width { (true, true) } else { (false, used + with_keys <= width) };
-    let mut parts = Vec::new();
-    if show_time {
-        parts.push((time, Paint::Dim));
-        used += with_time;
-    }
-    parts.extend(counts.into_iter().map(|(text, color)| (text, Paint::Color(color))));
-    let mut pieces = vec![(" ".to_string(), Paint::Plain)];
-    for (i, part) in parts.into_iter().enumerate() {
-        if i > 0 {
-            pieces.push(("  ".into(), Paint::Plain));
-        }
-        pieces.push(part);
-    }
-    if show_keys {
-        pieces.push((" ".repeat(width - used - keys.chars().count()), Paint::Plain));
-        pieces.push((keys, Paint::Dim));
-    }
-    // Narrower than the counts alone, cut rather than wrapped.
-    painted(&pieces, width)
 }
 
 /// How a piece of a line is painted.
@@ -1759,27 +1709,11 @@ impl Tail {
 /// Earlier messages shown when the journal opens.
 const BACKLOG: usize = 200;
 
-/// The journal's first line under tmux: its title, and the key that sizes it. None in recruit's own multiplexer, whose
-/// frame already bears the title.
-fn journal_head(backend: backend::Kind, width: usize) -> Option<String> {
-    if backend == backend::Kind::Native {
-        return None;
-    }
-    let hint = t!("{ALT}j taille", "{ALT}j size");
-    let title = " Journal ";
-    let gap = width.saturating_sub(title.len() + hint.chars().count() + 1).max(2);
-    Some(format!("{}{}{}", title.reverse().bold(), " ".repeat(gap), hint.dim()))
-}
-
 fn journal(mut s: Snapshot, state: &Path) -> Result<()> {
     let mut out = std::io::stdout();
     queue!(out, cursor::Hide)?;
     // What is typed there shows nowhere either (an Enter would leave an empty line between two messages).
     let _quiet = quiet_input(Arc::new(AtomicBool::new(false)));
-    let width = terminal::size().map_or(80, |(w, _)| w as usize);
-    if let Some(head) = journal_head(s.backend, width) {
-        writeln!(out, "{head}\n")?;
-    }
     let mut tails: HashMap<PathBuf, Tail> = HashMap::new();
     let mut first = true;
     loop {
@@ -1814,7 +1748,7 @@ fn journal(mut s: Snapshot, state: &Path) -> Result<()> {
 const ARROW: &str = "──▶";
 
 /// A message's first line in the journal, ` 14:32  dev-cli ──▶ coordinateur`, cut to `width` rather than wrapped:
-/// tmux gives a click only the line it lands on, and a name split over two would read as another one.
+/// a click reaches only the line it lands on, and a name split over two would read as another one.
 fn message_head(s: &Snapshot, time: &str, from: &str, to: &str, width: usize) -> String {
     let (sender, recipient) = (member_color(s, from), member_color(s, to));
     let pieces = [
@@ -1832,8 +1766,8 @@ fn message_head(s: &Snapshot, time: &str, from: &str, to: &str, width: usize) ->
 
 /// The name under column `x` on a message's first line in the journal, ` 14:32  dev-cli ──▶ coordinateur`: its
 /// sender or its recipient, nothing elsewhere nor on any other line. Columns counted in characters, as the journal
-/// writes them. A recipient that reaches the last of the pane's `columns` may go on over the next line: tmux wraps
-/// again the lines already written when the pane narrows, `dev-cli` then reads `dev`. It is no one's.
+/// writes them. A recipient that reaches the last of the pane's `columns` may go on over the next line: the pane's
+/// terminal wraps again the lines already written when it narrows, `dev-cli` then reads `dev`. It is no one's.
 fn journal_name_at(line: &str, x: usize, columns: usize) -> Option<&str> {
     let (time, rest) = line.strip_prefix(' ')?.split_at_checked(5)?;
     let clock = time.bytes().enumerate().all(|(i, b)| if i == 2 { b == b':' } else { b.is_ascii_digit() });
@@ -1851,7 +1785,7 @@ fn journal_name_at(line: &str, x: usize, columns: usize) -> Option<&str> {
 }
 
 /// The member under a click on a panel, at column `x` and row `y` of its pane from 0, the pane `columns` wide, `line`
-/// the clicked line as tmux shows it: on the dashboard, a card or a name in a list, where the dashboard last drew
+/// the clicked line as the pane shows it: on the dashboard, a card or a name in a list, where the dashboard last drew
 /// them; in the journal, the sender or the recipient on a message's first line, read from `line` alone (it may be
 /// scrolled back).
 pub fn member_at(
@@ -1948,8 +1882,8 @@ pub fn context_percent(state: &Path, member: &str) -> Option<u8> {
     percent.is_finite().then(|| percent.round().clamp(0.0, 100.0) as u8)
 }
 
-/// What a click on a panel reaches, under tmux (`recruit _click`) as in recruit's own multiplexer (the server): see
-/// [`compaction_at`], asked first, then [`member_at`].
+/// What a click on a panel reaches, as recruit's own multiplexer (the server) asks: see [`compaction_at`], asked
+/// first, then [`member_at`].
 pub fn clicked(
     s: &Snapshot,
     state: &Path,
@@ -1968,10 +1902,10 @@ pub fn clicked(
 }
 
 /// Takes the journal to its next size: full, reduced, hidden, full again.
-pub fn toggle(s: &Snapshot) -> Result<tmux::JournalSize> {
+pub fn toggle(s: &Snapshot) -> Result<backend::JournalSize> {
     let journal = Pane {
         member: journal_title(s.lang).to_string(),
-        role: Some(tmux::JOURNAL),
+        role: Some(backend::JOURNAL),
         argv: s.journal.clone(),
         env: Vec::new(),
     };
@@ -2041,6 +1975,7 @@ fn clock(epoch: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::look::ALT;
 
     #[test]
     fn iso_times() {
@@ -2154,8 +2089,16 @@ mod tests {
     }
 
     /// The lines of a dashboard: no more than the pane holds, no card with an empty line, every zone over what it names.
+    /// The dashboard in a pane `height` rows high as these tests measure it, from when it had a header of two rows:
+    /// those two rows blank, then the cards in the room they leave. Each test keeps its room and its rows.
+    fn padded(b: &Board, width: usize, height: usize) -> Drawn {
+        let mut drawn = Drawn::from(vec![String::new(); 2.min(height.saturating_sub(1))]);
+        drawn.append(render(b, width, height.saturating_sub(2)));
+        drawn
+    }
+
     fn checked(b: &Board, width: usize, height: usize) -> Vec<String> {
-        let drawn = render(b, width, height);
+        let drawn = padded(b, width, height);
         zones_match(&drawn);
         let lines: Vec<String> = drawn.lines.iter().map(|l| visible(l)).collect();
         assert!(lines.len() == height - 1 && lines.iter().all(|l| l.chars().count() <= width), "{lines:#?}");
@@ -2274,23 +2217,19 @@ mod tests {
 
     #[test]
     fn too_low_a_pane() {
-        for height in 0..=7 {
+        // Two rows more than with the header it had: from six, « … et 13 de plus » holds.
+        for height in 0..=5 {
             let lines = render(&board(capture()), 60, height).lines;
             assert!(lines.len() <= height.saturating_sub(1), "{height}: {lines:#?}");
             assert!(!lines.iter().any(|l| visible(l).starts_with('…')), "{height}: {lines:#?}");
         }
-        // The header, and the usage at the bottom.
-        let lines: Vec<String> = render(&board(capture()), 60, 5).lines.iter().map(|l| visible(l)).collect();
-        assert!(
-            lines[0].contains(&format!("{}j", crate::tmux::ALT))
-                && lines[3].contains("41 % ↻ 1h22")
-                && lines.len() == 4,
-            "{lines:#?}"
-        );
-        assert!(render(&board(capture()), 60, 5).zones.is_empty());
+        // The usage at the bottom only.
+        let lines: Vec<String> = render(&board(capture()), 60, 3).lines.iter().map(|l| visible(l)).collect();
+        assert!(lines[0].is_empty() && lines[1].contains("41 % ↻ 1h22") && lines.len() == 2, "{lines:#?}");
+        assert!(render(&board(capture()), 60, 3).zones.is_empty());
         // Room for how many more only.
         let lines: Vec<String> =
-            render(&Board { absent: Vec::new(), ..board(capture()) }, 60, 6).lines.iter().map(|l| visible(l)).collect();
+            padded(&Board { absent: Vec::new(), ..board(capture()) }, 60, 6).lines.iter().map(|l| visible(l)).collect();
         assert_eq!(lines[2], t!("… et {} de plus", "… and {} more", 13));
     }
 
@@ -2349,7 +2288,7 @@ mod tests {
             sample_card("lanceur", false, State::Idle),
             sample_card("interface", false, State::Waiting),
         ]);
-        let lines: Vec<String> = render(&b, 70, 23).lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = padded(&b, 70, 23).lines.iter().map(|l| visible(l)).collect();
         assert_eq!(lines.len(), 22);
         assert!(lines.iter().all(|l| l.chars().count() <= 70), "{lines:#?}");
         let tops: Vec<&String> = lines.iter().filter(|l| l.starts_with('╻')).collect();
@@ -2378,7 +2317,7 @@ mod tests {
             doing("dev", State::Idle, "Je publie la version 0.6.2", Some("Version 0.6.2 publiée")),
             sample_card("ops", false, State::Waiting),
         ];
-        let lines: Vec<String> = render(&board(cards.clone()), 50, 23).lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = padded(&board(cards.clone()), 50, 23).lines.iter().map(|l| visible(l)).collect();
         // The one waiting for the user first; nothing said yet, no line for it.
         assert!(lines[2].starts_with("╻ ⚑ ops ") && lines[3].starts_with("╹ "));
         assert!(lines[5].starts_with("╻ ⠋ coordinateur "));
@@ -2401,7 +2340,7 @@ mod tests {
             "┃   ✓ Je relis le clic"
         );
         // Short of room, the agent at rest goes first, into the list of names; the one at work keeps its task.
-        let lines: Vec<String> = render(&board(cards), 50, 15).lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = padded(&board(cards), 50, 15).lines.iter().map(|l| visible(l)).collect();
         assert!(lines.iter().any(|l| l.trim_end() == "┃   Je relis la maquette des cartes"), "{lines:#?}");
         assert_eq!(lines.iter().filter(|l| l.starts_with('╻')).count(), 2);
         assert!(lines.iter().any(|l| l.starts_with(&t!("au repos", "idle")) && l.ends_with(" dev")), "{lines:#?}");
@@ -2703,7 +2642,7 @@ mod tests {
     fn forms_given_up_in_turn() {
         // The contact at work over two lines, the agent at rest with its task done: 15 lines leave them 8.
         let at = |height: usize| -> Vec<String> {
-            render(&board(long_and_short()), 70, height).lines.iter().map(|l| visible(l)).collect()
+            padded(&board(long_and_short()), 70, height).lines.iter().map(|l| visible(l)).collect()
         };
         let middles = |lines: &[String], name: &str| {
             let top = lines.iter().position(|l| l.contains(&format!(" {name} "))).unwrap();
@@ -2733,7 +2672,7 @@ mod tests {
     #[test]
     fn zones_over_cards_of_different_heights() {
         // One column: four lines, an empty one, three.
-        let drawn = render(&board(long_and_short()), 70, 15);
+        let drawn = padded(&board(long_and_short()), 70, 15);
         zones_match(&drawn);
         let rows = |drawn: &Drawn| -> Vec<(String, ZoneKind, usize, usize, usize)> {
             drawn.zones.iter().map(|z| (z.member.clone(), z.kind, z.row, z.col, z.rows)).collect()
@@ -2754,7 +2693,7 @@ mod tests {
                 sample_card("dev", false, State::Working),
             ]
         };
-        let drawn = render(&board(pair()), 70, 10);
+        let drawn = padded(&board(pair()), 70, 10);
         zones_match(&drawn);
         assert_eq!(
             rows(&drawn)[..2],
@@ -2763,7 +2702,7 @@ mod tests {
         // The shorter one on the left: room kept under it, the right one's capsule in its column on all its lines.
         let mut cards = pair();
         cards.reverse();
-        let drawn = render(&board(cards), 70, 10);
+        let drawn = padded(&board(cards), 70, 10);
         zones_match(&drawn);
         assert_eq!(rows(&drawn)[0], ("dev".into(), ZoneKind::Member, 2, 0, 2));
         assert_eq!(rows(&drawn)[1], ("relecteur".into(), ZoneKind::Member, 2, 35, 3));
@@ -2841,7 +2780,7 @@ mod tests {
             vec![sample_card("coordinateur", true, State::Idle), sample_card("archi", true, State::Working)];
         cards.extend((0..4).map(|i| sample_card(&format!("w{i}"), false, State::Working)));
         cards.extend((0..9).map(|i| sample_card(&format!("repos{i}"), false, State::Idle)));
-        let lines: Vec<String> = render(&board(cards.clone()), 70, 23).lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = padded(&board(cards.clone()), 70, 23).lines.iter().map(|l| visible(l)).collect();
         assert!(lines.iter().all(|l| l.chars().count() <= 70), "{lines:#?}");
         // Nothing to say of what they do: two side by side rather than a name less. A contact at rest keeps its card,
         // the latest agents at rest too; the others are only named.
@@ -2850,10 +2789,10 @@ mod tests {
         assert_eq!(named(&lines), ["repos4", "repos5", "repos6", "repos7", "repos8"]);
 
         // Twice the height: every one in cards, two side by side.
-        let tall: Vec<String> = render(&board(cards.clone()), 70, 47).lines.iter().map(|l| visible(l)).collect();
+        let tall: Vec<String> = padded(&board(cards.clone()), 70, 47).lines.iter().map(|l| visible(l)).collect();
         assert!(tall.iter().any(|l| l.contains("╻ ◷ repos0 ")));
         // Too narrow for two side by side.
-        let narrow: Vec<String> = render(&board(cards), 50, 47).lines.iter().map(|l| visible(l)).collect();
+        let narrow: Vec<String> = padded(&board(cards), 50, 47).lines.iter().map(|l| visible(l)).collect();
         assert!(narrow.iter().all(|l| l.matches('╻').count() <= 1 && l.chars().count() <= 50));
     }
 
@@ -2888,7 +2827,7 @@ mod tests {
             sample_card("lanceur", false, State::Idle),
             sample_card("interface", false, State::Waiting),
         ]);
-        let drawn = render(&b, 70, 23);
+        let drawn = padded(&b, 70, 23);
         zones_match(&drawn);
         let at =
             |member: &str, kind| drawn.zones.iter().find(|z| z.member == member && z.kind == kind).cloned().unwrap();
@@ -2907,7 +2846,7 @@ mod tests {
             vec![sample_card("coordinateur", true, State::Idle), sample_card("archi", true, State::Working)];
         cards.extend((0..4).map(|i| sample_card(&format!("w{i}"), false, State::Working)));
         cards.extend((0..9).map(|i| sample_card(&format!("repos{i}"), false, State::Idle)));
-        let drawn = render(&board(cards), 70, 23);
+        let drawn = padded(&board(cards), 70, 23);
         zones_match(&drawn);
         let archi = drawn.zones.iter().find(|z| z.member == "archi").unwrap();
         assert_eq!((archi.row, archi.col, archi.cols), (2, 35, 35));
@@ -2922,16 +2861,16 @@ mod tests {
     #[test]
     fn zones_follow_what_moves_them() {
         let cards = || vec![sample_card("coordinateur", true, State::Working), sample_card("dev", false, State::Idle)];
-        let rows = |b: &Board| render(b, 70, 23).zones.iter().map(|z| z.row).collect::<Vec<_>>();
-        // An error under the header: everything one line lower.
+        let rows = |b: &Board| padded(b, 70, 23).zones.iter().map(|z| z.row).collect::<Vec<_>>();
+        // An error first, then a blank: everything two lines lower.
         let failing = Board { error: Some("claude agents: boom".into()), ..board(cards()) };
-        zones_match(&render(&failing, 70, 23));
-        assert_eq!(rows(&failing), rows(&board(cards())).iter().map(|r| r + 1).collect::<Vec<_>>());
+        zones_match(&padded(&failing, 70, 23));
+        assert_eq!(rows(&failing), rows(&board(cards())).iter().map(|r| r + 2).collect::<Vec<_>>());
 
         // Two side by side on an odd width: the right one a column wider.
         let mut many: Vec<Card> = (0..6).map(|i| sample_card(&format!("w{i}"), false, State::Working)).collect();
         many.extend((0..4).map(|i| sample_card(&format!("v{i}"), false, State::Waiting)));
-        let drawn = render(&board(many), 71, 23);
+        let drawn = padded(&board(many), 71, 23);
         zones_match(&drawn);
         assert!(drawn.lines.iter().all(|l| visible(l).chars().count() <= 71));
         let w1 = drawn.zones.iter().find(|z| z.member == "w1").unwrap();
@@ -2967,7 +2906,6 @@ mod tests {
         Snapshot {
             team: "web".into(),
             session: "web".into(),
-            socket: "rtest".into(),
             dir: "/tmp/web".into(),
             claude: "claude".into(),
             config_dir: None,
@@ -3119,16 +3057,6 @@ mod tests {
     }
 
     #[test]
-    fn the_journal_titled_once() {
-        let head = journal_head(backend::Kind::Tmux, 40).map(|line| visible(&line));
-        let hint = t!("{ALT}j taille", "{ALT}j size");
-        let gap = 40 - " Journal ".len() - hint.chars().count() - 1;
-        assert_eq!(head, Some(format!(" Journal {}{hint}", " ".repeat(gap))));
-        // Its frame already bears it.
-        assert_eq!(journal_head(backend::Kind::Native, 40), None);
-    }
-
-    #[test]
     fn exact_addresses_in_the_states_only_when_some() {
         let mut states = States { at: 5, ..Default::default() };
         assert!(!serde_json::to_string(&states).unwrap().contains("refs"));
@@ -3244,23 +3172,23 @@ mod tests {
         };
         let b = Board { elsewhere: vec![("coordinateur".into(), Some("shop".into()))], ..board(cards()) };
         let lines =
-            |height: usize| -> Vec<String> { render(&b, 70, height).lines.iter().map(|l| visible(l)).collect() };
+            |height: usize| -> Vec<String> { padded(&b, 70, height).lines.iter().map(|l| visible(l)).collect() };
         let line = t!(" nom en double ailleurs : {}", " name in use elsewhere: {}", "coordinateur (shop)");
         // Right over the usage, dimmed.
         let tall = lines(23);
         assert_eq!(tall[20], line);
         assert!(tall[21].contains("41 % ↻ 1h22") && tall[19].is_empty());
-        assert!(render(&b, 70, 23).lines[20].contains(&line.clone().dim().to_string()));
+        assert!(padded(&b, 70, 23).lines[20].contains(&line.clone().dim().to_string()));
         // The cards first: no room left, no line.
         assert_eq!(lines(16)[13], line);
         assert!(!lines(15).contains(&line), "{:#?}", lines(15));
-        assert_eq!(render(&b, 70, 15).zones, render(&board(cards()), 70, 15).zones);
+        assert_eq!(padded(&b, 70, 15).zones, padded(&board(cards()), 70, 15).zones);
         // Several, on one line at most.
         let b = Board {
             elsewhere: vec![("coordinateur".into(), Some("shop".into())), ("dev".into(), None)],
             ..board(cards())
         };
-        let shown = render(&b, 30, 23)
+        let shown = padded(&b, 30, 23)
             .lines
             .iter()
             .map(|l| visible(l))
@@ -3333,7 +3261,7 @@ mod tests {
         assert!((20..28).all(|x| at(&head, x).is_none()));
         let wide = visible(&message_head(&s, "14:32", "coordinateur", "dev-cli", 40));
         assert_eq!(at(&wide, 25).as_deref(), Some("dev-cli"));
-        // Written 40 wide, then wrapped again by tmux in a pane narrowed to 28: `dev` up to the last column, `-cli` on
+        // Written 40 wide, then wrapped again by the pane's terminal narrowed to 28: `dev` up to the last column, `-cli` on
         // the next line. The recipient may go on: no one; the sender still answers.
         let wrapped = format!(" 14:32  coordinateur {ARROW} dev");
         assert_eq!(wrapped.chars().count(), 28);
@@ -3415,41 +3343,8 @@ mod tests {
     }
 
     #[test]
-    fn header_counts_then_less_when_narrow() {
-        let mut cards = vec![
-            sample_card("a", true, State::Working),
-            sample_card("b", false, State::Working),
-            sample_card("c", false, State::Waiting),
-        ];
-        cards.extend((0..3).map(|i| sample_card(&format!("r{i}"), false, State::Idle)));
-        let mut b = Board { frame: 2, ..board(cards) };
-        let keys = keys();
-        let pad = |width: usize, used: usize| " ".repeat(width - used - keys.chars().count());
-        let counts = "⠹ 2  ⚑ 1  ◷ 3";
-        let at = |b: &Board, width: usize| visible(&header(b, width));
-        // Everything takes a space, the time (8), the counts (2 + 13), two spaces and the keys, whose length depends
-        // on `ALT`.
-        let all = 26 + keys.chars().count();
-        assert_eq!(at(&b, all + 10), format!(" {}  {counts}{}{keys}", clock(1000), pad(all + 10, 24)));
-        assert_eq!(at(&b, all), format!(" {}  {counts}  {keys}", clock(1000)));
-        // The time goes first, then the keys; the counts stay.
-        assert_eq!(at(&b, all - 1), format!(" {counts}{}{keys}", pad(all - 1, 14)));
-        assert_eq!(at(&b, all - 10), format!(" {counts}  {keys}"));
-        assert_eq!(at(&b, all - 11), format!(" {counts}"));
-        assert_eq!(at(&b, 14), format!(" {counts}"));
-        // Narrower still, cut rather than wrapped.
-        assert_eq!(at(&b, 10), " ⠹ 2  ⚑ 1…");
-        b.glyphs = Glyphs::Nerd;
-        assert_eq!(at(&b, 14), " \u{F06A9} 2  \u{F009E} 1  \u{F0150} 3");
-        // No one running: the time alone, then the keys.
-        let empty = board(Vec::new());
-        assert_eq!(at(&empty, 11 + keys.chars().count()), format!(" {}  {keys}", clock(1000)));
-    }
-
-    /// No size, however small, makes the dashboard or the journal panic: a panel that panics is not started again.
-    #[test]
     fn no_size_too_small() {
-        // Thirteen cards, the same with long names, twenty-six; with an error, none, natively.
+        // Thirteen cards, the same with long names, twenty-six; with an error, none.
         let long: Vec<Card> = capture()
             .into_iter()
             .enumerate()
@@ -3460,8 +3355,8 @@ mod tests {
             .collect();
         let boards = [
             board(capture()),
-            Board { native: true, glyphs: Glyphs::Nerd, ..board(long) },
-            Board { native: true, ..board(many) },
+            Board { glyphs: Glyphs::Nerd, ..board(long) },
+            board(many),
             Board { error: Some("claude agents: boom".into()), usage: Vec::new(), ..board(Vec::new()) },
         ];
         let s = snapshot(&["coordinateur", "dev-cli"]);
@@ -3488,8 +3383,7 @@ mod tests {
                         }
                         let journal = std::panic::catch_unwind(|| {
                             message_head(s, "14:32", "dev-cli", "coordinateur", width);
-                            fit("Le texte d'un message", width.saturating_sub(11));
-                            journal_head(backend::Kind::Tmux, width)
+                            fit("Le texte d'un message", width.saturating_sub(11))
                         });
                         if journal.is_err() {
                             failed.lock().unwrap().push(format!("the journal at {width}"));
@@ -3502,23 +3396,18 @@ mod tests {
         assert!(failed.is_empty(), "{} failed: {}", failed.len(), failed.join(", "));
     }
 
-    /// In recruit's own multiplexer, no header: its frame says the counts, the bar the keys (mock-up B1).
+    /// No header: its frame says the counts, the bar the keys (mock-up B1); the cards from the top.
     #[test]
-    fn no_header_in_the_native_frame() {
+    fn no_header() {
         let cards = vec![sample_card("a", true, State::Working), sample_card("b", false, State::Idle)];
-        let tmux = render(&board(cards.clone()), 60, 20);
-        assert!(visible(&tmux.lines[0]).contains(&keys()), "{:?}", tmux.lines[0]);
-        let native = render(&Board { native: true, ..board(cards) }, 60, 20);
-        assert!(native.lines.iter().all(|line| !visible(line).contains(&keys())));
-        // Two lines less above the cards, the same below.
-        assert_eq!(native.lines.len(), tmux.lines.len());
-        let first = |drawn: &Drawn| drawn.lines.iter().position(|line| visible(line).contains(" a")).unwrap();
-        assert_eq!(first(&native) + 2, first(&tmux));
+        let drawn = render(&board(cards), 60, 20);
+        assert!(visible(&drawn.lines[0]).contains(" a"), "{:?}", drawn.lines[0]);
+        assert!(drawn.lines.iter().all(|line| !visible(line).contains(&format!("{ALT}r menu"))));
         // An error first, then a blank.
-        let failing = render(&Board { native: true, error: Some("boom".into()), ..board(Vec::new()) }, 60, 20);
+        let failing = render(&Board { error: Some("boom".into()), ..board(Vec::new()) }, 60, 20);
         assert_eq!((visible(&failing.lines[0]).as_str(), failing.lines[1].as_str()), ("boom", ""));
         // A pane too low: the usage at the bottom only.
-        let low = render(&Board { native: true, ..board(vec![sample_card("a", true, State::Working); 6]) }, 60, 4);
+        let low = render(&board(vec![sample_card("a", true, State::Working); 6]), 60, 4);
         assert_eq!(low.lines.len(), 3);
         assert!(visible(&low.lines[2]).contains("5 h"), "{:?}", low.lines);
     }

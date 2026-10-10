@@ -275,7 +275,7 @@ impl Tab {
 }
 
 /// The reduced journal's rows, its frame included: its last three messages, two lines each, then the line the next
-/// one starts on (as `tmux.rs`'s `REDUCED_ROWS`).
+/// one starts on.
 const JOURNAL_ROWS: usize = 3 * 2 + 1 + 2 * chrome::FRAME;
 
 /// The kinds of the panes that are not members'.
@@ -1837,7 +1837,8 @@ impl Server {
             _ => None,
         };
         let base = chrome::Header {
-            name: &pane.member,
+            // The menu names itself on its first line: its frame has no title.
+            name: if pane.role == MENU { "" } else { &pane.member },
             state: look_state(pane.state),
             note,
             hint,

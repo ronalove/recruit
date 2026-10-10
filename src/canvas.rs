@@ -5,9 +5,8 @@
 //! terminal while such a screen is on it ([`Session`]), given back as it was however the program ends, a panic
 //! included ([`PanicGuard`]).
 //!
-//! tmux keeps the synchronized updates of a program in a pane (3.7c), not in a popup (3.5a, 3.7c): no frame relies on
-//! them, each goes out in a single write instead. A terminal that has them ([`Features::sync`]) gets each frame
-//! framed by BSU and ESU as well.
+//! No frame relies on synchronized updates, which not every terminal keeps (tmux drops them in a popup): each goes out
+//! in a single write. A terminal that has them ([`Features::sync`]) gets each frame framed by BSU and ESU as well.
 
 use std::io::{self, Stdout, Write};
 use std::panic::{self, PanicHookInfo};

@@ -2,6 +2,22 @@
 
 Tenu par l'architecte. La spec : [multiplexeur.md](multiplexeur.md) ; ses décisions : son §11.
 
+## Étape 4 : retrait de tmux et version 2.0.0 (ouverte le 2026-10-10 à 04 h 15, par l'utilisateur)
+
+Décisions : tmux retiré dès la 2.0.0 ; `[tmux]` accepté, ignoré avec un avertissement ; étapes 1 à 3 closes sans la journée de test. La publication (`scripts/release.sh 2.0.0`) revient à l'utilisateur.
+
+| Qui | Tâche | État |
+|---|---|---|
+| architecte | Fusion de main (1.1.3) ; types partagés hors de tmux.rs (`backend.rs`, `look::ALT`) ; launch, app, live, cli sans tmux ; `[tmux]` ignoré avec avertissement (config.rs) ; passage d'une équipe qui tourne encore sous tmux (recruit 1) ; tmux.rs et `layout::tmux_layout` retirés ; CLAUDE.md proposé à l'utilisateur, accepté et appliqué | fait d'un seul passage (dev-interface et dev-serveur d'accord), tous les fichiers de src/ compris : tmux.rs, `Kind`, `RECRUIT_BACKEND`, `_click`, `--popup`, jeton `menu.opened`, `journal_head`, mise en page tmux retirés ; `launch::legacy` (une équipe de la 1.x : question puis arrêt de sa session tmux et relance avec reprise ; sans terminal, refus qui dit quoi faire ; `recruit stop` l'arrête aussi) ; avertissement `[tmux]` ; Cargo.toml (description, mots-clés). Essayé sur une équipe isolée et un tmux de test. Vert : clippy, 428 + intégration, EN et FR. Relecture de leur zone par dev-interface et dev-serveur ; CLAUDE.md à proposer |
+| dev-interface | board.rs, bridge.rs, menu.rs et menu/, prompt.rs sans leurs branches tmux (`_click`, `--popup`, `journal_head` tmux, textes) | branches retirées par l'architecte ; relu et nettoyé par dev-interface (`Board.native` et la ligne du haut du tableau de bord retirés, aide `padded` dans les tests, commentaires de board, look, menu, sheet, member, chrome) ; vert EN et FR |
+| dev-serveur | native.rs et le serveur sans `Kind` ; tests du serveur | relu : rien n'y dépendait de `Kind` ; commentaires de server.rs et server/pane.rs (SCRUB) ; vert |
+| dev-terminal | release.sh (formule sans `depends_on "tmux"`, description), ci.yml, scripts/ghostty.sh | fait : description lue dans Cargo.toml, `depends_on "tmux"` retiré, `check_formulae` OK ; ci.yml n'installait pas tmux |
+| testeur | tests/ sans tmux (sauf les comparaisons du banc) ; `scripts/screenshots.sh` natif seul, puis les captures du site en vrai | confié |
+| reviewer | Site EN et FR (`guides/tmux.md` remplacé, installation sans tmux, configuration, FAQ), README EN et FR, notes de version 2.0.0 ; relectures | site, README et notes faits (`../recruit-2.0.0-notes.md`, build du site vert) ; reste les images du guide de l'écran et l'alt « The specialists ». Revue du retrait de tmux : passage 1.x essayé dans un tmux de test (sans terminal, `attach`, `stop` exact, « n ») ; défaut corrigé par l'architecte (doublons vérifiés sans attente après l'arrêt d'une équipe 1.x), textes et commentaires repris, `list` montre une équipe 1.x ; en contre-relecture, avec le CLAUDE.md |
+| designer | Captures et page d'accueil : ce que montre le site du nouvel écran ; relecture des textes avec reviewer | confié |
+
+Après la 2.0.0 : traits horizontaux du menu en calque qui rejoignent son bord épais (« ┠───┨ », demande du designer après le menu sans titre) ; commencé par dev-interface et dev-rendu (`Canvas::char_at`), retiré avant la publication (gel de src/), gardé hors du dépôt dans `../recruit-apres-2.0.0/`.
+
 ## Étape 3 : nouvelle interface (ouverte le 2026-10-10 à 00 h 15, par l'utilisateur, pour la nuit)
 
 Bilan de la copie 3 (test de charge de la nuit, relevé du testeur) : 00 h 05 à 03 h 05, 37 relevés, serveur 24 puis 28 Mio stables, CPU 0,33 % en moyenne, 0,80 % au plus, 176 700 images, aucun plantage. Copie 4 depuis 03 h 09 (relevé à 03 h 18 : serveur 33 Mio, 0,38 %).

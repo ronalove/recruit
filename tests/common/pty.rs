@@ -102,9 +102,6 @@ pub const SCRUB: &[&str] = &[
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_EFFORT",
     "CLAUDE_PID",
-    // The multiplexer recruit was launched with (the user's `RECRUIT_BACKEND=native`): the tests say which they
-    // want (`common::team`), and a comparison with tmux must not start natively.
-    "RECRUIT_BACKEND",
 ];
 
 #[derive(Clone, Default)]

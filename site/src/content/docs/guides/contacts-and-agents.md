@@ -38,7 +38,7 @@ With the default layout, `layout = "auto"`:
 
 In a French team, the first tab is called "Interlocuteurs". A member's `tab` can be any title but recruit's own, in either language: "Contacts", "Interlocuteurs", "Agents (1)", "Agents (2)"… "Agents" alone is the default group.
 
-![A tab of working agents in a 2 × 2 grid, one of them waiting for a permission](../../../assets/screenshots/agents.png)
+![A tab of working agents in a 2 × 2 grid, two of them waiting for a permission](../../../assets/screenshots/agents.png)
 
 ```toml
 [teams.web]
@@ -64,4 +64,4 @@ The [team's menu](/recruit/guides/menu/) makes a member a contact or a working a
 
 ## Moving between tabs
 
-`Alt+1`…`Alt+9` go to a tab, `Alt+Shift+←` / `Alt+Shift+→` to the previous or next one, and a click on a member's card on the dashboard goes to its pane. See [In tmux](/recruit/guides/tmux/).
+`Alt+1`…`Alt+9` go to a tab, `Alt+Shift+←` / `Alt+Shift+→` to the previous or next one, `Alt+n` to the next member of the tab, and a click on a member's card on the dashboard goes to its pane. When a member you cannot see waits for you, a notice tells you, and `Alt+g` takes you there. See [Around the screen](/recruit/guides/screen/).

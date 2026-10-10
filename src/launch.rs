@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! Launching a team: one tmux session, the contacts' tab then the working agents' tabs, a Claude session per pane.
+//! Launching a team: its server, the contacts' tab then the working agents' tabs, a Claude session per pane.
 
 use std::collections::HashMap;
 use std::fs;
@@ -10,10 +10,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 
 use crate::backend::{self, Backend};
+use crate::backend::{Pane, Plan, Side, TabPlan};
 use crate::config::{Found, Scope, Team, tilde};
 use crate::i18n::Lang;
 use crate::state::{self, Snapshot};
-use crate::tmux::{self, Pane, Plan, Side, TabPlan};
 use crate::{board, bridge, claude, i18n, layout, prompt, t, ui};
 
 /// In a team's state folder: when its members last resumed after a crash, in seconds since the epoch.
@@ -42,22 +42,33 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
         bail!(t!("l'équipe « {} » n'a aucun membre", "team \"{}\" has no members", found.name));
     }
     let dir = found.work_dir(cwd);
-    let mut session = tmux::session_name(&found.name);
+    let mut session = backend::session_name(&found.name);
     if options.dry_run {
         session.push_str(DRY_RUN);
     }
-    // What the team last ran on, to say so when it starts again on the other one.
-    let launched = Snapshot::read(&state::dir(&session)).ok().map(|snapshot| snapshot.backend);
+    if !options.print && !found.tmux.is_empty() {
+        eprintln!(
+            "{}",
+            t!(
+                "La section [tmux] des fichiers de l'équipe « {} » n'a plus d'effet : recruit n'utilise plus tmux. Tu peux la retirer.",
+                "The [tmux] section of team \"{}\"'s files has no effect any more: recruit no longer uses tmux. You can remove it.",
+                found.name
+            )
+        );
+    }
+    // A team still running in recruit 1's tmux server: stopped first, then built again on its conversations. Its
+    // Claude sessions close after `kill-session` returns: the duplicate check waits for them, as after --restart.
+    let mut stopped = false;
+    if !options.print && legacy::running(found.tmux.socket(), &session) {
+        legacy::stop_for_launch(&found.name, found.tmux.socket(), &session)?;
+        options.resume = true;
+        stopped = true;
+    }
     // The team's multiplexer stopped without being asked to: the members pick up their conversations (user's
     // decision, spec §11), unless a new start is what is asked for.
-    let crashed = launched == Some(backend::Kind::Native)
-        && !options.print
-        && !options.restart
-        && !options.dry_run
-        && backend::crashed(&session);
-    let (mut kind, mut backend) = backend::for_session(&session, &found.tmux)?;
+    let crashed = !options.print && !options.restart && !options.dry_run && backend::crashed(&session);
+    let backend = backend::for_session(&session);
 
-    let mut stopped = false;
     if !options.print && backend.has_session(&session) {
         let running = backend.running()?.into_iter().find(|r| r.session == session);
         let running_dir = running.map(|r| r.dir).unwrap_or_default();
@@ -99,17 +110,6 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
             stopped = true;
             options.resume = true;
         }
-    }
-    // Stopped, the team starts again on what is asked for now, not on what it ran on.
-    if stopped && kind != backend::requested() {
-        kind = backend::requested();
-        backend = backend::new(kind, &found.tmux, &session)?;
-    }
-    if !options.print
-        && let Some(launched) = launched
-        && launched != kind
-    {
-        println!("{}", switched(&found.name, kind));
     }
     if crashed {
         recover(&found.name, &state::dir(&session), &mut options, ui::interactive())?;
@@ -184,7 +184,7 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
         let mut panes = Vec::new();
         for name in &tab.members {
             let member = &team.members[name];
-            let prompt_file = prompt::write(&session, name, &prompt::build(&found.name, &session, team, name, kind))?;
+            let prompt_file = prompt::write(&session, name, &prompt::build(&found.name, team, name))?;
             let resume = resume.get(name).map(String::as_str);
             let argv = start.argv(name, member, &prompt_file, resume);
             let line = shlex::try_join(argv.iter().map(String::as_str))?;
@@ -221,13 +221,13 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
         let side = (index == 0 && team.dashboard != Some(false)).then(|| Side {
             dashboard: Pane {
                 member: board::dashboard_title(lang).into(),
-                role: Some(tmux::DASHBOARD),
+                role: Some(backend::DASHBOARD),
                 argv: panel("dashboard"),
                 env: Vec::new(),
             },
             journal: Pane {
                 member: board::journal_title(lang).into(),
-                role: Some(tmux::JOURNAL),
+                role: Some(backend::JOURNAL),
                 argv: panel("journal"),
                 env: Vec::new(),
             },
@@ -240,22 +240,16 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
         dir: dir.clone(),
         columns: layout::columns(team),
         tabs,
-        state: state.clone(),
-        // The session's own folder, read by tmux when the key is pressed: the binding serves every team.
-        toggle: format!("{} _panel toggle '#{{@recruit_state}}' >/dev/null 2>&1", quote(&exe)),
-        click: click_command(&exe),
-        menu: menu_command(&exe),
         lang,
     };
 
     if options.print {
-        print_plan(&plan, &commands, kind);
+        print_plan(&plan, &commands);
         return Ok(());
     }
     let snapshot = Snapshot {
         team: found.name.clone(),
         session: session.clone(),
-        socket: found.tmux.socket().to_string(),
         dir: dir.clone(),
         claude: claude.clone(),
         config_dir: config_dir.clone(),
@@ -266,7 +260,6 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
         origin: Some(found.origin()),
         plugin_dir: plugin_dir.clone(),
         status_line: start.status_line,
-        backend: kind,
     };
     snapshot.write(&state)?;
     bridge::reset(&state)?;
@@ -289,34 +282,11 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
     attach_or_hint(backend.as_ref(), &session, &found.name, options.detach)
 }
 
-/// Suffix of the tmux session of a `--dry-run`, which may run next to the real team.
+/// Suffix of the session of a `--dry-run`, which may run next to the real team.
 pub const DRY_RUN: &str = "-dry-run";
 
 /// Once the member's supervisor gives up, the pane keeps a shell open in the same directory.
 const SHELL: &str = r#"exec "${SHELL:-/bin/sh}" -l"#;
-
-/// What Alt+r and the bar's button run, read by tmux when the key is pressed or the button clicked: the session's
-/// folder and language, the client to show the menu on. `display-popup` reads no format in its command (tmux 3.7c),
-/// `run-shell` does: recruit opens the popup itself, with these values.
-fn menu_command(exe: &str) -> String {
-    format!(
-        "{} --lang '#{{@recruit_lang}}' _menu '#{{@recruit_state}}' --client '#{{client_name}}' --popup >/dev/null 2>&1",
-        quote(exe)
-    )
-}
-
-/// The menu's command line in its popup, for one client, `nerd` when its terminal carries the Nerd Font symbols. The
-/// popup runs it through the user's shell (`default-shell`): a plain command line.
-pub fn menu_line(exe: &str, lang: Lang, state: &Path, client: &str, nerd: bool) -> String {
-    format!(
-        "{} --lang {} _menu {} --client {}{}",
-        quote(exe),
-        lang.code(),
-        quote(&state.to_string_lossy()),
-        quote(client),
-        if nerd { " --nerd" } else { "" }
-    )
-}
 
 /// A team whose multiplexer crashed: each member resumes its conversation, said so. A second crash soon after the last
 /// recovery ([`note_recovery`]) asks first, when `interactive` (a conversation may be what brings the multiplexer
@@ -364,36 +334,10 @@ fn note_recovery(state: &Path) {
     let _ = crate::config::write_atomic(&state.join(RECOVERED), &now.to_string());
 }
 
-/// The note for a team that starts again on another multiplexer than the one it last ran on.
-fn switched(team: &str, now: backend::Kind) -> String {
-    match now {
-        backend::Kind::Tmux => t!(
-            "L'équipe « {} » tournait avec le multiplexeur de recruit : elle repart sous tmux (RECRUIT_BACKEND=native pour le garder).",
-            "Team \"{}\" ran on recruit's multiplexer: it starts again under tmux (RECRUIT_BACKEND=native to keep it).",
-            team
-        ),
-        backend::Kind::Native => t!(
-            "L'équipe « {} » tournait sous tmux : elle repart avec le multiplexeur de recruit.",
-            "Team \"{}\" ran under tmux: it starts again on recruit's multiplexer.",
-            team
-        ),
-    }
-}
-
 /// A panel's command line.
 pub fn panel(exe: &str, lang: Lang, kind: &str, state: &Path) -> Vec<String> {
     let state = state.to_string_lossy().into_owned();
     [exe, "--lang", lang.code(), "_panel", kind, &state].map(String::from).to_vec()
-}
-
-/// What a click on a panel runs, read by tmux when it happens: the session's folder and language, the pane clicked.
-/// The binding serves every team; the language is the team's, for the menu a click may open. Nothing the click
-/// landed on: the binding leaves it in the pane's options.
-fn click_command(exe: &str) -> String {
-    format!(
-        "RECRUIT_LANG='#{{@recruit_lang}}' {} _click '#{{@recruit_state}}' '#{{pane_id}}' >/dev/null 2>&1",
-        quote(exe)
-    )
 }
 
 /// What a member's pane runs: `recruit _member`, which starts Claude again when it stops on its own, then the
@@ -479,10 +423,10 @@ fn repair(backend: &dyn Backend, found: &Found, session: &str) -> Result<bool> {
             )
         );
     }
-    if !snapshot.dashboard.is_empty() && !panes.iter().any(|p| p.role == tmux::DASHBOARD) {
+    if !snapshot.dashboard.is_empty() && !panes.iter().any(|p| p.role == backend::DASHBOARD) {
         let dashboard = Pane {
             member: board::dashboard_title(snapshot.lang).into(),
-            role: Some(tmux::DASHBOARD),
+            role: Some(backend::DASHBOARD),
             argv: snapshot.dashboard.clone(),
             env: Vec::new(),
         };
@@ -526,9 +470,8 @@ pub fn attach_or_hint(backend: &dyn Backend, session: &str, team: &str, detach: 
 }
 
 /// A member's session is the one with its name in its directory (member.rs): two there could not be told apart.
-/// Elsewhere, the prompt tells members apart by their tmux session, and the dashboard names the duplicates when it
-/// has room. ListAgents does not show the tmux socket, though: two teams with one session name on two servers, or a
-/// tmux session of the user's with the team's name, still look alike.
+/// Elsewhere, recruit gives each member the exact addresses of its teammates whose name another session carries
+/// (`live::addresses`), and the dashboard names the duplicates when it has room.
 fn check_duplicates(
     claude: &Path,
     found: &Found,
@@ -536,7 +479,7 @@ fn check_duplicates(
     config_dir: Option<&Path>,
     just_stopped: bool,
 ) -> Result<()> {
-    // A team just stopped by --restart takes a moment to close its sessions.
+    // A team just stopped, by --restart or from recruit 1's tmux, takes a moment to close its sessions.
     let attempts = if just_stopped { 10 } else { 1 };
     for attempt in 0..attempts {
         let running = match claude::running(claude, config_dir) {
@@ -596,19 +539,8 @@ fn check_trust(dir: &Path, config_dir: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn print_plan(plan: &Plan, commands: &[(String, String, std::path::PathBuf)], kind: backend::Kind) {
-    let head = match kind {
-        backend::Kind::Tmux => {
-            t!("Session tmux : {} (dossier {})", "tmux session: {} (directory {})", plan.session, tilde(&plan.dir))
-        }
-        backend::Kind::Native => t!(
-            "Équipe « {} », avec le multiplexeur de recruit (dossier {})",
-            "Team \"{}\", on recruit's multiplexer (directory {})",
-            plan.team,
-            tilde(&plan.dir)
-        ),
-    };
-    println!("{head}");
+fn print_plan(plan: &Plan, commands: &[(String, String, std::path::PathBuf)]) {
+    println!("{}", t!("Équipe « {} » (dossier {})", "Team \"{}\" (directory {})", plan.team, tilde(&plan.dir)));
     for (i, tab) in plan.tabs.iter().enumerate() {
         let names: Vec<&str> = tab.panes.iter().map(|p| p.member.as_str()).collect();
         let side =
@@ -617,6 +549,61 @@ fn print_plan(plan: &Plan, commands: &[(String, String, std::path::PathBuf)], ki
     }
     for (name, line, prompt) in commands {
         println!("\n# {name}\n{line}\n# {}", t!("prompt : {}", "prompt: {}", tilde(prompt)));
+    }
+}
+
+/// A team launched by recruit 1, in its tmux server (`tmux -L <socket>`, `recruit` by default), still running after
+/// the upgrade. recruit no longer drives tmux: it only asks whether such a session is there, and stops it.
+pub mod legacy {
+    use std::process::{Command, Stdio};
+
+    use anyhow::{Result, bail};
+
+    use crate::{t, ui};
+
+    fn tmux(socket: &str, args: &[&str]) -> bool {
+        Command::new("tmux")
+            .args(["-L", socket])
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// Whether `session` still runs under recruit 1's tmux server. False without tmux.
+    pub fn running(socket: &str, session: &str) -> bool {
+        tmux(socket, &["has-session", "-t", &format!("={session}")])
+    }
+
+    /// Stops it, its members' panes with it.
+    pub fn stop(socket: &str, session: &str) -> bool {
+        tmux(socket, &["kill-session", "-t", &format!("={session}")])
+    }
+
+    /// Before a launch: asks, from a terminal, to stop the team under tmux and build it again here, each member on
+    /// its conversation; without one, says how and stops there.
+    pub fn stop_for_launch(team: &str, socket: &str, session: &str) -> Result<()> {
+        if !ui::interactive() {
+            bail!(t!(
+                "l'équipe « {0} » tourne encore sous tmux, lancée par recruit 1. Arrête-la (recruit stop {0}), puis relance-la avec --resume pour que chacun reprenne sa conversation.",
+                "team \"{0}\" still runs under tmux, launched by recruit 1. Stop it (recruit stop {0}), then launch it again with --resume so that each member picks up its conversation.",
+                team
+            ));
+        }
+        let question = t!(
+            "L'équipe « {} » tourne encore sous tmux, lancée par recruit 1. L'arrêter et la relancer ici, chaque membre sur sa conversation ?",
+            "Team \"{}\" still runs under tmux, launched by recruit 1. Stop it and launch it again here, each member on its conversation?",
+            team
+        );
+        if !ui::confirm(&question, true)? {
+            return Err(ui::Cancelled.into());
+        }
+        if !stop(socket, session) {
+            bail!(t!("tmux n'a pas arrêté l'équipe « {} »", "tmux did not stop team \"{}\"", team));
+        }
+        Ok(())
     }
 }
 
@@ -641,20 +628,6 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_line_reads_back() {
-        for nerd in [false, true] {
-            let line = menu_line("/opt/re cruit", Lang::Fr, Path::new("/tmp/équipe x"), "/dev/ttys004", nerd);
-            let words = shlex::split(&line).expect("a shell line");
-            assert_eq!(words[0], "/opt/re cruit");
-            let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(&words).unwrap();
-            let Some(crate::cli::Command::Menu { state, client, popup, nerd: read, .. }) = cli.command else {
-                panic!()
-            };
-            assert_eq!(state, Path::new("/tmp/équipe x"));
-            assert_eq!((client.as_deref(), popup, read), (Some("/dev/ttys004"), false, nerd));
-        }
-    }
-    #[test]
     fn a_crash_resumes_then_asks() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path();
@@ -676,17 +649,6 @@ mod tests {
         let mut options = Options::default();
         recover("x", state, &mut options, false).unwrap();
         assert!(options.resume);
-    }
-
-    #[test]
-    fn click_command_as_bound() {
-        let command = click_command("/opt/re cruit/recruit");
-        assert_eq!(
-            command,
-            "RECRUIT_LANG='#{@recruit_lang}' '/opt/re cruit/recruit' _click '#{@recruit_state}' '#{pane_id}' >/dev/null 2>&1"
-        );
-        // What the members wrote never reaches the shell.
-        assert!(!command.contains("mouse_"));
     }
 
     #[test]

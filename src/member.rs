@@ -108,7 +108,7 @@ pub fn run(state: &Path, member: &str, resume: bool) -> Result<()> {
 
 /// Ends the program status Claude gave its terminal (OSC 7501), whatever stopped it, a crash included: the native
 /// multiplexer then shows the pane without a state, and a status that a later program writes (a shell replaying old
-/// output) no longer counts. tmux ignores the sequence.
+/// output) no longer counts.
 fn clear_status() {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(b"\x1b]7501;state=clear\x07");

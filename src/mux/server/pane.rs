@@ -33,8 +33,9 @@ const FAILURES: usize = 3;
 const FAILURES_WITHIN: Duration = Duration::from_secs(10);
 
 /// What the real terminal, or a multiplexer, puts in the environment to say what it is: a pane's program must not
-/// believe it runs there (spec §5.2). `TERM`, `COLORTERM` and `TERM_PROGRAM` are set again. And the multiplexer the
-/// team was launched with: what its members start (a `recruit` of their own) must not inherit it.
+/// believe it runs there (spec §5.2). `TERM`, `COLORTERM` and `TERM_PROGRAM` are set again. And `RECRUIT_BACKEND`,
+/// which chose the multiplexer before 2.0: nothing reads it any more, and a value left in the user's environment goes
+/// no further than the server.
 const SCRUB: &[&str] = &[
     "RECRUIT_BACKEND",
     "TMUX",
@@ -432,7 +433,7 @@ mod tests {
         let command = Command { argv: vec!["/bin/sh".into()], cwd: "/".into(), env: Vec::new() };
         let spawn = spawn_of(&command, (80, 24)).unwrap();
         let removed = |name: &str| spawn.env_remove.iter().any(|removed| removed == name);
-        assert!(removed("RECRUIT_BACKEND"), "a member's own `recruit` chooses again");
+        assert!(removed("RECRUIT_BACKEND"), "a value from before 2.0 goes no further");
         assert!(removed("TMUX") && removed("TMUX_PANE"));
         // What the members need to reach their team stays.
         assert!(!removed("RECRUIT_TMPDIR") && !removed("RECRUIT_STATE"));

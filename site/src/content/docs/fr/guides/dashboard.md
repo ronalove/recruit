@@ -9,13 +9,13 @@ Le tableau de bord te dit d'un coup d'œil qui travaille, sur quoi, et qui t'att
 
 Les deux sont à droite de tes interlocuteurs, dans le premier onglet : le **tableau de bord** en haut, le **journal** en dessous. Ils lisent ce que Claude Code enregistre déjà, sa liste de sessions (`claude agents --json`) et les fichiers de conversation.
 
-![Le premier onglet d'une équipe lancée : deux interlocuteurs à gauche, le tableau de bord et le journal à droite](../../../../assets/screenshots/team-fr.png)
+![Le premier onglet d'une équipe lancée : deux interlocuteurs à gauche, le tableau de bord et le journal à droite](../../../../assets/screenshots/team.png)
 
 ## Le tableau de bord
 
-![Le tableau de bord : une carte par membre, avec son état, ce qu'il fait, son modèle et son effort](../../../../assets/screenshots/dashboard-fr.png)
+![Le tableau de bord : une carte par membre, avec son état, ce qu'il fait, son modèle et son effort](../../../../assets/screenshots/dashboard.png)
 
-En haut : l'heure, combien de membres sont dans chaque état, et les raccourcis. Dans un panneau étroit, l'heure disparaît d'abord, puis les raccourcis. Puis une carte par membre.
+Le bord du haut de son cadre compte les membres de chaque état ; les raccourcis sont dans la barre, en bas de l'écran. Dessous, une carte par membre.
 
 Ce que tu tapes dans le tableau de bord ou le journal ne fait rien. Le tableau de bord se redessine en entier toutes les 30 secondes et quand l'ordinateur sort de veille ; `Ctrl-L`, dans son panneau, le redessine aussitôt.
 
@@ -56,7 +56,7 @@ Ils n'ont que la place qui reste une fois que chaque carte montre ce que fait so
 
 ### Compacter une conversation
 
-Un clic sur le contexte d'un membre au repos, marqué ⟳, propose de compacter sa conversation, après confirmation. C'est ce que Claude Code ferait de lui-même au seuil, et cela coûte autant : le modèle du membre relit tout son contexte pour le résumer. Un membre qui s'est remis au travail entre-temps refuse. Ensuite, jusqu'à la réponse suivante du membre, la carte montre le contexte tel que Claude Code le compte, comme `/context`.
+Un clic sur le contexte d'un membre au repos, marqué ⟳, propose de compacter sa conversation, après confirmation. Le même ⟳ s'affiche dans le bord du haut du cadre du membre. C'est ce que Claude Code ferait de lui-même au seuil, et cela coûte autant : le modèle du membre relit tout son contexte pour le résumer. Un membre qui s'est remis au travail entre-temps refuse. Ensuite, jusqu'à la réponse suivante du membre, la carte montre le contexte tel que Claude Code le compte, comme `/context`.
 
 ### Ordre et place
 
@@ -72,7 +72,7 @@ Quand des sessions ouvertes ailleurs portent le nom de membres, une ligne attén
 
 ## Le journal
 
-![Le journal en taille complète : les messages que les membres s'envoient](../../../../assets/screenshots/journal-fr.png)
+![Le journal en taille complète : les messages que les membres s'envoient](../../../../assets/screenshots/journal.png)
 
 Le journal liste les messages que les membres s'envoient, sur deux lignes chacun.
 

@@ -7,7 +7,7 @@ description: Good to know before you start, and what to do when something does n
 
 ### Does closing the terminal stop the team?
 
-No. A team runs in recruit's own tmux server: closing the window, even with `Cmd+q`, leaves the agents working. `recruit`, or `recruit attach`, finds them where you left them, from any terminal, even over SSH. To stop a team: `Alt+q` then "Quit" (`q`), or `recruit stop`.
+No. A team runs in the background, apart from your terminal: closing the window, even with `Cmd+q`, leaves the agents working. `recruit`, or `recruit attach`, finds them where you left them, from any terminal, even over SSH. To stop a team: `Alt+q` then "Quit" (`q`), or `recruit stop`.
 
 ### Why does Claude Code ask whether to trust the folder?
 
@@ -19,7 +19,7 @@ No: a team runs in one place at a time. Its members are addressed by name, so tw
 
 ### What if another session uses a member's name?
 
-Another team, or a session of yours, may use a member's name. recruit stops nothing and renames no one: each member's prompt gives its team's tmux session, and when `ListAgents` shows several sessions under one name, the member writes to the one whose line shows that session, at its "name [ref]" address. The dashboard names these sessions, if it has room.
+Another team, or a session of yours, may use a member's name. recruit stops nothing and renames no one: each member is given the exact address of its teammates who share a name with another session, "name [ref]", and writes to that one. Without it, the member asks its contact, or you. The dashboard names these sessions, if it has room.
 
 Sessions with a member's name already open in the team's folder are refused at launch: they could not be told apart.
 
@@ -42,10 +42,6 @@ Each member is a Claude Code session on your account, and uses it like any other
 No. recruit writes nothing in Claude Code's settings files. The members other than the main contact go without your status line for their session only, through `--settings`, and the team's menu writes its changes into the team's files.
 
 ## Troubleshooting
-
-### "tmux not found" or "tmux … is too old"
-
-recruit needs tmux 3.5 or newer. Install or upgrade it: `brew install tmux` on macOS, your distribution's package elsewhere (some still ship older versions: Homebrew on Linux has a recent one). `tmux -V` prints the version.
 
 ### Every member asks "Do you trust this folder?", or closes at once
 
@@ -71,7 +67,7 @@ recruit <team> --restart --resume
 
 ### On macOS, `Alt+j` or `Alt+r` types a character
 
-The terminal sends Option as a character, not as Alt. Set it to send Alt: see [Option on macOS](/recruit/guides/tmux/#option-on-macos). Meanwhile, the "menu" and "quit" buttons on the right of the status line, and `/recruit` and `/team` in a member's prompt, do the same.
+The terminal sends Option as a character, not as Alt. Set it to send Alt: see [Option on macOS](/recruit/guides/screen/#option-on-macos). Meanwhile, the "menu" and "quit" buttons at the bottom right, and `/recruit` and `/team` in a member's prompt, do the same.
 
 ### The dashboard shows no model, context or usage, and `/recruit` is unknown
 
@@ -111,13 +107,26 @@ Two members whose names differ only by case get "differs from … by case only".
 
 Without a terminal to ask in, recruit cannot choose. Name the team (`recruit <team>`), or set `default` at the top of `.recruit/settings.toml`.
 
-### A change in `[tmux]` has no effect
+### "The [tmux] section … has no effect any more"
 
-recruit reads `[tmux]` when its tmux server starts. Stop the server, which stops every team in it, then launch again:
+recruit 2 no longer uses tmux: teams draw their own screen. The `[tmux]` section of an older file is read and ignored. Remove it from the team's file, and the warning goes with it.
+
+### A team still runs under recruit 1
+
+recruit 1 ran teams in tmux, and such a team keeps running after an upgrade. `recruit` (or `recruit <team>`) finds it, and offers to stop it and start it again on the new screen, each member resuming its conversation. Without a terminal to ask in, it stops there; then:
 
 ```sh
-tmux -L recruit kill-server
+recruit stop <team>          # stops it, tmux or not, after confirmation
+recruit <team> --resume
 ```
+
+### Copying a selection does nothing
+
+The copy goes through your terminal. iTerm2 asks you to allow it once, and Terminal.app cannot take it: see [Select and copy](/recruit/guides/screen/#select-and-copy) for what to do.
+
+### A team stopped on its own
+
+A crash, or the machine restarted. Run `recruit`: it starts the team again, each member resuming its conversation, and says so. What happened is in the team's log, `~/.cache/recruit/teams/<team>/server.log`.
 
 ### The menu does not open
 

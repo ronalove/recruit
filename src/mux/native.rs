@@ -281,10 +281,6 @@ impl Backend for Native {
         })
     }
 
-    fn focus(&self, session: &str, member: &str) -> Result<bool> {
-        self.ask(&self.state_of(session), Request::Focus { member: member.to_string() }, client::ANSWER)
-    }
-
     fn detach(&self, client: &str) -> Result<()> {
         self.ask_unit(Request::Detach { client: client.to_string() })
     }

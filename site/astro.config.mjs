@@ -7,6 +7,11 @@ import starlightLinksValidator from 'starlight-links-validator';
 export default defineConfig({
   site: 'https://ronalove.github.io',
   base: '/recruit',
+  // The tmux guide of recruit 1, replaced by the screen's in 2.0.0: links to it go on working.
+  redirects: {
+    '/guides/tmux': '/recruit/guides/screen/',
+    '/fr/guides/tmux': '/recruit/fr/guides/screen/',
+  },
   integrations: [
     starlight({
       title: 'recruit',

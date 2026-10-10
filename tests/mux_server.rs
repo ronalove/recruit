@@ -309,7 +309,7 @@ fn ssh_attach() {
     };
     let team = std::env::var("SSH_TEAM").unwrap_or_else(|_| "nat".into());
     let env = format!(
-        "cd {root}/proj && env RECRUIT_BACKEND=native XDG_CONFIG_HOME={root}/config XDG_CACHE_HOME={root}/cache RECRUIT_TMPDIR={root}/r"
+        "cd {root}/proj && env XDG_CONFIG_HOME={root}/config XDG_CACHE_HOME={root}/cache RECRUIT_TMPDIR={root}/r"
     );
     let remote = |command: &str| -> String {
         let out = std::process::Command::new("ssh")

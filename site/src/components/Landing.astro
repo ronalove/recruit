@@ -8,14 +8,11 @@ import '@fontsource-variable/schibsted-grotesk/wght.css';
 import '@fontsource-variable/jetbrains-mono/wght.css';
 import { strings, type Lang } from '../i18n/landing';
 
+// The screenshots and the animation are in English only, for both pages (2.0.0); the alt texts are translated.
 import journalEn from '../assets/screenshots/journal.png';
-import journalFr from '../assets/screenshots/journal-fr.png';
 import menuEn from '../assets/screenshots/menu.png';
-import menuFr from '../assets/screenshots/menu-fr.png';
 import agentsEn from '../assets/screenshots/agents.png';
-import agentsFr from '../assets/screenshots/agents-fr.png';
 import teamEn from '../assets/screenshots/team.png';
-import teamFr from '../assets/screenshots/team-fr.png';
 
 interface Props {
   lang: Lang;
@@ -33,23 +30,20 @@ const startUrl = `${base}${lang === 'fr' ? '/fr' : ''}/getting-started/quick-sta
 const repo = 'https://github.com/ronalove/recruit';
 const brew = 'brew install ronalove/tap/recruit';
 
-const shots = {
-  en: { journal: journalEn, menu: menuEn, agents: agentsEn, team: teamEn },
-  fr: { journal: journalFr, menu: menuFr, agents: agentsFr, team: teamFr },
-}[lang];
+const shots = { journal: journalEn, menu: menuEn, agents: agentsEn, team: teamEn };
 
 // The first tab plays the animation; its still frame is the poster, and what reduced-motion users see.
 const poster = await getImage({ src: shots.team, format: 'webp', width: 1600 });
 const social = await getImage({ src: teamEn, format: 'png', width: 1200 });
-// The animation (public/media) is only written into the page when its files exist at build time: French prefers
-// demo-fr, and falls back to demo. Without any, the tab shows the still image.
+// The animation (public/media) is only written into the page when its files exist at build time, the same for both
+// languages. Without it, the tab shows the still image.
 const mediaDir = join(process.cwd(), 'public', 'media');
 const formats = [
   { ext: 'webm', type: 'video/webm' },
   { ext: 'mp4', type: 'video/mp4' },
 ];
 const found = (name: string) => formats.filter((f) => existsSync(join(mediaDir, `${name}.${f.ext}`)));
-const names = lang === 'fr' ? ['demo-fr', 'demo'] : ['demo'];
+const names = ['demo'];
 const mediaName = names.find((name) => found(name).length > 0);
 const videoSources = mediaName ? found(mediaName).map((f) => ({ src: `${base}/media/${mediaName}.${f.ext}`, type: f.type })) : [];
 

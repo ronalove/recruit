@@ -16,7 +16,7 @@ Son nom, donné par `claude -n`, et un prompt système ajouté (`--append-system
 - son rôle et ses instructions ;
 - s'il est interlocuteur ou agent de travail. Un agent de travail pose ses questions aux interlocuteurs quand il est bloqué, plutôt que d'attendre dans son terminal, et fait ce que tu demandes quand tu interviens ;
 - la liste de ses coéquipiers, avec leurs rôles et les interlocuteurs signalés ;
-- la session tmux de son équipe, pour distinguer ses coéquipiers des sessions du même nom ailleurs (dès deux membres) ;
+- quand une autre session porte le nom d'un coéquipier, l'adresse exacte où lui écrire, « nom [ref] » ;
 - les règles communes de l'équipe.
 
 recruit écrit ce prompt dans la langue de l'équipe (`lang`). Les fichiers de prompt sont dans `~/.cache/recruit/prompts/`. Pour voir la ligne de commande et le fichier de prompt de chaque membre sans rien lancer :

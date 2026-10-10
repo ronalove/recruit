@@ -7,7 +7,7 @@ description: Bon à savoir avant de commencer, et que faire quand quelque chose 
 
 ### Fermer le terminal n'arrête pas l'équipe
 
-Une équipe tourne dans le serveur tmux propre à recruit : fermer la fenêtre, même avec `Cmd+q`, laisse les agents travailler. `recruit`, ou `recruit attach`, les retrouve là où tu les as laissés, depuis n'importe quel terminal, même en SSH. Pour arrêter une équipe : `Alt+q` puis « Quitter » (`q`), ou `recruit stop`.
+Une équipe tourne en arrière-plan, à part de ton terminal : fermer la fenêtre, même avec `Cmd+q`, laisse les agents travailler. `recruit`, ou `recruit attach`, les retrouve là où tu les as laissés, depuis n'importe quel terminal, même en SSH. Pour arrêter une équipe : `Alt+q` puis « Quitter » (`q`), ou `recruit stop`.
 
 ### Approbation du dossier
 
@@ -19,7 +19,7 @@ Une équipe ne tourne qu'à un endroit à la fois : ses membres sont joints par 
 
 ### Mêmes noms ailleurs
 
-Une autre équipe, ou une session à toi, peut porter le nom d'un membre. recruit n'arrête rien et ne renomme personne : le prompt de chaque membre donne la session tmux de son équipe, et quand `ListAgents` montre plusieurs sessions sous un même nom, le membre écrit à celle dont la ligne indique cette session, à son adresse « nom [ref] ». Le tableau de bord nomme ces sessions, s'il a la place.
+Une autre équipe, ou une session à toi, peut porter le nom d'un membre. recruit n'arrête rien et ne renomme personne : chaque membre reçoit l'adresse exacte de ses coéquipiers dont le nom est porté par une autre session, « nom [ref] », et écrit à celle-là. Sans elle, le membre demande à son interlocuteur, ou à toi. Le tableau de bord nomme ces sessions, s'il a la place.
 
 Des sessions au nom d'un membre déjà ouvertes dans le dossier de l'équipe sont refusées au lancement : on ne pourrait pas les distinguer.
 
@@ -42,10 +42,6 @@ Chaque membre est une session Claude Code sur ton compte, et l'utilise comme n'i
 recruit n'écrit rien dans les fichiers de réglages de Claude Code. Les membres autres que l'interlocuteur principal n'ont pas ta ligne d'état pour leur session seulement, par `--settings`, et le menu de l'équipe écrit ses changements dans les fichiers de l'équipe.
 
 ## Dépannage
-
-### « tmux est introuvable » ou « … est trop ancien »
-
-recruit demande tmux 3.5 ou plus récent. Installe-le ou mets-le à jour : `brew install tmux` sous macOS, le paquet de ta distribution ailleurs (certaines livrent encore une version plus ancienne : Homebrew sous Linux en a une récente). `tmux -V` affiche la version.
 
 ### Chaque membre demande « Do you trust this folder? », ou se ferme aussitôt
 
@@ -71,7 +67,7 @@ recruit <équipe> --restart --resume
 
 ### Sous macOS, `Alt+j` ou `Alt+r` tape un caractère
 
-Le terminal envoie Option comme un caractère, pas comme Alt. Règle-le pour qu'il envoie Alt : voir [Option sous macOS](/recruit/fr/guides/tmux/#option-sous-macos). En attendant, les boutons « menu » et « quitter » à droite de la barre tmux, et `/recruit` et `/equipe` dans l'invite d'un membre, font la même chose.
+Le terminal envoie Option comme un caractère, pas comme Alt. Règle-le pour qu'il envoie Alt : voir [Option sous macOS](/recruit/fr/guides/screen/#option-sous-macos). En attendant, les boutons « menu » et « quitter » en bas à droite, et `/recruit` et `/equipe` dans l'invite d'un membre, font la même chose.
 
 ### Le tableau de bord n'affiche ni modèle, ni contexte, ni usage, et `/recruit` est inconnu
 
@@ -111,13 +107,26 @@ Deux membres dont les noms ne diffèrent que par la casse donnent « ne diffère
 
 Sans terminal pour demander, recruit ne peut pas choisir. Nomme l'équipe (`recruit <équipe>`), ou fixe `default` en tête de `.recruit/settings.toml`.
 
-### Un changement dans `[tmux]` n'a pas d'effet
+### « La section [tmux] … n'a plus d'effet »
 
-recruit lit `[tmux]` au démarrage de son serveur tmux. Arrête le serveur, ce qui arrête toutes les équipes qui y tournent, puis relance :
+recruit 2 n'utilise plus tmux : les équipes dessinent leur propre écran. La section `[tmux]` d'un fichier plus ancien est lue, puis ignorée. Retire-la du fichier de l'équipe, et l'avertissement part avec.
+
+### Une équipe tourne encore sous recruit 1
+
+recruit 1 faisait tourner les équipes dans tmux, et une telle équipe continue de tourner après la mise à jour. `recruit` (ou `recruit <équipe>`) la trouve, et propose de l'arrêter et de la relancer sur le nouvel écran, chaque membre reprenant sa conversation. Sans terminal pour demander, il s'arrête là ; alors :
 
 ```sh
-tmux -L recruit kill-server
+recruit stop <équipe>          # l'arrête, sous tmux ou non, après confirmation
+recruit <équipe> --resume
 ```
+
+### Copier une sélection ne fait rien
+
+La copie passe par ton terminal. iTerm2 demande de l'autoriser une fois, et Terminal.app ne peut pas la recevoir : voir [Sélectionner et copier](/recruit/fr/guides/screen/#sélectionner-et-copier) pour quoi faire.
+
+### Une équipe s'est arrêtée d'elle-même
+
+Un plantage, ou la machine a redémarré. Lance `recruit` : il relance l'équipe, chaque membre reprenant sa conversation, et le dit. Ce qui s'est passé est dans le journal de l'équipe, `~/.cache/recruit/teams/<équipe>/server.log`.
 
 ### Le menu ne s'ouvre pas
 

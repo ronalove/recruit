@@ -227,8 +227,15 @@ fn claude_modes() {
             let env = claude_env(announced, fullscreen);
             let env: Vec<(&str, &OsStr)> = env.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
             let profile = Profile { kitty_keyboard: true, capture: true, xtversion: None };
-            let mut term =
-                TestTerm::spawn_in(Some(&dir), OsStr::new("claude"), ["-n", SESSION], &env, 120, 40, profile);
+            let mut term = TestTerm::spawn_in(
+                Some(&dir),
+                OsStr::new("claude"),
+                ["--strict-mcp-config", "-n", SESSION],
+                &env,
+                120,
+                40,
+                profile,
+            );
             let up = wait_prompt(&mut term);
             let name = format!("{}{}", announced.name, if fullscreen { ", plein écran" } else { "" });
             let mut found = modes(&term.raw());
@@ -320,7 +327,7 @@ fn claude_through_mux() {
         let command: Vec<&str> = if std::env::var_os("MUX_SCRIPT").is_some() {
             vec!["sh", "-c", "exec script -q -F \"$PANE_LOGS/pane.$$\" claude -n testeur-compat"]
         } else {
-            vec!["claude", "-n", SESSION]
+            vec!["claude", "--strict-mcp-config", "-n", SESSION]
         };
         // The terminal announced, over what the server gives a pane (an empty TERM_PROGRAM for none).
         let logs_text = logs.to_string_lossy().into_owned();
@@ -512,8 +519,13 @@ fn claude_mouse_native() {
     let work = workdir();
     let server = common::server::Server::start(dir.path());
     let ask = "Écris les nombres de 1 à 80, un par ligne, puis le mot FINI-TEST seul sur la dernière ligne.";
-    server.spawn("plein", &work, &[("CLAUDE_CODE_NO_FLICKER", "1")], &["claude", "-n", SESSION]);
-    server.spawn("classique", &work, &[("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1")], &["claude", "-n", SESSION]);
+    server.spawn("plein", &work, &[("CLAUDE_CODE_NO_FLICKER", "1")], &["claude", "--strict-mcp-config", "-n", SESSION]);
+    server.spawn(
+        "classique",
+        &work,
+        &[("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1")],
+        &["claude", "--strict-mcp-config", "-n", SESSION],
+    );
     let mut term = server.attach(200, 50);
     for member in ["plein", "classique"] {
         assert!(server.wait_pane(member, "❯", Duration::from_secs(40)), "{member}: {:?}", server.capture(Some(member)));
@@ -674,6 +686,7 @@ fn claude_header_against_card() {
     let tables = "\
 [teams.states]
 description = \"test\"
+args = [\"--strict-mcp-config\"]
 [teams.states.members.lead]
 role = \"Contact\"
 contact = true

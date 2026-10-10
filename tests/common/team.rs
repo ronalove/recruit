@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! A whole team of the test's own, launched by `recruit` on the native multiplexer (`RECRUIT_BACKEND=native`): a
+//! A whole team of the test's own, launched by `recruit` (its own multiplexer): a
 //! project folder with its `.recruit/settings.toml`, a fake `claude` (a shim that answers `--version` and
 //! `agents`, then the fake `claude` of `common::fakes`), a Claude Code profile of its own (`[claude] config_dir`:
 //! recruit approves the team's folder there, never in the user's `~/.claude.json`), `XDG_*` and `RECRUIT_TMPDIR`
@@ -118,7 +118,6 @@ impl Team {
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("XDG_CACHE_HOME", self.root.join("cache"))
             .env("RECRUIT_TMPDIR", self.run.path())
-            .env("RECRUIT_BACKEND", "native")
             .env("RECRUIT_LANG", self.lang)
             .env("SHELL", "/bin/sh")
             .stdin(Stdio::null());
@@ -251,7 +250,6 @@ impl Team {
             ("XDG_CONFIG_HOME", self.root.join("config").into_os_string()),
             ("XDG_CACHE_HOME", self.root.join("cache").into_os_string()),
             ("RECRUIT_TMPDIR", self.run.path().as_os_str().to_os_string()),
-            ("RECRUIT_BACKEND", "native".into()),
             ("RECRUIT_LANG", self.lang.into()),
             ("SHELL", "/bin/sh".into()),
         ];
@@ -305,6 +303,8 @@ impl Drop for Team {
             // A failed test: stop without checking, never a second panic.
             self.stopped = true;
             let _ = self.recruit(["stop", &self.name]);
+            // `recruit stop` reads the team's files: with those broken it stops nothing, and the server would stay.
+            let _ = self.ctl_output(["stop"]);
         }
     }
 }

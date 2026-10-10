@@ -1533,7 +1533,6 @@ impl Sheet {
             Action::Stop => {
                 let confirm = Confirm::new(
                     t!("Quitter l'équipe ?", "Quit the team?"),
-                    // True under tmux as in recruit's own multiplexer: no session named.
                     vec![t!(
                         "Tous les membres s'arrêtent et l'équipe se ferme.",
                         "Every member stops and the team closes."

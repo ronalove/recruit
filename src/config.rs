@@ -73,7 +73,7 @@ pub struct ClaudeSettings {
 }
 
 impl ClaudeSettings {
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
 
@@ -89,23 +89,25 @@ impl ClaudeSettings {
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// The `[tmux]` section of recruit 1, which ran its teams in tmux: its keys are accepted and have no effect, with a
+/// warning at launch. Only `socket` still serves, to find a team still running in recruit 1's tmux server.
 pub struct TmuxSettings {
-    /// Name of recruit's own tmux server (`tmux -L <socket>`), `recruit` by default.
+    /// Name of recruit 1's tmux server (`tmux -L <socket>`), `recruit` by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket: Option<String>,
-    /// Mouse support: click to focus, drag borders, scroll. On by default.
+    /// Mouse support in recruit 1's tmux server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<bool>,
-    /// Also read the user's own tmux configuration. On by default.
+    /// Whether recruit 1's tmux server read the user's tmux configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_config: Option<bool>,
-    /// Extra tmux commands, applied when recruit's tmux server starts.
+    /// Extra tmux commands for recruit 1's tmux server.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
 }
 
 impl TmuxSettings {
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
 
@@ -427,7 +429,7 @@ pub fn global_dir() -> PathBuf {
     }
 }
 
-/// Generated files: the members' prompts, the tmux configuration.
+/// Generated files: the members' prompts, the mod, the running teams' state.
 pub fn cache_dir() -> PathBuf {
     match std::env::var_os("XDG_CACHE_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("recruit"),
@@ -709,7 +711,7 @@ pub fn team_toml(name: &str, team: &Team) -> Result<String> {
     Ok(toml::to_string_pretty(&settings)?)
 }
 
-/// Team names become file names and tmux session names.
+/// Team names become file names, and the names of their sessions and sockets.
 pub fn validate_team_name(name: &str) -> Result<(), String> {
     let ok_chars = name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_');
     if name.is_empty() || name.chars().count() > 40 || !ok_chars || name.starts_with('-') {

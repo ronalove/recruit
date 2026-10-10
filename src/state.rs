@@ -21,8 +21,6 @@ const LOCK: &str = "team.lock";
 pub struct Snapshot {
     pub team: String,
     pub session: String,
-    /// recruit's tmux server (`tmux -L <socket>`).
-    pub socket: String,
     /// Where the members work.
     pub dir: PathBuf,
     /// The Claude Code executable, and its profile when the settings name one.
@@ -45,9 +43,6 @@ pub struct Snapshot {
     /// The members' settings give a status line (`claude::status_line`).
     #[serde(default)]
     pub status_line: bool,
-    /// What runs the team: tmux in a team launched before it.
-    #[serde(default)]
-    pub backend: crate::backend::Kind,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -116,7 +111,7 @@ pub fn lock(dir: &Path) -> Result<Lock> {
     Ok(Lock { _file: handle })
 }
 
-/// The folder of a running team, by its tmux session.
+/// The folder of a running team, by its session name (`backend::session_name`).
 pub fn dir(session: &str) -> PathBuf {
     cache_dir().join("teams").join(session)
 }
@@ -160,7 +155,6 @@ mod tests {
         let snapshot = Snapshot {
             team: "web".into(),
             session: "web".into(),
-            socket: "recruit".into(),
             dir: "/tmp/web".into(),
             claude: "/bin/claude".into(),
             config_dir: None,
@@ -171,7 +165,6 @@ mod tests {
             origin: Some(Origin::Local { root: "/tmp/web".into() }),
             plugin_dir: None,
             status_line: true,
-            backend: crate::backend::Kind::Tmux,
         };
         let lead = MemberInfo {
             name: "lead".into(),

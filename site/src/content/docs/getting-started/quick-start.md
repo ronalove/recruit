@@ -43,7 +43,7 @@ recruit new my-team --template personal --size small --launch
 recruit
 ```
 
-In a project that has a team, `recruit` launches it. The team opens in tmux: your contacts in the first tab, the dashboard and the journal on their right, the working agents in the next tabs.
+In a project that has a team, `recruit` launches it. The team opens in your terminal: your contacts in the first tab, the dashboard and the journal on their right, the working agents in the next tabs.
 
 :::tip[Approve the folder once]
 Claude Code asks every new session whether to trust a folder it has never approved, and Enter alone answers "No, exit". recruit warns you before launching. To approve the folder once for the whole team, run `claude` there first and accept.
@@ -59,7 +59,7 @@ To watch an agent, click its card on the dashboard, or go to its tab with `Alt+1
 
 ## 4. Leave and come back
 
-`Alt+q` (`⌥q` on macOS), or the "quit" button on the right of the status line, offers to detach (`d`) or to quit, which stops the team (`q`). Detached, the team keeps working, even when you close the terminal:
+`Alt+q` (`⌥q` on macOS), or the "quit" button at the bottom right, offers to detach (`d`) or to quit, which stops the team (`q`). Detached, the team keeps working, even when you close the terminal:
 
 ```sh
 recruit          # back where you left it, from any terminal, even over SSH
@@ -70,5 +70,5 @@ recruit stop     # closes every member's session
 
 - [Teams](/recruit/guides/teams/): local or global, personal settings, the ways to compose a team.
 - [The team's menu](/recruit/guides/menu/): change a member's model, role or tab while the team runs.
-- [In tmux](/recruit/guides/tmux/): keys, and Option on macOS.
+- [Around the screen](/recruit/guides/screen/): leave and come back, follow a member full screen, keys, and Option on macOS.
 - [Configuration](/recruit/reference/configuration/): every key of the team's file.

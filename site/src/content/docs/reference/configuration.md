@@ -24,12 +24,6 @@ default = "web"                   # team launched by a bare `recruit` when the f
 command = "claude"                # Claude Code executable
 config_dir = "~/.claude-work"     # Claude Code profile; better in settings.local.toml
 
-[tmux]                            # read when recruit's tmux server starts
-socket = "recruit"
-mouse = true
-user_config = true                # also read ~/.tmux.conf
-options = ["set -g status-position top"]
-
 [teams.web]
 description = "Web application"
 lang = "en"
@@ -75,14 +69,7 @@ Applies to every team of the file.
 
 ## `[tmux]`
 
-Read when recruit's tmux server starts, that is when the first team is launched in it, except `socket`, which picks the server at each launch. To apply a change, run `tmux -L recruit kill-server`, which stops every team in that server.
-
-| Key | Type | Default | Effect |
-|---|---|---|---|
-| `socket` | string | `"recruit"` | The name of recruit's tmux server: `tmux -L <socket>`. |
-| `mouse` | boolean | `true` | Mouse support: click to focus, drag borders, scroll. |
-| `user_config` | boolean | `true` | Also read your own tmux configuration, `~/.tmux.conf` and `~/.config/tmux/tmux.conf`. |
-| `options` | list of strings | `[]` | tmux commands applied last, after recruit's settings and yours. |
+Ignored. recruit 1 ran its teams in tmux, and this section set up tmux. Since recruit 2, teams draw their own [screen](/recruit/guides/screen/), with nothing to set up: the section is still read, so that an older file keeps working, and launching says that it has no effect. Its keys are those of recruit 1 (`socket`, `mouse`, `user_config`, `options`), and another one is refused. recruit 2 still uses `socket` to find a team that recruit 1 left running. Remove the section from the file to silence the warning.
 
 ## Teams
 

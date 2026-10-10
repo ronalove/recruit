@@ -12,12 +12,13 @@ Chaque changement est enregistré dans les fichiers de l'équipe, et la plupart 
 ## L'ouvrir
 
 - `Alt+r` (`⌥r` sous macOS) dans n'importe quel panneau de l'équipe ;
-- le bouton « menu » à droite de la barre tmux ;
+- le bouton « menu » en bas à droite ;
+- un clic sur le nom, le modèle ou l'effort d'un membre, dans le bord du haut de son cadre : le menu s'ouvre sur ce réglage ;
 - `/recruit`, tapé dans l'invite d'un membre, avec [le mod de recruit](/recruit/fr/guides/claude-code/#le-mod-de-recruit).
 
-Le menu s'ouvre dans une fenêtre tmux par-dessus l'équipe. Il lui faut une fenêtre de 50 × 14 au moins.
+Le menu s'ouvre par-dessus l'équipe, le reste atténué ; `Alt+r` et le bouton l'ouvrent sur la fiche du membre où tu es. Il lui faut une fenêtre de 50 × 14 au moins.
 
-![Le menu de l'équipe, ouvert sur la fiche d'un membre](../../../../assets/screenshots/menu-fr.png)
+![Le menu de l'équipe, ouvert sur la fiche d'un membre](../../../../assets/screenshots/menu.png)
 
 ## L'écran
 

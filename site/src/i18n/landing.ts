@@ -93,7 +93,7 @@ const en: Strings = {
       {
         id: 'dashboard',
         label: "Who's on what",
-        text: "Who's working, who's waiting for you, who just finished, and what each one is doing right now.",
+        text: "Who's working, who's waiting for you, even in another tab, and what each one is doing right now.",
         alt: 'A recruit team at work: the coordinator takes a request and hands it out, and the dashboard shows each member’s state and what it is doing.',
       },
       {
@@ -111,8 +111,8 @@ const en: Strings = {
       {
         id: 'agents',
         label: 'The specialists',
-        text: 'Each specialist works in its own pane. Watch any of them, or step in whenever you want.',
-        alt: 'The specialists tab of a recruit team: four panes side by side, one per member, each with its own conversation, its work and its pending question.',
+        text: 'Each specialist works on its own. Follow any of them full screen, or step in whenever you want.',
+        alt: 'The specialists tab of a recruit team: four members side by side, each in its own frame with its conversation and its work; the two in red wait for a permission.',
       },
     ],
   },
@@ -138,7 +138,7 @@ const en: Strings = {
     text: 'A coordinator, two developers, a reviewer and an ops agent build every release of recruit. They built this page too.',
     members: ['coordinator', 'dev-cli', 'dev-mod', 'review', 'ops'],
   },
-  final: { title: 'Build your first team.', small: 'Free and open source · For Claude Code · macOS and Linux' },
+  final: { title: 'Build your first team.', small: 'Free and open source · For Claude Code · macOS and Linux · Nothing else to install' },
   footer: { license: 'AGPL-3.0-or-later', docs: 'Docs', releases: 'Releases', github: 'GitHub' },
 };
 
@@ -196,7 +196,7 @@ const fr: Strings = {
       {
         id: 'dashboard',
         label: 'Qui fait quoi',
-        text: 'Qui travaille, qui t’attend, qui vient de finir, et ce que fait chacun en ce moment.',
+        text: 'Qui travaille, qui t’attend, même dans un autre onglet, et ce que fait chacun en ce moment.',
         alt: 'Une équipe recruit au travail : le coordinateur reçoit une demande et la répartit, et le tableau de bord montre l’état de chaque membre et ce qu’il fait.',
       },
       {
@@ -214,8 +214,8 @@ const fr: Strings = {
       {
         id: 'agents',
         label: 'Les spécialistes',
-        text: 'Chaque spécialiste travaille dans son propre panneau. Regarde n’importe lequel, ou interviens quand tu veux.',
-        alt: 'L’onglet des spécialistes d’une équipe recruit : quatre panneaux côte à côte, un par membre, chacun avec sa conversation, son travail et sa question en attente.',
+        text: 'Chaque spécialiste avance de son côté. Suis-en un en plein écran, ou interviens quand tu veux.',
+        alt: 'L’onglet des spécialistes d’une équipe recruit : quatre membres côte à côte, chacun dans son cadre avec sa conversation et son travail ; les deux en rouge attendent une permission.',
       },
     ],
   },
@@ -241,7 +241,7 @@ const fr: Strings = {
     text: 'Un coordinateur, deux développeurs, un relecteur et un agent ops construisent chaque version de recruit. Cette page aussi.',
     members: ['coordinateur', 'dev-cli', 'dev-mod', 'review', 'ops'],
   },
-  final: { title: 'Monte ta première équipe.', small: 'Libre et open source · Pour Claude Code · macOS et Linux' },
+  final: { title: 'Monte ta première équipe.', small: 'Libre et open source · Pour Claude Code · macOS et Linux · Rien d’autre à installer' },
   footer: { license: 'AGPL-3.0-or-later', docs: 'Docs', releases: 'Versions', github: 'GitHub' },
 };
 

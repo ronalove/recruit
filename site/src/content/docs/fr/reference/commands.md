@@ -28,7 +28,7 @@ Si l'équipe tourne déjà, `recruit` la rejoint. Il remet aussi en route les me
 | Option | Effet |
 |---|---|
 | `-r`, `--resume` | Chaque membre reprend la dernière conversation qui porte son nom dans ce dossier. Ignoré si l'équipe tourne. |
-| `--dry-run` | Ouvre la disposition seule, dans une session tmux à part (`<équipe>-dry-run`) : chaque panneau affiche son membre, son rôle et la commande qu'il lancerait, sans lancer Claude. `recruit stop <équipe>` ferme l'essai. |
+| `--dry-run` | Ouvre la disposition seule, en essai à part (`<équipe>-dry-run`) : chaque panneau affiche son membre, son rôle et la commande qu'il lancerait, sans lancer Claude. `recruit stop <équipe>` ferme l'essai. |
 | `-d`, `--detach` | Lance sans s'attacher à l'équipe. |
 | `--restart` | Arrête d'abord l'équipe si elle tourne. |
 | `--print` | Affiche les onglets, la ligne de commande de chaque membre et son fichier de prompt, sans rien lancer. |
@@ -73,7 +73,7 @@ Une équipe créée avec `--member` seul reçoit les règles communes de recruit
 recruit list [--json]
 ```
 
-Liste les équipes du projet et tes équipes globales, chacune avec son nombre de membres et son état : arrêtée, en cours, en cours et attachée, ou essai en cours (`--dry-run`). Un `*` marque l'équipe `default` du projet. Les sessions du serveur tmux de recruit qui ne sont à aucune d'elles viennent en dernier, comme autres équipes en cours.
+Liste les équipes du projet et tes équipes globales, chacune avec son nombre de membres et son état : arrêtée, en cours, en cours et attachée, essai en cours (`--dry-run`), ou en cours sous recruit 1 (tmux), pour une équipe que recruit 1 a laissée tourner (voir [la FAQ](/recruit/fr/faq/#une-équipe-tourne-encore-sous-recruit-1)). Un `*` marque l'équipe `default` du projet. Les équipes en cours qui ne sont à aucune d'elles viennent en dernier.
 
 ```
 Équipes de ce projet (~/code/mon-app/.recruit)
@@ -83,7 +83,7 @@ Liste les équipes du projet et tes équipes globales, chacune avec son nombre d
     outils    2 membres  arrêtée
 ```
 
-`--json` affiche un objet par équipe : `name`, `scope` (`local` ou `global`), `file`, `members`, `running`, `attached` et `dir`, le dossier où elle tourne.
+`--json` affiche un objet par équipe : `name`, `scope` (`local` ou `global`), `file`, `members`, `running`, `attached`, `dir`, le dossier où elle tourne, et `tmux`, vrai pour une équipe qui tourne encore sous recruit 1.
 
 ## `recruit attach`
 

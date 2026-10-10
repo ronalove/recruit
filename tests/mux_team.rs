@@ -1010,8 +1010,8 @@ fn screenshots_backend_native() {
     }
     let members = sh("member_panes | wc -l | tr -d ' '");
     checks.check("member_panes counts the members only", members == "2", || members.clone());
-    let all = sh("all_panes | wc -l | tr -d ' '");
-    checks.check("all_panes counts the panels too", all == "4", || all.clone());
+    let all = sh("shown_panes | wc -l | tr -d ' '");
+    checks.check("shown_panes counts the panels too", all == "4", || all.clone());
     let text = sh("pane_text \"$(pane_of lead)\"");
     checks.check("pane_text", text.contains("FAKE CLAUDE lead"), || text.clone());
     checks.check("state_of_team", sh("state_of_team") == team.state().to_string_lossy(), || sh("state_of_team"));
@@ -1027,10 +1027,38 @@ fn screenshots_backend_native() {
     sh("select_first");
     let first = wait(Duration::from_secs(3), || has_header(&term, "lead"));
     checks.check("select_first", first, || shown(&term));
-    sh("open_menu en");
+    sh("open_menu");
     let menu = wait(Duration::from_secs(8), || shown(&term).contains("Nouvel agent"));
     checks.check("open_menu", menu, || shown(&term));
     close_menu(&team, &mut term);
+    // The focus goes to a member of the second tab, by ⌥n from the first.
+    sh("select_second");
+    wait(Duration::from_secs(3), || has_header(&term, "dev"));
+    sh("focus_member dev");
+    checks.check("focus_member", wait(Duration::from_secs(3), || active(&term, &["dev"]) == ["dev"]), || shown(&term));
+    sh("select_first");
+    wait(Duration::from_secs(3), || has_header(&term, "lead"));
+    // The header and the card of each member say the same state: told by the fakes (OSC 7501 and `claude agents`).
+    says(&team, "lead", "working");
+    team.ctl(["send", "--pane", "lead", "agent busy\\r"]);
+    says(&team, "dev", "idle");
+    wait(Duration::from_secs(6), || {
+        let (ok, _) = team.bash(&format!("{prelude}states_agree"));
+        ok
+    });
+    let (agree, why) = team.bash(&format!("{prelude}states_agree"));
+    checks.check("states_agree: header and card alike", agree, || why.clone());
+    // And apart: the header says it works, the card (`claude agents`) says it rests.
+    team.ctl(["send", "--pane", "lead", "agent idle\\r"]);
+    let (apart, said) = {
+        let mut last = (true, String::new());
+        wait(Duration::from_secs(8), || {
+            last = team.bash(&format!("{prelude}states_agree"));
+            !last.0
+        });
+        last
+    };
+    checks.check("states_agree: tells them apart", !apart && said.contains("lead"), || said.clone());
     // A text typed as a user would reach the pane's program: `osc working` makes the fake say it works.
     sh("pane_type \"$(pane_of lead)\" 'osc working'");
     let working = wait(Duration::from_secs(4), || {

@@ -10,7 +10,7 @@ use crate::i18n::{self, Lang};
 use crate::t;
 use crate::{board, bridge, launch};
 
-/// Launch a team of Claude Code agents in tmux, or create one.
+/// Launch a team of Claude Code agents, or create one.
 #[derive(Parser, Debug)]
 #[command(name = "recruit", version)]
 pub struct Cli {
@@ -86,20 +86,12 @@ pub enum Command {
     },
     /// List built-in project types and sizes
     Templates,
-    /// Internal: a running team's panels, launched by recruit in its tmux panes
+    /// Internal: a running team's panels, launched by recruit in their panes
     #[command(name = "_panel", hide = true)]
     Panel {
         kind: board::Kind,
         /// The team's folder, under ~/.cache/recruit/teams/
         state: std::path::PathBuf,
-    },
-    /// Internal: a click on a panel, bound by recruit in its tmux server; goes to the member clicked
-    #[command(name = "_click", hide = true)]
-    Click {
-        /// The team's folder, under ~/.cache/recruit/teams/
-        state: std::path::PathBuf,
-        /// The panel's tmux pane (`%12`)
-        pane: String,
     },
     /// Internal: what runs in a member's pane, its Claude started again when it stops on its own
     #[command(name = "_member", hide = true)]
@@ -111,17 +103,14 @@ pub enum Command {
         #[arg(long)]
         resume: bool,
     },
-    /// Internal: a running team's menu, in a tmux popup opened by /recruit, Alt+r or the status line's button
+    /// Internal: a running team's menu, in a layer over the team, opened by /recruit, Alt+r or the bar's button
     #[command(name = "_menu", hide = true)]
     Menu {
         /// The team's folder, under ~/.cache/recruit/teams/
         state: std::path::PathBuf,
-        /// The tmux client the menu shows on, to detach it
+        /// The client the menu shows on, to detach it
         #[arg(long)]
         client: Option<String>,
-        /// Open the menu in a popup on --client, and return at once
-        #[arg(long, requires = "client")]
-        popup: bool,
         /// The client's terminal carries the Nerd Font symbols
         #[arg(long)]
         nerd: bool,
@@ -268,7 +257,7 @@ fn french(command: clap::Command) -> clap::Command {
         "Team name (default: this project's team, or the only one running)"
     );
     launch_help(command)
-        .about("Lance une équipe d'agents Claude Code dans tmux, ou en crée une.")
+        .about("Lance une équipe d'agents Claude Code, ou en crée une.")
         .mut_arg("team", |a| {
             a.value_name("ÉQUIPE").help("Équipe à lancer : la locale si les deux existent, sinon la globale ; créée si elle n'existe pas")
         })
@@ -324,12 +313,11 @@ fn french(command: clap::Command) -> clap::Command {
         })
         .mut_subcommand("_menu", |c| {
             c.about(format!(
-                "Interne : le menu d'une équipe lancée, dans une fenêtre tmux ouverte par /recruit, {}r ou le bouton de la barre",
-                crate::tmux::ALT
+                "Interne : le menu d'une équipe lancée, en calque sur l'équipe, ouvert par /recruit, {}r ou le bouton de la barre",
+                crate::look::ALT
             ))
                 .mut_arg("state", |a| a.help("Le dossier de l'équipe, sous ~/.cache/recruit/teams/"))
-                .mut_arg("client", |a| a.help("Le client tmux où s'affiche le menu, pour le détacher"))
-                .mut_arg("popup", |a| a.help("Ouvrir le menu dans une fenêtre sur --client, et rendre la main aussitôt"))
+                .mut_arg("client", |a| a.help("Le client où s'affiche le menu, pour le détacher"))
                 .mut_arg("nerd", |a| a.help("Le terminal du client embarque les symboles Nerd Font"))
                 .mut_arg("member", |a| a.help("Ouvrir sur la fiche de ce membre").value_name("MEMBRE"))
                 .mut_arg("field", |a| a.help("Le champ de sa fiche à mettre en avant : name, model ou effort").value_name("CHAMP"))
@@ -420,9 +408,8 @@ mod tests {
         assert_eq!(new.members, ["a:b", "c:d"]);
         assert_eq!(new.contacts, ["c"]);
         let cli = Cli::try_parse_from(["recruit", "--lang", "fr", "_menu", "/s", "--client", "/dev/ttys004"]).unwrap();
-        let Some(Command::Menu { state, client, popup, nerd, .. }) = cli.command else { panic!() };
-        assert_eq!((state.to_str(), client.as_deref(), popup, nerd), (Some("/s"), Some("/dev/ttys004"), false, false));
-        assert!(Cli::try_parse_from(["recruit", "_menu", "/s", "--popup"]).is_err());
+        let Some(Command::Menu { state, client, nerd, .. }) = cli.command else { panic!() };
+        assert_eq!((state.to_str(), client.as_deref(), nerd), (Some("/s"), Some("/dev/ttys004"), false));
         let cli = Cli::try_parse_from(["recruit", "_menu", "/s", "--member", "dev", "--field", "effort"]).unwrap();
         let Some(Command::Menu { member, field, .. }) = cli.command else { panic!() };
         assert_eq!((member.as_deref(), field.as_deref()), (Some("dev"), Some("effort")));

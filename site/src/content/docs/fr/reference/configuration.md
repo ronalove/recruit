@@ -24,12 +24,6 @@ default = "web"                   # équipe lancée par `recruit` seul quand le 
 command = "claude"                # exécutable de Claude Code
 config_dir = "~/.claude-perso"    # profil Claude Code ; mieux dans settings.local.toml
 
-[tmux]                            # lu au démarrage du serveur tmux de recruit
-socket = "recruit"
-mouse = true
-user_config = true                # lire aussi ~/.tmux.conf
-options = ["set -g status-position top"]
-
 [teams.web]
 description = "Application web"
 lang = "fr"
@@ -75,14 +69,7 @@ Vaut pour toutes les équipes du fichier.
 
 ## `[tmux]`
 
-Lu au démarrage du serveur tmux de recruit, c'est-à-dire quand la première équipe y est lancée, sauf `socket`, qui choisit le serveur à chaque lancement. Pour appliquer un changement, lance `tmux -L recruit kill-server`, qui arrête toutes les équipes de ce serveur.
-
-| Clé | Type | Défaut | Effet |
-|---|---|---|---|
-| `socket` | texte | `"recruit"` | Le nom du serveur tmux de recruit : `tmux -L <socket>`. |
-| `mouse` | booléen | `true` | La souris : clic pour choisir un panneau, bordures à tirer, défilement. |
-| `user_config` | booléen | `true` | Lire aussi ta propre configuration tmux, `~/.tmux.conf` et `~/.config/tmux/tmux.conf`. |
-| `options` | liste de textes | `[]` | Des commandes tmux appliquées en dernier, après les réglages de recruit et les tiens. |
+Ignorée. recruit 1 faisait tourner ses équipes dans tmux, et cette section réglait tmux. Depuis recruit 2, les équipes dessinent leur propre [écran](/recruit/fr/guides/screen/), sans rien à régler : la section est encore lue, pour qu'un fichier plus ancien marche toujours, et le lancement dit qu'elle n'a plus d'effet. Ses clés sont celles de recruit 1 (`socket`, `mouse`, `user_config`, `options`), et une autre est refusée. recruit 2 se sert encore de `socket` pour trouver une équipe que recruit 1 a laissée tourner. Retire la section du fichier pour faire taire l'avertissement.
 
 ## Équipes
 
