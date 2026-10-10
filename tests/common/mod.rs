@@ -245,9 +245,11 @@ pub fn retry_busy<T>(mut run: impl FnMut() -> std::io::Result<T>) -> std::io::Re
     }
 }
 
-/// A copy of the recruit binary in `dir`: others rebuild `target/` while the tests run.
+/// A copy of the recruit binary in `dir`: others rebuild `target/` while the tests run. `RECRUIT_BIN` names another
+/// binary to measure instead (the published one, for the « before » of a fix).
 pub fn recruit_copy(dir: &Path) -> PathBuf {
     let copy = dir.join("recruit");
-    std::fs::copy(env!("CARGO_BIN_EXE_recruit"), &copy).expect("copy of the recruit binary");
+    let from = std::env::var_os("RECRUIT_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_recruit").into());
+    std::fs::copy(from, &copy).expect("copy of the recruit binary");
     copy
 }

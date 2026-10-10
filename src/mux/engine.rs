@@ -193,7 +193,8 @@ pub(crate) enum Relay {
     /// OSC 9;4: progress.
     Progress(Progress),
     /// OSC 7501: what the program says it is doing. Claude Code writes it once its terminal answered
-    /// `OSC 7501 ; ?`, which the engine does: idle, working, blocked (and why), done.
+    /// `OSC 7501 ; ?`, which the engine does: idle, working, blocked (and why), done. The program's own status only:
+    /// those of its tasks (an `id`) are not relayed.
     Status(Status),
 }
 
@@ -208,8 +209,14 @@ pub(crate) struct Status {
     pub progress: Option<u8>,
     pub title: Option<String>,
     pub message: Option<String>,
-    /// Tells apart several statuses of the same program.
+    /// One of the program's tasks rather than the program (Claude Code 2.1.296: a sub-agent's, `clear` when it ends).
     pub id: Option<String>,
+    /// Who says it: `claude-code`, or `recruit` in the `clear` that `recruit _member` writes once its program stopped
+    /// (`state=clear:app=recruit`). Only that one says the program left, and its statuses no longer count until a
+    /// program asks again (`OSC 7501 ; ?`), so that a shell replaying old output sets none: Claude Code's own `clear`
+    /// comes on its way out, but also when the component that writes its status unmounts for a moment, and its
+    /// statuses go on after it.
+    pub app: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,9 +226,9 @@ pub(crate) enum State {
     Working,
     /// Waiting on the user: a permission, a question.
     Blocked,
-    /// Its turn is over.
+    /// Its turn is over, done or failed.
     Done,
-    /// No status any more (the program is leaving).
+    /// No status any more: the program is leaving, or the component that writes its status went away for a moment.
     Clear,
 }
 

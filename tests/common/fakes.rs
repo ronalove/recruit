@@ -27,7 +27,9 @@
 //! - `claude`: a Claude Code for the team tests, started by the shim of `common::team` (which answers `--version`
 //!   and `agents` itself), its own arguments after `--`. It notes its session as `claude agents --json` gives it
 //!   (`$CLAUDE_CONFIG_DIR/fake/run/<pid>.json`: `-r <id>`, else a new id), a line in that conversation's file so
-//!   that it can be resumed, and its command line (`fake/argv.log`, `<name>\t<arguments>`); shows
+//!   that it can be resumed, its own file as Claude Code writes it (`$CLAUDE_CONFIG_DIR/sessions/<pid>.json`: `pid`,
+//!   `sessionId`, `cwd`, `name`, `status`…, unless `fake/no-session-file` is there), and its command line
+//!   (`fake/argv.log`, `<name>\t<arguments>`); shows
 //!   `FAKE CLAUDE <name> <session>` and `❯`; then reads lines: `Q` ends it (0), `X` crashes it (1).
 //!
 //! Owner: testeur.
@@ -329,11 +331,36 @@ fn claude() -> ! {
         // One write per line: the fakes of a team start together, appending to the same file.
         let _ = log.write_all(format!("{name}\t{}\n", args.join(" ")).as_bytes());
     }
+    // `Team::die_once`: stops at once, once, before any file of its own (a Claude that fails to start).
+    let once = fake.join("die-once").join(&name);
+    if once.exists() {
+        let _ = std::fs::remove_file(&once);
+        std::process::exit(1);
+    }
     let running = serde_json::json!({
         "name": name, "cwd": cwd, "status": "idle", "sessionId": session, "pid": pid,
     });
     let run = fake.join("run").join(format!("{pid}.json"));
     let _ = std::fs::write(&run, running.to_string());
+    // Claude Code's own file for the session (`<profile>/sessions/<pid>.json`), which `member.rs` reads: the
+    // process is the one it started (the shim `exec`s down to here). A team may go without it (`fake/no-session-file`,
+    // `Team::without_session_files`) to test the fallback to `claude agents`.
+    let sessions = profile.join("sessions");
+    let own = (!fake.join("no-session-file").exists()).then(|| sessions.join(format!("{pid}.json")));
+    let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let write_own = |status: &str| {
+        if let Some(own) = &own {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+            let file = serde_json::json!({
+                "pid": pid, "sessionId": session, "cwd": cwd, "startedAt": started, "version": "2.1.295",
+                "kind": "interactive", "entrypoint": "cli", "name": name, "nameSource": "user",
+                "updatedAt": now, "status": status, "statusUpdatedAt": now,
+            });
+            let _ = std::fs::create_dir_all(&sessions);
+            let _ = std::fs::write(own, file.to_string());
+        }
+    };
+    write_own("idle");
     // The conversation's file, where recruit looks for it (`claude::transcript`): a session that said nothing is
     // not resumed.
     let key: String = cwd
@@ -401,12 +428,16 @@ fn claude() -> ! {
                         "name": name, "cwd": cwd, "status": &command[6..], "sessionId": session, "pid": pid,
                     });
                     let _ = std::fs::write(&run, running.to_string());
+                    write_own(&command[6..]);
                 }
                 _ => {}
             },
         }
     };
     let _ = std::fs::remove_file(&run);
+    if let Some(own) = &own {
+        let _ = std::fs::remove_file(own);
+    }
     std::process::exit(code)
 }
 

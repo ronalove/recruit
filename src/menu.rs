@@ -25,7 +25,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::terminal;
 
 use crate::board;
-use crate::canvas::{Painter, Session};
+use crate::canvas::{Features, Painter, Session};
 use crate::config::{self, Edit, Member, Origin};
 use crate::live::Running;
 use crate::look::{self, Glyphs, State, family};
@@ -54,7 +54,8 @@ pub fn run(state: &Path, client: Option<&str>, nerd: bool, member: Option<&str>,
         running: &mut running,
         client,
         session: Session::open()?,
-        painter: Painter::default(),
+        // Each frame a synchronized update: the multiplexer shows it only once it is all there.
+        painter: Painter::new(Features { sync: true, ..Features::default() }),
         states,
         news: mpsc::channel(),
         composers: Composers::default(),
@@ -76,9 +77,6 @@ fn field_of(name: &str) -> Option<sheet::Fid> {
     }
 }
 
-/// Further than this from now, `states.json` is not looked after: the dashboard is off or stopped, or the clock moved.
-const STALE: i64 = 3;
-
 /// How often the menu asks `claude agents --json` itself, the dashboard off.
 const ASK_EVERY: Duration = Duration::from_secs(2);
 
@@ -87,9 +85,8 @@ type States = HashMap<String, (State, i64)>;
 
 /// What the dashboard last saw, if it saw it lately.
 fn fresh_states(state: &Path, now: i64) -> Option<States> {
-    let states = board::read_states(state)?;
-    ((now - states.at).abs() <= STALE)
-        .then(|| states.members.into_iter().map(|(name, m)| (name, (m.state, m.since))).collect())
+    let states = board::read_states(state).filter(|states| states.fresh(now))?;
+    Some(states.members.into_iter().map(|(name, m)| (name, (m.state, m.since))).collect())
 }
 
 /// Keeps the members' states up to date for the menu, on the side: what the dashboard writes, read every half second,

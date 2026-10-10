@@ -966,8 +966,23 @@ impl Server {
             }
             Msg::Broken => self.dirty = true,
             Msg::Looks(looks) => {
+                // A member whose program says nothing, gone waiting out of sight by the dashboard: a notice, as by its
+                // program (`relay`).
+                let shown = self.shown_ids();
+                let waiting = self
+                    .panes
+                    .iter()
+                    .filter(|pane| pane.role.is_empty() && !shown.contains(&pane.id))
+                    .find(|pane| {
+                        pane_state(pane, &looks) == look::State::Waiting
+                            && pane_state(pane, &self.looks) != look::State::Waiting
+                    })
+                    .map(|pane| pane.id.clone());
                 self.looks = looks;
                 self.dirty = true;
+                if let Some(id) = waiting {
+                    self.notify(&id);
+                }
             }
             Msg::Attach(attaching) => self.attach(*attaching),
             Msg::Client(id, message) => {
@@ -1298,9 +1313,11 @@ impl Server {
 
     /// To the member who has waited the longest (⌥g, F6); nothing when none waits.
     fn go_waiting(&mut self) {
+        let looks = &self.looks;
         let waiting =
-            self.panes.iter().filter(|pane| pane.role.is_empty() && look_state(pane.state) == look::State::Waiting);
-        if let Some(id) = waiting.min_by_key(|pane| pane.since.unwrap_or(u64::MAX)).map(|pane| pane.id.clone()) {
+            self.panes.iter().filter(|pane| pane.role.is_empty() && pane_state(pane, looks) == look::State::Waiting);
+        let first = waiting.min_by_key(|pane| pane_since(pane, looks).unwrap_or(u64::MAX));
+        if let Some(id) = first.map(|pane| pane.id.clone()) {
             self.focus_on(&id);
         }
     }
@@ -1691,6 +1708,7 @@ impl Server {
         let mut relays = Vec::new();
         let mut waiting = None;
         let held = self.gate.hold();
+        let looks = &self.looks;
         for pane in &mut self.panes {
             relays.clear();
             let gate_free = pane.with(|engine| engine.relays(&mut relays));
@@ -1700,11 +1718,16 @@ impl Server {
             for relay in relays.drain(..) {
                 if let Relay::Status(status) = &relay {
                     let state = look_state(Some(status.state));
+                    // Waiting already, by its program or by the dashboard: no second notice.
+                    if state == look::State::Waiting
+                        && pane_state(pane, looks) != look::State::Waiting
+                        && pane.role.is_empty()
+                        && !shown.contains(&pane.id)
+                    {
+                        waiting = Some(pane.id.clone());
+                    }
                     if pane.since.is_none() || look_state(pane.state) != state {
                         pane.since = Some(now());
-                        if state == look::State::Waiting && pane.role.is_empty() && !shown.contains(&pane.id) {
-                            waiting = Some(pane.id.clone());
-                        }
                     }
                     pane.state = Some(status.state);
                 }
@@ -1750,7 +1773,7 @@ impl Server {
             || self.menu.is_some()
             || self.choice.is_some()
             || pane.is_none_or(|pane| {
-                look_state(pane.state) != look::State::Waiting || self.shown_ids().contains(&pane.id)
+                pane_state(pane, &self.looks) != look::State::Waiting || self.shown_ids().contains(&pane.id)
             });
         if over {
             self.notice = None;
@@ -1839,7 +1862,7 @@ impl Server {
         let base = chrome::Header {
             // The menu names itself on its first line: its frame has no title.
             name: if pane.role == MENU { "" } else { &pane.member },
-            state: look_state(pane.state),
+            state: pane_state(pane, &self.looks),
             note,
             hint,
             ..chrome::Header::default()
@@ -1849,10 +1872,12 @@ impl Server {
         }
         let looks = self.looks.get(&pane.member);
         let context = looks.and_then(|looks| looks.context);
-        // Its program says its state: at rest by it. Else as the dashboard last saw it.
-        let compactable = match pane.state {
-            Some(_) => base.state == look::State::Idle && context.is_some(),
-            None => looks.is_some_and(|looks| looks.compactable),
+        // Its program says its state: at rest by it. Else (none said, or `Clear`) as the dashboard last saw it.
+        let told = look_state(pane.state) != look::State::Other;
+        let compactable = if told {
+            base.state == look::State::Idle && context.is_some()
+        } else {
+            looks.is_some_and(|looks| looks.compactable)
         };
         // At rest by its program, a command still running by `claude agents` (`"status": "shell"`, which OSC 7501 does
         // not tell): the command's sign, and since when it runs, as its card (architect's decision). At work, or
@@ -1860,7 +1885,8 @@ impl Server {
         let shell = looks.is_some_and(|looks| looks.shell)
             && !matches!(base.state, look::State::Working | look::State::Waiting);
         let seen = || looks?.since.and_then(|since| u64::try_from(since).ok());
-        let since = if shell { seen().or(pane.since) } else { pane.since.or_else(seen) };
+        let own = pane.since.filter(|_| told);
+        let since = if shell { seen().or(own) } else { own.or_else(seen) };
         let hover = match &self.hover {
             Some(Hover::Part(id, part)) if *id == pane.id => Some(*part),
             _ => None,
@@ -1882,14 +1908,11 @@ impl Server {
     }
 
     /// How many members work, wait for the user and rest, for the dashboard's border (mock-up B1), as their programs
-    /// say it; for one whose program says nothing (no OSC 7501), as the dashboard last saw it (`looks`).
+    /// say it; for one whose program says nothing (no OSC 7501, or `Clear`), as the dashboard last saw it (`looks`).
     fn counts(&self) -> chrome::Hint {
         let (mut working, mut waiting, mut idle) = (0, 0, 0);
         for pane in self.panes.iter().filter(|pane| pane.role.is_empty()) {
-            let seen = || self.looks.get(&pane.member).and_then(|looks| looks.state);
-            let state =
-                if pane.state.is_some() { look_state(pane.state) } else { seen().unwrap_or(look::State::Other) };
-            match state {
+            match pane_state(pane, &self.looks) {
                 look::State::Working => working += 1,
                 look::State::Waiting => waiting += 1,
                 look::State::Idle => idle += 1,
@@ -1938,7 +1961,7 @@ impl Server {
             .iter()
             .enumerate()
             .map(|(i, tab)| {
-                let states = tab.panes.iter().filter_map(|id| self.pane(id)).map(|pane| look_state(pane.state));
+                let states = tab.panes.iter().filter_map(|id| self.pane(id)).map(|pane| pane_state(pane, &self.looks));
                 let zoomed = tab.zoomed.as_deref().and_then(|id| self.pane(id)).map(|pane| pane.member.as_str());
                 chrome::Tab { title: &tab.title, active: i == self.active, state: urgent(states), zoomed }
             })
@@ -2163,6 +2186,12 @@ impl Server {
                         pid: pane.pty.pid(),
                         cols: pane.size.0,
                         rows: pane.size.1,
+                        // Its program's own, never the dashboard's (`pane_state`): the dashboard reads it, and would
+                        // read back its own echo.
+                        status: Some(look_state(pane.state))
+                            .filter(|state| *state != look::State::Other)
+                            .map(|state| state.name().to_string()),
+                        since: pane.since.filter(|_| look_state(pane.state) != look::State::Other),
                     })
                     .collect();
                 ok(serde_json::to_value(list).unwrap_or_default())
@@ -2650,6 +2679,26 @@ fn look_state(state: Option<State>) -> look::State {
     }
 }
 
+/// A pane's state, as its program says it (OSC 7501); for a member whose program says none, or `Clear`, as the
+/// dashboard last saw it (`looks`): everywhere a member's state is shown (headers, counts, tabs, ⌥g, notices); never
+/// in `Panes`, which the dashboard reads.
+fn pane_state(pane: &Pane, looks: &BTreeMap<String, board::MemberLook>) -> look::State {
+    match look_state(pane.state) {
+        look::State::Other if pane.role.is_empty() => {
+            looks.get(&pane.member).and_then(|looks| looks.state).unwrap_or(look::State::Other)
+        }
+        state => state,
+    }
+}
+
+/// Since when a pane is in its [`pane_state`], in seconds since the epoch: by its program, else by the dashboard.
+fn pane_since(pane: &Pane, looks: &BTreeMap<String, board::MemberLook>) -> Option<u64> {
+    if look_state(pane.state) != look::State::Other || !pane.role.is_empty() {
+        return pane.since;
+    }
+    looks.get(&pane.member)?.since.and_then(|since| u64::try_from(since).ok())
+}
+
 /// The member's pane after `focus` among a tab's `members`, in turn; the first when the focus is elsewhere (a panel).
 /// None when it would stay where it is: a tab of one member.
 fn next_member(members: &[String], focus: Option<&str>) -> Option<String> {
@@ -2902,6 +2951,8 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let tabs = vec![TabSpec { title: "1".into(), panes: vec![sleeper("dev-a")], side: None }];
         let mut server = built(state.path(), &["dev-a"], tabs);
+        // Its program says its state: its time is since then.
+        server.panes[0].state = Some(State::Idle);
         server.panes[0].since = Some(now() - 5);
         assert!(server.compose());
         let next = server.clock.expect("seconds shown").saturating_duration_since(Instant::now());
@@ -3103,6 +3154,69 @@ mod tests {
         assert_eq!((server.active, server.focus.as_deref()), (1, Some(b.as_str())));
         server.check_notice();
         assert!(server.notice.is_none());
+    }
+
+    #[test]
+    fn a_member_whose_program_says_nothing_or_clear_is_as_the_dashboard_saw_it() {
+        let state = tempfile::tempdir().unwrap();
+        let tabs = vec![
+            TabSpec { title: "1".into(), panes: vec![sleeper("dev-a")], side: None },
+            TabSpec { title: "2".into(), panes: vec![sleeper("dev-b")], side: None },
+        ];
+        let mut server = built(state.path(), &["dev-a", "dev-b"], tabs);
+        let _client = attached(&mut server);
+        let b = id_of(&server, "dev-b");
+        let now = now();
+        // dev-b's program said `Clear` long ago (the omnidex coordinator, 2.0.0): its own state and time are no more.
+        server.panes[1].state = Some(State::Clear);
+        server.panes[1].since = Some(now - 5);
+        server.panes[0].state = Some(State::Idle);
+        let seen =
+            |state| board::MemberLook { state: Some(state), since: Some(now as i64 - 300), ..Default::default() };
+        let looks = BTreeMap::from([
+            ("dev-a".into(), seen(look::State::Working)),
+            ("dev-b".into(), seen(look::State::Waiting)),
+        ]);
+        server.message(Msg::Looks(looks));
+        // Out of sight, waiting by the dashboard: its notice, its tab's ⚑.
+        assert_eq!(server.notice.as_ref().map(|(notice, _)| notice.member.as_str()), Some("dev-b"));
+        let header = server.header(&server.panes[1], None, None, now);
+        assert_eq!((header.state, header.since), (look::State::Waiting, Some(300)));
+        // dev-a's program says it rests: it, not the dashboard.
+        assert_eq!(server.header(&server.panes[0], None, None, now).state, look::State::Idle);
+        assert_eq!(server.counts(), chrome::Hint::Counts { working: 0, waiting: 1, idle: 1 });
+        let tab = |server: &Server, i: usize| {
+            urgent(
+                server.tabs[i]
+                    .ids()
+                    .iter()
+                    .filter_map(|id| server.pane(id))
+                    .map(|pane| pane_state(pane, &server.looks)),
+            )
+        };
+        assert_eq!(tab(&server, 1), look::State::Waiting);
+        // `Panes` gives its program's own: none. The dashboard reads it, not its own echo.
+        let Reply::Ok(list) = server.answer(Request::Panes) else { panic!("panes") };
+        let list: Vec<PaneInfo> = serde_json::from_value(list).unwrap();
+        let info = list.iter().find(|info| info.id == b).unwrap();
+        assert_eq!((info.status.as_deref(), info.since), (None, None));
+        // ⌥g reaches it.
+        server.go_waiting();
+        assert_eq!(server.focus.as_deref(), Some(b.as_str()));
+        // Its program speaks again: it wins over the dashboard.
+        server.panes[1].state = Some(State::Working);
+        assert_eq!(server.header(&server.panes[1], None, None, now).state, look::State::Working);
+        // Never told, never seen: nothing.
+        server.panes[1].state = None;
+        server.looks.remove("dev-b");
+        assert_eq!(server.header(&server.panes[1], None, None, now).state, look::State::Other);
+        // Panels keep their own (none): the dashboard's states are the members'.
+        assert!(
+            server
+                .panes
+                .iter()
+                .all(|pane| pane.role.is_empty() || pane_state(pane, &server.looks) == look::State::Other)
+        );
     }
 
     #[test]

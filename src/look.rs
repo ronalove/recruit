@@ -53,6 +53,26 @@ impl State {
         }
     }
 
+    /// Its name in `states.json` and in the server's list of panes: `working`, `idle`, `waiting` or `other`.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            State::Working => "working",
+            State::Idle => "idle",
+            State::Waiting => "waiting",
+            State::Other => "other",
+        }
+    }
+
+    /// The state [`State::name`] gives; `Other` for any other name.
+    pub(crate) fn named(name: &str) -> Self {
+        match name {
+            "working" => State::Working,
+            "idle" => State::Idle,
+            "waiting" => State::Waiting,
+            _ => State::Other,
+        }
+    }
+
     pub(crate) fn color(self) -> Color {
         match self {
             State::Working => Color::Yellow,

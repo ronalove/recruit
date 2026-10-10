@@ -458,7 +458,15 @@ mod tests {
         let held = try_lock(state.path()).unwrap().expect("free");
         assert!(try_lock(state.path()).unwrap().is_none(), "held");
         drop(held);
-        assert!(try_lock(state.path()).unwrap().is_some(), "free again once closed");
+        // Free again once closed. Not at once in every case: another test that forks (a PTY's program) gives its
+        // child a copy of every descriptor of this process, the lock's among them, and `flock` holds for the open
+        // file wherever a copy of it is, until the child closes it (above 2, then CLOEXEC at `exec`). A bounded wait:
+        // a lock still held after it would still fail.
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while try_lock(state.path()).unwrap().is_none() {
+            assert!(std::time::Instant::now() < until, "free again once closed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

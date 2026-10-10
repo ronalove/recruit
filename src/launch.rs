@@ -263,6 +263,8 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
     };
     snapshot.write(&state)?;
     bridge::reset(&state)?;
+    // What the last launch's dashboard saw: its sessions, processes and exact addresses are not this launch's.
+    let _ = fs::remove_file(state.join(board::STATES));
     backend.launch(&plan)?;
     if crashed && options.resume {
         note_recovery(&state);

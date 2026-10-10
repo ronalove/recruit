@@ -45,6 +45,12 @@ D="${{CLAUDE_CONFIG_DIR:-/nonexistent}}/fake"
 case "$1" in
   --version) echo "2.1.295 (Claude Code)"; exit 0;;
   agents)
+    # One line a call, for the tests that count them (`Team::agent_calls`): the time, the arguments, and who asked
+    # (the parent's command, shortened to `_panel dashboard`, `_member <name>`…).
+    mkdir -p "$D"
+    printf '%s\t%s\t%s\n' "$(date +%s)" "$*" \
+      "$(ps -o args= -p "$PPID" 2>/dev/null | awk '{{for (i = 1; i < NF; i++) if ($i == "_panel") {{print $i, $(i + 1); exit}} else if ($i == "_member") {{print $i, $NF; exit}}}}')" \
+      >> "$D/agents.log"
     printf '['; sep=''
     for f in "$D"/run/*.json; do
       [ -f "$f" ] || continue
@@ -153,7 +159,12 @@ impl Team {
 
     /// `recruit --detach`, which must succeed; then every member's fake up.
     pub fn launch(&self, members: &[&str]) {
-        let out = self.recruit(["--detach"]);
+        self.launch_with(&["--detach"], members);
+    }
+
+    /// `recruit <args…>` (with `--detach`), which must succeed; then every member's fake up.
+    pub fn launch_with(&self, args: &[&str], members: &[&str]) {
+        let out = self.recruit(args);
         assert!(out.status.success(), "recruit --detach: {}{}", self.text(&out.stdout), self.text(&out.stderr));
         for member in members {
             assert!(
@@ -231,6 +242,69 @@ impl Team {
         log.lines().filter_map(|l| l.strip_prefix(&format!("{member}\t")).map(str::to_string)).collect()
     }
 
+    /// Runs the team with another recruit than the build's (a published one, for a server of the old protocol): a
+    /// copy of `from` in the test's folder, used by every command after this. Before `launch`.
+    pub fn use_binary(&mut self, from: &Path) {
+        // Another name each time: a running server keeps its file, and a copy over it would kill the next start (macOS).
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let copy = self.root.join(format!("recruit-other-{nanos}"));
+        std::fs::copy(from, &copy).expect("copy of the other recruit");
+        self.recruit = copy;
+    }
+
+    /// The fakes write no `<profile>/sessions/<pid>.json` (as an older Claude Code, or one whose file cannot be read):
+    /// `member.rs` falls back to `claude agents`. Before the members start.
+    pub fn without_session_files(&self) {
+        let fake = self.profile.join("fake");
+        std::fs::create_dir_all(&fake).expect("fake folder");
+        std::fs::write(fake.join("no-session-file"), "").expect("marker");
+    }
+
+    /// The next start of `member`'s fake `claude` stops at once with code 1, before it writes anything of its own
+    /// (its argv is logged first, `launches`).
+    pub fn die_once(&self, member: &str) {
+        let dir = self.profile.join("fake/die-once");
+        std::fs::create_dir_all(&dir).expect("die-once folder");
+        std::fs::write(dir.join(member), "").expect("marker");
+    }
+
+    /// A conversation `id` in the project that `member`'s fake `claude` could resume: titled `member` (as `-n` does),
+    /// then the `lines` (JSON) it holds. Returns the conversation's file.
+    pub fn seed_conversation(&self, member: &str, id: &str, lines: &[String]) -> PathBuf {
+        let key: String = self
+            .proj
+            .canonicalize()
+            .expect("project")
+            .to_string_lossy()
+            .chars()
+            .flat_map(|c| if c.is_ascii_alphanumeric() { vec![c] } else { vec!['-'; c.len_utf16()] })
+            .collect();
+        let dir = self.profile.join("projects").join(key);
+        std::fs::create_dir_all(&dir).expect("conversations folder");
+        let mut text = String::from("{\"type\":\"fake\"}\n");
+        text.push_str(&format!("{{\"type\":\"custom-title\",\"customTitle\":\"{member}\",\"sessionId\":\"{id}\"}}\n"));
+        for line in lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        let file = dir.join(format!("{id}.jsonl"));
+        std::fs::write(&file, text).expect("conversation");
+        file
+    }
+
+    /// The calls of `claude agents` the shim answered so far, in order: when (seconds since the epoch), its
+    /// arguments, and who asked (`_panel dashboard`, `_member <name>`, `_panel journal`…).
+    pub fn agent_calls(&self) -> Vec<(u64, String, String)> {
+        let log = std::fs::read_to_string(self.profile.join("fake/agents.log")).unwrap_or_default();
+        log.lines()
+            .filter_map(|l| {
+                let mut parts = l.splitn(3, '\t');
+                let at = parts.next()?.trim().parse().ok()?;
+                Some((at, parts.next()?.to_string(), parts.next().unwrap_or_default().trim().to_string()))
+            })
+            .collect()
+    }
+
     /// Whether `member`'s `recruit _member` still runs (the loop that starts its Claude again).
     pub fn member_runs(&self, member: &str) -> bool {
         let state = self.state();
@@ -246,6 +320,11 @@ impl Team {
 
     /// `recruit <args…>` on a new test terminal of the team's environment, in the project.
     pub fn in_terminal(&self, args: &[&str], cols: u16, rows: u16, profile: Profile) -> TestTerm {
+        self.in_terminal_of(&self.recruit, args, cols, rows, profile)
+    }
+
+    /// The same with the program `recruit` (another build than the team's).
+    pub fn in_terminal_of(&self, recruit: &Path, args: &[&str], cols: u16, rows: u16, profile: Profile) -> TestTerm {
         let env = [
             ("XDG_CONFIG_HOME", self.root.join("config").into_os_string()),
             ("XDG_CACHE_HOME", self.root.join("cache").into_os_string()),
@@ -254,7 +333,7 @@ impl Team {
             ("SHELL", "/bin/sh".into()),
         ];
         let env: Vec<(&str, &OsStr)> = env.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
-        TestTerm::spawn_in(Some(&self.proj), self.recruit.as_os_str(), args, &env, cols, rows, profile)
+        TestTerm::spawn_in(Some(&self.proj), recruit.as_os_str(), args, &env, cols, rows, profile)
     }
 
     /// `recruit stop <team>`, then: nothing left running, the user's files untouched.

@@ -85,14 +85,30 @@ pub struct SessionFile {
     pub since: Option<i64>,
 }
 
-/// A session's own file in the profile (`sessions/<pid>.json`); None when missing or without a status. Its time
-/// (`statusUpdatedAt`, in milliseconds, whole or not) may be missing: the status stands on its own.
+/// A session's own file in the profile (`sessions/<pid>.json`); None when missing, another process's (a pid seen a
+/// few seconds ago, gone since) or without a status. Its time (`statusUpdatedAt`, in milliseconds, whole or not) may
+/// be missing: the status stands on its own.
 pub fn session_status(config_dir: Option<&Path>, pid: u32) -> Option<SessionFile> {
     let file = profile_dir(config_dir).join("sessions").join(format!("{pid}.json"));
     let session: serde_json::Value = serde_json::from_str(&fs::read_to_string(file).ok()?).ok()?;
+    if session["pid"].as_u64() != Some(u64::from(pid)) {
+        return None;
+    }
     let since =
         session["statusUpdatedAt"].as_f64().filter(|ms| ms.is_finite() && *ms > 0.0).map(|ms| (ms / 1000.0) as i64);
     Some(SessionFile { status: session["status"].as_str()?.to_string(), since })
+}
+
+/// The session Claude's process `pid` runs, from its own file in the profile (`sessions/<pid>.json`, `sessionId`; after
+/// a `/clear`, the new one): what `claude agents` says, for a file read. None when the file is missing, unreadable,
+/// another process's, or says no session: an undocumented format, so its reader falls back on something else.
+pub fn session_id(config_dir: Option<&Path>, pid: u32) -> Option<String> {
+    let file = profile_dir(config_dir).join("sessions").join(format!("{pid}.json"));
+    let session: serde_json::Value = serde_json::from_str(&fs::read_to_string(file).ok()?).ok()?;
+    if session["pid"].as_u64() != Some(u64::from(pid)) {
+        return None;
+    }
+    session["sessionId"].as_str().filter(|id| !id.is_empty()).map(str::to_string)
 }
 
 /// The exact address ListAgents gives a session (`name [ref]`), from its own file in the profile: the first six hex
@@ -434,6 +450,28 @@ mod tests {
         assert_eq!(session_ref(Some(profile.path()), 4), None);
     }
 
+    #[test]
+    fn session_id_from_its_file() {
+        let profile = tempfile::tempdir().unwrap();
+        let sessions = profile.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let write = |pid: u32, json: &str| fs::write(sessions.join(format!("{pid}.json")), json).unwrap();
+        write(10, r#"{"pid":10,"sessionId":"s-10","cwd":"/w","name":"dev","status":"idle"}"#);
+        assert_eq!(session_id(Some(profile.path()), 10).as_deref(), Some("s-10"));
+        // Missing, another process's, without a session, empty, or another format: none.
+        assert_eq!(session_id(Some(profile.path()), 1), None);
+        write(11, r#"{"pid":12,"sessionId":"s-12"}"#);
+        assert_eq!(session_id(Some(profile.path()), 11), None);
+        write(13, r#"{"pid":13}"#);
+        assert_eq!(session_id(Some(profile.path()), 13), None);
+        write(14, r#"{"pid":14,"sessionId":""}"#);
+        assert_eq!(session_id(Some(profile.path()), 14), None);
+        write(15, r#"{"pid":15,"session":{"id":"s-15"}}"#);
+        assert_eq!(session_id(Some(profile.path()), 15), None);
+        write(16, "not json");
+        assert_eq!(session_id(Some(profile.path()), 16), None);
+    }
+
     fn session(name: &str, cwd: &str, id: &str, pid: u32) -> Running {
         Running {
             name: Some(name.into()),
@@ -495,6 +533,11 @@ mod tests {
         assert_eq!(session_status(Some(profile.path()), 43), None);
         fs::write(sessions.join("44.json"), r#"{"pid":44,"status":"idle""#).unwrap();
         assert_eq!(session_status(Some(profile.path()), 44), None);
+        // Another process's, or without its pid: nothing.
+        fs::write(sessions.join("48.json"), r#"{"pid":49,"status":"shell"}"#).unwrap();
+        assert_eq!(session_status(Some(profile.path()), 48), None);
+        fs::write(sessions.join("50.json"), r#"{"status":"shell"}"#).unwrap();
+        assert_eq!(session_status(Some(profile.path()), 50), None);
     }
 
     #[test]

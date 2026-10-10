@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::state::{self, MemberInfo, Snapshot};
-use crate::{claude, live, t};
+use crate::{board, claude, live, t};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static HUNG_UP: AtomicBool = AtomicBool::new(false);
@@ -50,7 +50,7 @@ pub fn run(state: &Path, member: &str, resume: bool) -> Result<()> {
         .with_context(|| t!("aucun membre « {} » dans {}", "no member \"{}\" in {}", member, state.display()))?;
     catch_signals();
     // The first start as recruit just wrote it: launched, or started again from the menu.
-    let mut argv = if resume { resumed(&snapshot, state, &info) } else { info.argv.clone() };
+    let mut argv = first_argv(&snapshot, state, &info, resume);
     let mut quick = 0;
     loop {
         let started = Instant::now();
@@ -111,7 +111,7 @@ pub fn run(state: &Path, member: &str, resume: bool) -> Result<()> {
 /// output) no longer counts.
 fn clear_status() {
     let mut out = std::io::stdout().lock();
-    let _ = out.write_all(b"\x1b]7501;state=clear\x07");
+    let _ = out.write_all(b"\x1b]7501;state=clear:app=recruit\x07");
     let _ = out.flush();
 }
 
@@ -148,36 +148,135 @@ fn pause() -> bool {
     true
 }
 
-/// Waits for Claude to stop, noting meanwhile which session it runs (`claude agents --json`, by name and folder):
-/// the one to resume, even before it carries a title, and the latest one after a `/clear`.
+/// How often the session is read in what the dashboard wrote, while it looks: a file read, without backing off.
+const READ: Duration = Duration::from_secs(2);
+
+/// How far apart `claude agents` is asked at most, when the dashboard does not look.
+const SLOWEST: Duration = Duration::from_secs(60);
+
+/// How long a session may stay missing from what the dashboard writes before `claude agents` is asked all the same.
+const MISSING: Duration = Duration::from_secs(60);
+
+/// Waits for Claude to stop, noting meanwhile which session it runs: the one to resume, even before it carries a
+/// title, and the latest one after a `/clear`.
 fn watch(mut child: Child, snapshot: &Snapshot, state: &Path, info: &MemberInfo) -> std::io::Result<ExitStatus> {
     let started = Instant::now();
-    // At 2 s, then less and less often, a minute apart at most.
-    let (mut interval, mut next) = (Duration::from_secs(2), Duration::from_secs(2));
+    let mut pace = Pace::new();
+    let mut next = READ;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
         if started.elapsed() >= next {
-            note_session(snapshot, state, info);
-            interval = (interval * 2).min(Duration::from_secs(60));
-            next = started.elapsed() + interval;
+            note_session(snapshot, state, info, child.id(), &mut pace, started.elapsed());
+            next = started.elapsed() + READ;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
 }
 
-fn note_session(snapshot: &Snapshot, state: &Path, info: &MemberInfo) {
-    let Ok(running) = claude::running(&snapshot.claude, snapshot.config_dir.as_deref()) else { return };
+/// What the dashboard says of a member's session.
+#[derive(Debug, PartialEq)]
+enum Seen {
+    /// The session its Claude runs.
+    Session(String),
+    /// It looks, but has not noted that Claude's session: not seen yet, or the one before (a relaunch).
+    Missing,
+    /// It does not look: no file, or older than `board::FRESH` (`dashboard = false`, the dashboard stopped).
+    Stale,
+}
+
+/// What `states` (fresh, if any) says of `member`'s session, run by Claude's process `pid`: an entry of the Claude
+/// before it (a few seconds old at most) would resume the wrong conversation.
+fn seen(states: Option<&board::States>, member: &str, pid: u32) -> Seen {
+    let Some(states) = states else { return Seen::Stale };
+    match states.sessions.get(member) {
+        Some(session) if session.pid == Some(pid) => Seen::Session(session.id.clone()),
+        _ => Seen::Missing,
+    }
+}
+
+/// When to ask `claude agents --json` (0.2 s of CPU and 160 MB a call, a dozen members at once, 2.0.1): never while
+/// the dashboard notes the session; while it does not look, at 2 s, then less and less often, a minute apart at
+/// most; while it looks without noting it, once a minute.
+struct Pace {
+    /// The wait after the last ask, while the dashboard does not look.
+    backoff: Duration,
+    /// The next ask while it does not look, since the start.
+    next: Duration,
+    /// Since when the session is missing from a fresh file.
+    missing: Option<Duration>,
+}
+
+impl Pace {
+    fn new() -> Self {
+        Pace { backoff: READ, next: READ, missing: None }
+    }
+
+    /// Whether to ask, at `at` since the start, after what the dashboard said.
+    fn ask(&mut self, seen: &Seen, at: Duration) -> bool {
+        match seen {
+            Seen::Session(_) => {
+                self.missing = None;
+                false
+            }
+            Seen::Missing => {
+                let since = *self.missing.get_or_insert(at);
+                let ask = at.saturating_sub(since) >= MISSING;
+                if ask {
+                    self.missing = Some(at);
+                }
+                ask
+            }
+            Seen::Stale => {
+                self.missing = None;
+                let ask = at >= self.next;
+                if ask {
+                    self.backoff = (self.backoff * 2).min(SLOWEST);
+                    self.next = at + self.backoff;
+                }
+                ask
+            }
+        }
+    }
+}
+
+/// Notes the session the member's Claude (process `pid`) runs: read in Claude's own file in the profile, else in
+/// what the dashboard last wrote while it looks, else asked to `claude agents` (by name and folder) when [`Pace`]
+/// says so. True when it asked.
+fn note_session(snapshot: &Snapshot, state: &Path, info: &MemberInfo, pid: u32, pace: &mut Pace, at: Duration) -> bool {
+    // Claude's own file first (a file read, its process by construction), then what the dashboard wrote.
+    let seen = match claude::session_id(snapshot.config_dir.as_deref(), pid) {
+        Some(id) => Seen::Session(id),
+        None => seen(board::fresh_states(state).as_ref(), &info.name, pid),
+    };
+    let ask = pace.ask(&seen, at);
+    let id = match seen {
+        Seen::Session(id) => Some(id),
+        _ if ask => asked(snapshot, info),
+        _ => None,
+    };
+    if let Some(id) = id {
+        note(state, &info.name, &id);
+    }
+    ask
+}
+
+/// The session the member runs, as `claude agents` says it.
+fn asked(snapshot: &Snapshot, info: &MemberInfo) -> Option<String> {
+    let running = claude::running(&snapshot.claude, snapshot.config_dir.as_deref()).ok()?;
     let here = |r: &&claude::Running| {
         r.name.as_deref() == Some(info.name.as_str()) && r.cwd.as_deref().map(Path::new) == Some(snapshot.dir.as_path())
     };
-    if let Some(id) = running.iter().find(here).and_then(|r| r.session_id.as_deref()) {
-        let file = session_file(state, &info.name);
-        if fs::read_to_string(&file).ok().as_deref() != Some(id) {
-            let _ = fs::create_dir_all(file.parent().expect("a file in a folder"));
-            let _ = fs::write(&file, id);
-        }
+    running.into_iter().find(|r| here(&r)).and_then(|r| r.session_id)
+}
+
+/// Notes `id` as the member's session, if it is not already.
+fn note(state: &Path, member: &str, id: &str) {
+    let file = session_file(state, member);
+    if fs::read_to_string(&file).ok().as_deref() != Some(id) {
+        let _ = fs::create_dir_all(file.parent().expect("a file in a folder"));
+        let _ = fs::write(&file, id);
     }
 }
 
@@ -190,6 +289,33 @@ fn session_file(state: &Path, member: &str) -> PathBuf {
 pub fn noted(state: &Path, member: &str) -> Option<String> {
     let id = fs::read_to_string(session_file(state, member)).ok()?;
     Some(id.trim().to_string()).filter(|id| !id.is_empty())
+}
+
+/// The command line of the first start: on the conversation last noted (`resume`), else as launched. Launched on a
+/// conversation (`-r <id>`: a launch that resumes, after a crash, from recruit 1), that one is noted; launched
+/// afresh, the noted one is forgotten. Either way, a Claude that stops before its own is noted starts again where it
+/// started, not on an older conversation, nor afresh.
+fn first_argv(snapshot: &Snapshot, state: &Path, info: &MemberInfo, resume: bool) -> Vec<String> {
+    if resume {
+        return resumed(snapshot, state, info);
+    }
+    match resumes(&info.argv) {
+        Some(id) => note(state, &info.name, id),
+        None => {
+            let _ = fs::remove_file(session_file(state, &info.name));
+        }
+    }
+    info.argv.clone()
+}
+
+/// The conversation a command line resumes: the `-r <id>` right after `-n <name>`, where `claude::Start::argv` and
+/// [`resume_argv`] put it (one in the team's or the member's own arguments, before `-n`, is not recruit's).
+fn resumes(argv: &[String]) -> Option<&str> {
+    let n = argv.iter().rposition(|a| a == "-n")?;
+    match argv.get(n + 2..n + 4)? {
+        [flag, id] if flag == "-r" && !id.is_empty() => Some(id.as_str()),
+        _ => None,
+    }
 }
 
 /// The member's command line on the session it last ran; as launched when that session never got a word (no
@@ -216,6 +342,144 @@ mod tests {
 
     fn strings(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_session_is_read_where_the_dashboard_wrote_it_for_this_claude() {
+        let mut states = board::States::default();
+        assert_eq!(seen(None, "dev", 7), Seen::Stale, "the dashboard does not look");
+        assert_eq!(seen(Some(&states), "dev", 7), Seen::Missing, "not seen yet");
+        states.sessions.insert("dev".into(), board::Session { id: "s-1".into(), pid: Some(7) });
+        assert_eq!(seen(Some(&states), "dev", 7), Seen::Session("s-1".into()));
+        assert_eq!(seen(Some(&states), "dev", 8), Seen::Missing, "the Claude before: not its conversation");
+        assert_eq!(seen(Some(&states), "qa", 7), Seen::Missing);
+        states.sessions.insert("dev".into(), board::Session { id: "s-1".into(), pid: None });
+        assert_eq!(seen(Some(&states), "dev", 7), Seen::Missing, "no process said: not sure");
+    }
+
+    #[test]
+    fn claude_agents_is_asked_only_when_the_dashboard_cannot_tell() {
+        let s = Duration::from_secs;
+        let session = Seen::Session("s".into());
+        // The dashboard looks and notes it: a file read every 2 s, never an ask.
+        let mut pace = Pace::new();
+        assert!((1..=200).all(|i| !pace.ask(&session, s(2 * i))));
+        // It does not look: at 2 s, then 4, 8, 16, 32, then a minute apart.
+        let mut pace = Pace::new();
+        let asks: Vec<u64> =
+            (1..=100).map(|i| s(2 * i)).filter(|at| pace.ask(&Seen::Stale, *at)).map(|at| at.as_secs()).collect();
+        assert_eq!(asks, [2, 6, 14, 30, 62, 122, 182]);
+        // One stale read amid fresh ones does not ask at once: its own pace.
+        let mut pace = Pace::new();
+        assert!(pace.ask(&Seen::Stale, s(2)));
+        assert!(!pace.ask(&session, s(4)));
+        assert!(!pace.ask(&Seen::Stale, s(5)));
+        assert!(pace.ask(&Seen::Stale, s(6)));
+        // It looks without noting it: an ask once it has been missing a minute, then a minute later.
+        let mut pace = Pace::new();
+        let asks: Vec<u64> =
+            (1..=70).map(|i| s(2 * i)).filter(|at| pace.ask(&Seen::Missing, *at)).map(|at| at.as_secs()).collect();
+        assert_eq!(asks, [62, 122]);
+        // Found meanwhile: the minute starts over.
+        let mut pace = Pace::new();
+        assert!(!pace.ask(&Seen::Missing, s(2)));
+        assert!(!pace.ask(&session, s(50)));
+        assert!(!pace.ask(&Seen::Missing, s(70)));
+        assert!(pace.ask(&Seen::Missing, s(130)));
+    }
+
+    #[test]
+    fn a_fresh_states_file_spares_claude_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        // `claude agents` fails here (a missing executable): asked, it notes nothing. A profile of its own, without
+        // Claude's file: the fallbacks.
+        let profile = tempfile::tempdir().unwrap();
+        let snapshot = Snapshot {
+            claude: "/nonexistent/claude".into(),
+            dir: "/".into(),
+            config_dir: Some(profile.path().into()),
+            ..Default::default()
+        };
+        let info = MemberInfo { name: "dev".into(), ..Default::default() };
+        let mut pace = Pace::new();
+        let at = Duration::from_secs(2);
+        assert!(note_session(&snapshot, state, &info, 7, &mut pace, at), "no file: asked");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let mut states = board::States { at: now, ..Default::default() };
+        states.sessions.insert("dev".into(), board::Session { id: "s-2".into(), pid: Some(7) });
+        let write =
+            |states: &board::States| fs::write(state.join(board::STATES), serde_json::to_string(states).unwrap());
+        write(&states).unwrap();
+        assert!(!note_session(&snapshot, state, &info, 7, &mut pace, at * 2));
+        assert_eq!(noted(state, "dev").as_deref(), Some("s-2"));
+        // Another Claude's entry: not noted.
+        assert!(!note_session(&snapshot, state, &info, 8, &mut pace, at * 3));
+        assert_eq!(noted(state, "dev").as_deref(), Some("s-2"));
+        // Too old: the dashboard no longer looks; not noted from it.
+        states.at = now - board::FRESH - 5;
+        states.sessions.insert("dev".into(), board::Session { id: "s-3".into(), pid: Some(7) });
+        write(&states).unwrap();
+        note_session(&snapshot, state, &info, 7, &mut pace, at * 4);
+        assert_eq!(noted(state, "dev").as_deref(), Some("s-2"), "kept");
+        // Claude's own file: first, whatever the dashboard says, and never an ask.
+        let sessions = profile.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("7.json"), r#"{"pid":7,"sessionId":"s-4","cwd":"/","name":"dev","status":"idle"}"#)
+            .unwrap();
+        assert!(!note_session(&snapshot, state, &info, 7, &mut pace, at * 50));
+        assert_eq!(noted(state, "dev").as_deref(), Some("s-4"));
+        // Another process's file: not its session.
+        fs::write(sessions.join("9.json"), r#"{"pid":8,"sessionId":"s-5"}"#).unwrap();
+        states.at = now;
+        write(&states).unwrap();
+        note_session(&snapshot, state, &info, 9, &mut pace, at * 51);
+        assert_eq!(noted(state, "dev").as_deref(), Some("s-4"));
+    }
+
+    #[test]
+    fn a_fresh_start_forgets_the_conversation_noted() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let profile = tempfile::tempdir().unwrap();
+        let snapshot = Snapshot { dir: "/w".into(), config_dir: Some(profile.path().into()), ..Default::default() };
+        let launched = strings(&["claude", "-n", "dev", "--append-system-prompt-file", "/p/01.md"]);
+        let info = MemberInfo { name: "dev".into(), argv: launched.clone(), ..Default::default() };
+        // A conversation noted, that said something.
+        note(state, "dev", "old");
+        let transcript = claude::transcript(&snapshot.dir, snapshot.config_dir.as_deref(), "old");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, "{}\n").unwrap();
+        assert_eq!(first_argv(&snapshot, state, &info, true), strings(&["claude", "-n", "dev", "-r", "old"]));
+        assert_eq!(noted(state, "dev").as_deref(), Some("old"), "resumed: kept");
+        // Afresh: forgotten, so that a quick stop starts afresh again.
+        assert_eq!(first_argv(&snapshot, state, &info, false), launched);
+        assert_eq!(noted(state, "dev"), None);
+        assert_eq!(resumed(&snapshot, state, &info), launched);
+        // Launched on a conversation (`--resume`, after a crash): that one noted, so that a quick stop resumes it.
+        let on = strings(&["claude", "--model", "opus", "-n", "dev", "-r", "old2"]);
+        let info = MemberInfo { argv: on.clone(), ..info };
+        let transcript = claude::transcript(&snapshot.dir, snapshot.config_dir.as_deref(), "old2");
+        fs::write(&transcript, "{}\n").unwrap();
+        assert_eq!(first_argv(&snapshot, state, &info, false), on);
+        assert_eq!(noted(state, "dev").as_deref(), Some("old2"));
+        assert_eq!(resumed(&snapshot, state, &info), on);
+    }
+
+    #[test]
+    fn the_conversation_a_command_line_resumes() {
+        let argv = |list: &[&str]| strings(list);
+        assert_eq!(resumes(&argv(&["claude", "-n", "dev", "-r", "id-1"])), Some("id-1"));
+        assert_eq!(
+            resumes(&resume_argv(&argv(&["claude", "-n", "dev", "--append-system-prompt-file", "/p"]), "id-2")),
+            Some("id-2")
+        );
+        // Afresh, a `-r` in the team's own arguments, a name without anything after, a bare `-r`: none.
+        assert_eq!(resumes(&argv(&["claude", "-n", "dev", "--append-system-prompt-file", "/p"])), None);
+        assert_eq!(resumes(&argv(&["claude", "-r", "x", "-n", "dev", "--append-system-prompt-file", "/p"])), None);
+        assert_eq!(resumes(&argv(&["claude", "-n", "dev"])), None);
+        assert_eq!(resumes(&argv(&["claude", "-n", "dev", "-r"])), None);
+        assert_eq!(resumes(&argv(&["claude"])), None);
     }
 
     #[test]

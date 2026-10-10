@@ -570,7 +570,8 @@ pub fn prompt(state: &Path, member: &str) -> Result<String> {
 }
 
 /// Older than this, in seconds, what the dashboard wrote is no longer what runs: the refs change rarely, at a
-/// member's restart.
+/// member's restart. Longer than `board::FRESH` on purpose: refs lost to a slow look would change the team's note,
+/// sent again to every member at its next message.
 const STALE: i64 = 10;
 
 /// The exact addresses of the members whose name another session carries too, as the dashboard saw them a moment ago;

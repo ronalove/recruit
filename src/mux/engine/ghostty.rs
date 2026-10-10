@@ -89,7 +89,8 @@ pub(super) struct Ghostty {
     sniffer: Sniffer,
     relays: Vec<Relay>,
     /// The program asked whether program statuses are taken (`OSC 7501 ; ?`) and was told yes: its statuses count
-    /// until it clears them, or until a reset. A shell replaying old output does not set a status.
+    /// until `recruit _member` says it left (`state=clear:app=recruit`), or until a reset. A shell replaying old
+    /// output does not set a status.
     armed: bool,
     /// While the program holds a synchronized update: until when the frame stays as it was.
     sync_until: Option<Instant>,
@@ -274,8 +275,12 @@ impl Ghostty {
                 replies.extend(b"\x1b]7501;?\x1b\\");
                 self.armed = true;
             }
+            // One of its tasks (Claude Code: a sub-agent, `clear` when it ends): the pane's state is the program's.
+            Sniffed::Status(status) if status.id.is_some() => {}
             Sniffed::Status(status) if self.armed => {
-                self.armed = status.state != State::Clear;
+                // Claude Code's own `clear` (no `app`) may come with its statuses going on after it.
+                let left = status.state == State::Clear && status.app.as_deref() == Some("recruit");
+                self.armed = !left;
                 self.relays.push(Relay::Status(status));
             }
             Sniffed::Status(_) => {}
@@ -854,10 +859,27 @@ mod tests {
         answer(&mut engine, b"\x1b]7501;?\x1b\\");
         answer(&mut engine, working);
         assert!(matches!(&relays(&mut engine)[..], [Relay::Status(s)] if s.state == State::Working));
-        // Cleared (member.rs writes it when its Claude stops): then nothing until asked again.
-        answer(&mut engine, b"\x1b]7501;state=clear\x07");
+        // A sub-agent's, paused, then its end (Claude Code 2.1.296): not the program's state, which goes on.
+        answer(&mut engine, b"\x1b]7501;state=working:app=claude-code:id=a1b2:title=VGVzdHM=\x1b\\");
+        answer(&mut engine, b"\x1b]7501;state=blocked:app=claude-code:id=a1b2:title=VGVzdHM=\x1b\\");
+        answer(&mut engine, b"\x1b]7501;state=clear:id=a1b2\x1b\\");
+        answer(&mut engine, working);
+        assert!(matches!(&relays(&mut engine)[..], [Relay::Status(s)] if s.state == State::Working));
+        // Claude Code's own clear (on its way out, or the component that writes its status unmounted): the pane
+        // without a state, until the next.
+        answer(&mut engine, b"\x1b]7501;state=clear\x1b\\");
+        answer(&mut engine, working);
+        assert!(matches!(
+            &relays(&mut engine)[..],
+            [Relay::Status(a), Relay::Status(b)] if a.state == State::Clear && b.state == State::Working
+        ));
+        // Recruit's, once its Claude stopped (member.rs): then nothing until asked again.
+        answer(&mut engine, b"\x1b]7501;state=clear:app=recruit\x07");
         answer(&mut engine, working);
         assert!(matches!(&relays(&mut engine)[..], [Relay::Status(s)] if s.state == State::Clear));
+        answer(&mut engine, b"\x1b]7501;?\x1b\\");
+        answer(&mut engine, working);
+        assert!(matches!(&relays(&mut engine)[..], [Relay::Status(s)] if s.state == State::Working));
         // A reset too.
         answer(&mut engine, b"\x1b]7501;?\x1b\\\x1bc");
         answer(&mut engine, working);

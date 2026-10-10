@@ -9,6 +9,7 @@ use anyhow::Result;
 
 use crate::i18n::Lang;
 use crate::layout::Tab;
+use crate::look;
 use crate::mux::native::Native;
 use crate::mux::socket;
 use crate::state::{self, Snapshot};
@@ -87,6 +88,11 @@ pub struct PaneState {
     pub role: String,
     /// Its tab.
     pub window: String,
+    /// What its program last said of its state (OSC 7501); none while it says nothing, or no longer, and from a
+    /// server older than 2.0.1.
+    pub status: Option<look::State>,
+    /// Since when, in seconds since the epoch.
+    pub since: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

@@ -1477,3 +1477,455 @@ fn journal_clicks_go_to_the_member() {
     checks.done();
     team.stop();
 }
+
+// 2.0.1: sobriety of the dashboard and the OSC state that is lost. Guards from end to end, measured before the fixes
+// (`--ignored`) and normal tests once the fixes are in.
+
+/// `claude agents --json` is what costs most of a team's CPU (0.16 to 0.29 s and ~160 MB a call): with every member
+/// giving its state by OSC 7501, a team of six asks it 0.3 times a second at most (2.0.0: ~1.9). Counted by the
+/// fake `claude`'s shim over 12 s, once the team has settled; the margin is two calls and no more load makes it
+/// ask more.
+#[test]
+fn claude_agents_is_asked_seldom() {
+    const WINDOW: u64 = 12;
+    const RATE: f64 = 0.3;
+    let agents: Vec<(String, Option<&str>)> = (1..=5).map(|i| (format!("dev{i}"), None)).collect();
+    let agents: Vec<(&str, Option<&str>)> = agents.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+    let mut team = Team::new("seldom", &tables("seldom", &["lead"], &agents, ""));
+    let members = ["lead", "dev1", "dev2", "dev3", "dev4", "dev5"];
+    team.launch(&members);
+    for member in members {
+        says(&team, member, "idle");
+    }
+    // The start-up settles: the first reads of every member, the dashboard's first states.
+    std::thread::sleep(Duration::from_secs(3));
+    let begun = team.agent_calls().len();
+    let started = Instant::now();
+    std::thread::sleep(Duration::from_secs(WINDOW));
+    let calls = team.agent_calls();
+    let calls = &calls[begun.min(calls.len())..];
+    let secs = started.elapsed().as_secs_f64();
+    let limit = (RATE * secs).ceil() as usize + 2;
+    let mut by_caller = std::collections::BTreeMap::<&str, usize>::new();
+    for (_, _, caller) in calls {
+        *by_caller.entry(caller.as_str()).or_default() += 1;
+    }
+    println!(
+        "claude agents: {} calls in {secs:.1} s = {:.2}/s (limit {limit}); by caller: {by_caller:?}",
+        calls.len(),
+        calls.len() as f64 / secs
+    );
+    assert!(calls.len() <= limit, "{} calls in {secs:.1} s (at most {limit}); by caller: {by_caller:?}", calls.len());
+    team.stop();
+}
+
+/// What a pane has read of its program since it opened (`_ctl stats`), for the pane called `member`.
+fn pane_read(team: &Team, member: &str) -> u64 {
+    let stats: serde_json::Value = serde_json::from_str(&team.ctl(["stats", "--json"])).expect("stats");
+    stats["panes"]
+        .as_array()
+        .and_then(|panes| panes.iter().find(|p| p["member"] == member))
+        .and_then(|p| p["read"].as_u64())
+        .unwrap_or_else(|| panic!("no pane {member} in {stats}"))
+}
+
+/// What `claude agents` says of a member: `busy`, `idle`, `waiting`.
+fn agent_status(team: &Team, member: &str, status: &str) {
+    team.ctl(["send", "--pane", member, &format!("agent {status}\\r")]);
+}
+
+/// The dashboard writes little while three members work: the spinners turn in the cards, and only what changed
+/// is drawn again (2.0.0: the whole title line of each working card ten times a second, ~7 KB/s for twelve
+/// members). At most 1 KB/s, read from the pane's own count of bytes its program wrote, over 5 s.
+#[test]
+fn the_dashboard_writes_little() {
+    const WINDOW: u64 = 5;
+    const PER_SECOND: u64 = 1024;
+    let mut team = Team::new("quiet", &tables("quiet", &["lead"], &[("dev1", None), ("dev2", None)], ""));
+    let members = ["lead", "dev1", "dev2"];
+    team.launch(&members);
+    // Told both ways, as Claude Code does: the OSC state and what `claude agents` says.
+    for member in members {
+        says(&team, member, "working");
+        agent_status(&team, member, "busy");
+    }
+    // The cards take the new states (the server and the dashboard read them every few seconds).
+    std::thread::sleep(Duration::from_secs(3));
+    let dashboard = "Tableau de bord";
+    let (dash, journal) = (pane_read(&team, dashboard), pane_read(&team, "Journal"));
+    let started = Instant::now();
+    std::thread::sleep(Duration::from_secs(WINDOW));
+    let secs = started.elapsed().as_secs_f64();
+    let (dash, journal) = (pane_read(&team, dashboard) - dash, pane_read(&team, "Journal") - journal);
+    println!(
+        "dashboard: {dash} bytes in {secs:.1} s = {:.0} B/s (limit {PER_SECOND}); journal: {journal} bytes",
+        dash as f64 / secs
+    );
+    assert!(
+        dash as f64 <= PER_SECOND as f64 * secs,
+        "the dashboard wrote {dash} bytes in {secs:.1} s ({:.0} B/s, at most {PER_SECOND})",
+        dash as f64 / secs
+    );
+    team.stop();
+}
+
+/// The sign before `name` on its header row on `term` (the frame's top border, not a card of the dashboard).
+fn header_sign(term: &TestTerm, name: &str) -> Option<char> {
+    let wanted = format!(" {name} ");
+    term.screen().iter().find_map(|row| {
+        if !row.chars().any(|c| matches!(c, '┏' | '╭')) || !row.contains(['━', '─']) {
+            return None;
+        }
+        row[..row.find(&wanted)?].chars().last()
+    })
+}
+
+/// Whether `sign` is an image of the spinner (Braille), the sign of a member at work.
+fn is_spinner(sign: Option<char>) -> bool {
+    sign.is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+}
+
+/// Waits until the header of `name` on `term` shows (or no longer shows) a member at work.
+fn header_works(term: &TestTerm, name: &str, works: bool, timeout: Duration) -> bool {
+    wait(timeout, || is_spinner(header_sign(term, name)) == works)
+}
+
+/// Claude Code 2.1.296 writes `state=working:app=claude-code:id=<id>:title=<b64>` for a sub-agent and
+/// `state=clear:id=<id>` when it ends (the `clear` of an id is that sub-agent's, not the member's), and a bare
+/// `state=clear` when `/clear` starts a new conversation: the header must keep showing the member's own state,
+/// not « ◌ ». The fake writes no new `OSC 7501 ; ?` after the clear, as Claude Code does not.
+#[test]
+fn the_state_survives_a_clear() {
+    let mut team = Team::new("cleared", &tables("cleared", &["lead", "co"], &[], ""));
+    team.launch(&["lead", "co"]);
+    for member in ["lead", "co"] {
+        says(&team, member, "idle");
+    }
+    let term = client(&team, "lead");
+    let mut checks = Checks::default();
+    let calm = header_works(&term, "lead", false, Duration::from_secs(5))
+        && header_works(&term, "co", false, Duration::from_secs(5));
+    checks.check("both idle before", calm, || shown(&term));
+    let fails = |term: &TestTerm, member: &str| format!("sign {:?}\n{}", header_sign(term, member), shown(term));
+    // A sub-agent starts and ends, with its id: the member stays at work, at every moment.
+    says(&team, "lead", "working");
+    says(&team, "lead", "working:app=claude-code:id=a1b2");
+    let works = header_works(&term, "lead", true, Duration::from_secs(5));
+    checks.check("lead: at work", works, || fails(&term, "lead"));
+    says(&team, "lead", "clear:id=a1b2");
+    let mut steady = true;
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_millis(100));
+        steady &= is_spinner(header_sign(&term, "lead"));
+    }
+    checks.check("lead: still at work after the sub-agent's clear (with its id)", steady, || fails(&term, "lead"));
+    // The states still count after that: done, then at work again.
+    says(&team, "lead", "done");
+    let rests = header_works(&term, "lead", false, Duration::from_secs(5));
+    checks.check("lead: at rest after `done`", rests, || fails(&term, "lead"));
+    says(&team, "lead", "working");
+    let again = header_works(&term, "lead", true, Duration::from_secs(5));
+    checks.check("lead: at work again", again, || fails(&term, "lead"));
+    // A status with an id alone changes nothing: from `done`, `working:id=` stays at rest.
+    says(&team, "lead", "done");
+    header_works(&term, "lead", false, Duration::from_secs(5));
+    says(&team, "lead", "working:id=a1b2");
+    std::thread::sleep(Duration::from_millis(800));
+    checks.check("lead: a status with an id alone changes nothing", !is_spinner(header_sign(&term, "lead")), || {
+        fails(&term, "lead")
+    });
+    // The member's own `/clear` (no id): its states come after, and count.
+    says(&team, "co", "clear");
+    std::thread::sleep(Duration::from_millis(500));
+    says(&team, "co", "working");
+    let works = header_works(&term, "co", true, Duration::from_secs(5));
+    checks.check("co: at work after a bare clear", works, || fails(&term, "co"));
+    // And it follows the states after that: waiting, then idle again.
+    says(&team, "co", "blocked:kind=permission");
+    let waits = wait(Duration::from_secs(5), || header_sign(&term, "co") == Some('\u{2691}'));
+    checks.check("co: waiting after the clear", waits, || fails(&term, "co"));
+    says(&team, "co", "done");
+    let idle = header_works(&term, "co", false, Duration::from_secs(5));
+    checks.check("co: at rest again", idle, || fails(&term, "co"));
+    drop(term);
+    checks.done();
+    team.stop();
+}
+
+/// A pane that gives no state by OSC 7501 (a Claude Code that never speaks it, a shell) takes its state from the
+/// dashboard (`claude agents`): at work when it says `busy`, idle when it does not.
+#[test]
+fn a_pane_without_a_state_takes_the_dashboards() {
+    let mut team = Team::new("fallback", &tables("fallback", &["lead", "co"], &[], ""));
+    team.launch(&["lead", "co"]);
+    let term = client(&team, "lead");
+    let mut checks = Checks::default();
+    // Neither speaks OSC 7501 (the fakes never ask for it): `claude agents` is all there is.
+    for member in ["lead", "co"] {
+        agent_status(&team, member, "busy");
+    }
+    for member in ["lead", "co"] {
+        let works = header_works(&term, member, true, Duration::from_secs(12));
+        checks.check(&format!("{member}: at work by the dashboard's state"), works, || {
+            format!("sign {:?}\n{}", header_sign(&term, member), shown(&term))
+        });
+    }
+    for member in ["lead", "co"] {
+        agent_status(&team, member, "idle");
+    }
+    for member in ["lead", "co"] {
+        let idle = header_works(&term, member, false, Duration::from_secs(12));
+        checks.check(&format!("{member}: idle by the dashboard's state"), idle, || {
+            format!("sign {:?}\n{}", header_sign(&term, member), shown(&term))
+        });
+    }
+    drop(term);
+    checks.done();
+    team.stop();
+}
+
+/// A bare `clear` (OSC 7501 `state=clear`, no id) means the program gives no state any more: the pane takes the
+/// dashboard's (`claude agents`), and shows « ◌ » only when the dashboard knows nothing of the member either.
+#[test]
+fn a_bare_clear_hands_over_to_the_dashboard() {
+    let mut team = Team::new("handover", &tables("handover", &["lead", "co"], &[], ""));
+    team.launch(&["lead", "co"]);
+    let term = client(&team, "lead");
+    let mut checks = Checks::default();
+    let fails = |member: &str| format!("sign {:?}\n{}", header_sign(&term, member), shown(&term));
+    for member in ["lead", "co"] {
+        says(&team, member, "working");
+        let works = header_works(&term, member, true, Duration::from_secs(5));
+        checks.check(&format!("{member}: at work by its own state"), works, || fails(member));
+    }
+    // `lead`: `claude agents` says idle: the clear hands the pane over to it.
+    agent_status(&team, "lead", "idle");
+    says(&team, "lead", "clear");
+    let rests = wait(Duration::from_secs(12), || header_sign(&term, "lead") == Some('\u{25f7}'));
+    checks.check("lead: a bare clear, the dashboard says idle: at rest", rests, || fails("lead"));
+    // `co`: `claude agents` no longer lists it (its file is gone): nothing says anything.
+    let runs = std::fs::read_dir(team.profile.join("fake/run")).expect("run folder");
+    let run = runs
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|f| std::fs::read_to_string(f).is_ok_and(|t| t.contains("\"name\":\"co\"")))
+        .expect("co's run file");
+    std::fs::remove_file(run).expect("remove co's run file");
+    says(&team, "co", "clear");
+    let unknown = wait(Duration::from_secs(12), || header_sign(&term, "co") == Some('\u{25cc}'));
+    checks.check("co: a bare clear, the dashboard knows nothing: \u{25cc}", unknown, || fails("co"));
+    drop(term);
+    checks.done();
+    team.stop();
+}
+
+/// The session files of the fake `claude` (`<profile>/sessions/<pid>.json`, as Claude Code writes them, for
+/// `member.rs`): the keys it reads, the status following `claude agents`, and none when the team goes without.
+#[test]
+fn the_fake_writes_its_session_file() {
+    let sessions = |team: &Team, name: &str| -> Option<serde_json::Value> {
+        let files = std::fs::read_dir(team.profile.join("sessions")).ok()?;
+        files
+            .filter_map(|e| {
+                serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(e.ok()?.path()).ok()?).ok()
+            })
+            .find(|v| v["name"] == name)
+    };
+    let mut team = Team::new("sessfile", &tables("sessfile", &["lead"], &[("dev", None)], ""));
+    team.launch(&["lead", "dev"]);
+    let file = sessions(&team, "dev").expect("dev's session file");
+    let (pid, session) = (file["pid"].as_u64().unwrap_or_default(), file["sessionId"].as_str().unwrap_or_default());
+    assert!(pid > 1 && session.starts_with("fake-"), "{file}");
+    assert!(file["cwd"].is_string() && file["status"] == "idle" && file["statusUpdatedAt"].is_u64(), "{file}");
+    assert!(team.profile.join(format!("sessions/{pid}.json")).exists());
+    agent_status(&team, "dev", "busy");
+    assert!(wait(Duration::from_secs(3), || sessions(&team, "dev").is_some_and(|f| f["status"] == "busy")));
+    team.stop();
+    let mut team = Team::new("nosess", &tables("nosess", &["lead"], &[], ""));
+    team.without_session_files();
+    team.launch(&["lead"]);
+    assert!(sessions(&team, "lead").is_none(), "a session file despite the marker");
+    team.stop();
+}
+
+/// `member.rs` notes its Claude's session (`<state>/sessions/<member>`) from Claude Code's own file in the profile
+/// (`sessions/<pid>.json`), asking `claude agents` for nothing; without that file it falls back to `claude agents`.
+#[test]
+fn a_member_notes_its_session() {
+    let from_members = |team: &Team| team.agent_calls().iter().filter(|c| c.2.starts_with("_member")).count();
+    // With the file: noted, and no call of `claude agents` from any `_member`.
+    let mut team = Team::new("noted", &tables("noted", &["lead"], &[("dev", None)], ""));
+    team.launch(&["lead", "dev"]);
+    assert!(wait(Duration::from_secs(8), || team.state().join("sessions/dev").exists()), "dev's session never noted");
+    let session = std::fs::read_to_string(team.state().join("sessions/dev")).unwrap_or_default();
+    assert!(session.trim().starts_with("fake-"), "{session:?}");
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(from_members(&team), 0, "{:?}", team.agent_calls());
+    team.stop();
+    // Without it: noted all the same, through `claude agents`.
+    let mut team = Team::new("fallbk", &tables("fallbk", &["lead"], &[("dev", None)], ""));
+    team.without_session_files();
+    team.launch(&["lead", "dev"]);
+    assert!(wait(Duration::from_secs(10), || team.state().join("sessions/dev").exists()), "dev's session never noted");
+    let session = std::fs::read_to_string(team.state().join("sessions/dev")).unwrap_or_default();
+    assert!(session.trim().starts_with("fake-"), "{session:?}");
+    team.stop();
+}
+
+/// A dashboard of this build in front of a server of the 2.0.0 (`OLD_RECRUIT=<a 2.0.0 binary>`: its `Panes` has no
+/// `status`): it must not break, and fall back to asking `claude agents` once a second, no more. The server has no
+/// dashboard of its own (`dashboard = false`), so the only `_panel dashboard` is this one.
+#[test]
+#[ignore = "needs OLD_RECRUIT=<a 2.0.0 binary>: run with --ignored"]
+fn the_dashboard_in_front_of_an_old_server() {
+    let old = std::env::var_os("OLD_RECRUIT").expect("OLD_RECRUIT: the path of a 2.0.0 binary");
+    let mut team = Team::new("oldsrv", &tables("oldsrv", &["lead"], &[("dev", None)], "dashboard = false"));
+    team.use_binary(std::path::Path::new(&old));
+    team.launch(&["lead", "dev"]);
+    // Members that say their state by OSC: with a new server nothing would be asked every second.
+    says(&team, "lead", "working");
+    says(&team, "dev", "idle");
+    let new = team.root.join("recruit-new");
+    std::fs::copy(env!("CARGO_BIN_EXE_recruit"), &new).expect("copy of this build");
+    let state = team.state().to_string_lossy().into_owned();
+    let term = team.in_terminal_of(&new, &["_panel", "dashboard", &state], 60, 20, Profile::default());
+    let started = Instant::now();
+    assert!(term.wait_for("lead", Duration::from_secs(8)), "the dashboard shows no member: {:?}", term.screen());
+    std::thread::sleep(Duration::from_secs(8));
+    let secs = started.elapsed().as_secs_f64();
+    let mine: Vec<_> = team.agent_calls().into_iter().filter(|c| c.2 == "_panel dashboard").collect();
+    println!(
+        "old server: {} calls of `_panel dashboard` in {secs:.1} s = {:.2}/s",
+        mine.len(),
+        mine.len() as f64 / secs
+    );
+    assert!(mine.len() as f64 <= secs * 1.3 + 2.0, "more than once a second: {} in {secs:.1} s", mine.len());
+    assert!(mine.len() >= 3, "far less than once a second: {} in {secs:.1} s", mine.len());
+    assert!(term.screen().iter().any(|r| r.contains("lead")), "{:?}", term.screen());
+    drop(term);
+    team.stop();
+}
+
+/// A launch that resumes (`--resume`): a member whose Claude stops at once, before it writes its own session file
+/// (a failed start), is started again on the same conversation, not afresh.
+#[test]
+fn a_resumed_member_that_stops_at_once_comes_back_on_its_conversation() {
+    let mut team = Team::new("resumes", &tables("resumes", &["lead"], &[("dev", None)], ""));
+    let said = serde_json::json!({"type": "user", "message": {"content": "earlier"}}).to_string();
+    team.seed_conversation("lead", "old-lead", std::slice::from_ref(&said));
+    team.seed_conversation("dev", "old-dev", std::slice::from_ref(&said));
+    team.die_once("dev");
+    team.launch_with(&["--detach", "--resume"], &["lead"]);
+    assert!(
+        wait(Duration::from_secs(12), || team.launches("dev").len() >= 2),
+        "dev never came back: {:?} {:?}",
+        team.launches("dev"),
+        team.capture("dev")
+    );
+    let starts = team.launches("dev");
+    assert!(starts[0].ends_with("-n dev -r old-dev") || starts[0].contains("-r old-dev"), "first start: {}", starts[0]);
+    assert!(starts[1].contains("-n dev") && starts[1].contains("-r old-dev"), "not on its conversation: {}", starts[1]);
+    assert!(team.wait_pane("dev", "FAKE CLAUDE dev old-dev", Duration::from_secs(5)), "{:?}", team.capture("dev"));
+    assert!(team.launches("lead")[0].contains("-r old-lead"), "{:?}", team.launches("lead"));
+    team.stop();
+}
+
+/// A `states.json` left by the launch before (still fresh, as after `recruit --restart` of a team that was
+/// running), with sessions, processes and addresses of members that are gone, and a transcript with a message:
+/// none of it survives the launch, in the members' starts, the dashboard's file or the journal.
+#[test]
+fn a_states_file_from_before_is_not_kept() {
+    let mut team = Team::new("yesterday", &tables("yesterday", &["lead"], &[("dev", None)], ""));
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let stale = serde_json::json!({"type": "assistant", "timestamp": "2026-10-09T10:00:00.000Z",
+        "message": {"content": [{"type": "tool_use", "name": "SendMessage",
+            "input": {"to": "lead", "summary": "stale-message-xyz", "message": "stale-message-xyz"}}]}})
+    .to_string();
+    team.seed_conversation("ghost", "ghost-session", &[stale]);
+    let before = serde_json::json!({
+        "at": now, "members": {}, "absent": [],
+        "refs": {"dev": "dev [ghost-ref]"},
+        "sessions": {"dev": {"id": "ghost-session", "pid": 99999}, "lead": {"id": "ghost-session", "pid": 99998}},
+        "pids": {"99999": "dev", "99998": "lead"},
+    });
+    std::fs::create_dir_all(team.state()).expect("state folder");
+    std::fs::write(team.state().join("states.json"), before.to_string()).expect("old states.json");
+    team.launch(&["lead", "dev"]);
+    for member in ["lead", "dev"] {
+        let starts = team.launches(member);
+        assert!(!starts[0].contains("ghost-session"), "{member} started on the old session: {}", starts[0]);
+    }
+    // The dashboard writes its own file; wait for one that is not the old one's.
+    let file = team.state().join("states.json");
+    let rewritten = wait(Duration::from_secs(10), || {
+        std::fs::read_to_string(&file).is_ok_and(|t| {
+            serde_json::from_str::<serde_json::Value>(&t).is_ok_and(|v| v["at"].as_u64().unwrap_or(0) > now + 1)
+        })
+    });
+    assert!(rewritten, "the dashboard never wrote its states: {:?}", std::fs::read_to_string(&file));
+    std::thread::sleep(Duration::from_secs(6));
+    let text = std::fs::read_to_string(&file).expect("states.json");
+    for old in ["ghost-session", "ghost-ref", "99999", "99998"] {
+        assert!(!text.contains(old), "states.json still carries {old}: {text}");
+    }
+    let journal = team.capture("Journal").join("\n");
+    assert!(!journal.contains("stale-message-xyz"), "{journal}");
+    team.stop();
+}
+
+/// A reading, not a guard: the composed text of the dashboard's pane for a team of fakes in a fixed state, written to
+/// `$DUMP_OUT` (run it with two binaries, `RECRUIT_BIN`, and compare, the times apart).
+#[test]
+#[ignore = "a reading: DUMP_OUT=<file> cargo test --test mux_team dashboard_capture_dump -- --ignored"]
+fn dashboard_capture_dump() {
+    let out = std::env::var_os("DUMP_OUT").expect("DUMP_OUT");
+    let mut team = Team::new("dump", &tables("dump", &["lead"], &[("dev1", None), ("dev2", None), ("dev3", None)], ""));
+    team.launch(&["lead", "dev1", "dev2", "dev3"]);
+    for (member, osc, agent) in [
+        ("lead", "working", "busy"),
+        ("dev1", "idle", "idle"),
+        ("dev2", "blocked:kind=permission", "waiting"),
+        ("dev3", "idle", "idle"),
+    ] {
+        says(&team, member, osc);
+        agent_status(&team, member, agent);
+    }
+    let _term = client(&team, "lead");
+    std::thread::sleep(Duration::from_secs(9));
+    let text = team.capture("Tableau de bord").join("\n");
+    std::fs::write(out, format!("{text}\n")).expect("dump");
+    team.stop();
+}
+
+/// The passage the release notes promise: a team running under the 2.0.0 (`OLD_RECRUIT=<a 2.0.0 binary>`), its members
+/// having noted their sessions, then `recruit --restart --resume` with this build. The old server ends, a new one
+/// runs, and each member is on its conversation again (`-r <id>`), the 2.0.0's `states.json` still there.
+#[test]
+#[ignore = "needs OLD_RECRUIT=<a 2.0.0 binary>: run with --ignored"]
+fn a_team_of_the_2_0_0_passes_to_this_build() {
+    let old = std::env::var_os("OLD_RECRUIT").expect("OLD_RECRUIT: the path of a 2.0.0 binary");
+    let mut team = Team::new("passage", &tables("passage", &["lead"], &[("dev", None)], ""));
+    team.use_binary(std::path::Path::new(&old));
+    team.launch(&["lead", "dev"]);
+    let sessions: Vec<(&str, String)> = ["lead", "dev"].iter().map(|m| (*m, noted(&team, m))).collect();
+    let before = team.ctl(["where"]);
+    let states = std::fs::read_to_string(team.state().join("states.json")).unwrap_or_default();
+    println!("2.0.0 server: {}\nstates.json from the 2.0.0: {} bytes", before.trim(), states.len());
+    // This build now.
+    team.use_binary(std::path::Path::new(env!("CARGO_BIN_EXE_recruit")));
+    let out = team.recruit(["--restart", "--resume", "--detach"]);
+    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let after = team.ctl(["where"]);
+    println!("new server: {}", after.trim());
+    assert_ne!(before.trim(), after.trim(), "the server is the old one");
+    for (member, id) in &sessions {
+        assert!(
+            wait(Duration::from_secs(12), || team.launches(member).len() >= 2),
+            "{member} not started again: {:?}",
+            team.launches(member)
+        );
+        let again = team.launches(member).last().cloned().unwrap_or_default();
+        assert!(again.contains(&format!("-r {id}")), "{member} not on {id}: {again}");
+        println!("{member}: {again}");
+    }
+    team.stop();
+}

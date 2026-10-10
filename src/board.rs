@@ -16,13 +16,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use crossterm::style::{Color, Stylize};
-use crossterm::terminal::{self, ClearType};
-use crossterm::{cursor, queue};
+use crossterm::{cursor, queue, terminal};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::Pane;
 use crate::bridge::{Helper, HelperStatus, Report, Task};
-use crate::canvas::PanicGuard;
+use crate::canvas::{Canvas, Features, Painter, PanicGuard, Style};
 use crate::claude::{self, Running};
 use crate::config::write_atomic;
 use crate::i18n::Lang;
@@ -146,7 +145,7 @@ const WHOLE_EVERY: Duration = Duration::from_secs(30);
 const CLOCK_JUMP: i64 = 5;
 
 /// The members' sessions by name, and every session's name by process: replies are addressed to a process.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Sessions {
     members: HashMap<String, Running>,
     by_pid: HashMap<u32, String>,
@@ -157,7 +156,45 @@ struct Sessions {
     /// The members at rest while a command they started still runs (see [`at_rest_with_a_command`]), and since when,
     /// when their file says it.
     shell: HashMap<String, Option<i64>>,
+    /// The states the members' panes tell (OSC 7501), and since when in seconds since the epoch: they come before
+    /// `claude agents`, which says them only once asked.
+    told: HashMap<String, (State, Option<u64>)>,
+    /// Until `claude agents` first answers: the states file as it was, whose exact addresses, sessions and processes
+    /// are written again rather than emptied (a dashboard started again would change the team's note for a second).
+    kept: Option<Box<States>>,
     error: Option<String>,
+}
+
+/// The states file to keep writing until `claude agents` first answers: only one a dashboard wrote moments ago (one
+/// started again); not an older one, a launch before's, whose sessions and addresses are no longer.
+fn kept(state: &Path) -> Option<Box<States>> {
+    read_states(state).filter(|states| states.fresh(now())).map(Box::new)
+}
+
+/// How often the dashboard asks `claude agents` while each member's pane tells its state: for the sessions (the
+/// journal's transcripts, the session a member resumes), the names in use elsewhere and the processes.
+const AGENTS_EVERY: Duration = Duration::from_secs(5);
+
+/// The members' states as their panes tell them (OSC 7501), by name; none when the server could not be asked.
+fn told(panes: Option<&[backend::PaneState]>) -> HashMap<String, (State, Option<u64>)> {
+    let members = panes.unwrap_or_default().iter().filter(|pane| pane.role.is_empty());
+    members.filter_map(|pane| Some((pane.member.clone(), (pane.status?, pane.since)))).collect()
+}
+
+/// A member whose pane says it is at rest may have a command still running (its pane says `idle` then, its session's
+/// file `shell`): read in its file, by the process `claude agents` last gave. Its pane says it works: no command shown.
+fn with_a_command(found: &mut Sessions, status: impl Fn(u32) -> Option<claude::SessionFile>) {
+    for (name, (state, _)) in &found.told {
+        if *state != State::Idle {
+            found.shell.remove(name);
+            continue;
+        }
+        let file = found.members.get(name).and_then(|session| session.pid).and_then(&status);
+        match file.filter(|file| file.status == "shell") {
+            Some(file) => found.shell.insert(name.clone(), file.since),
+            None => found.shell.remove(name),
+        };
+    }
 }
 
 /// The sessions as `claude agents` gives them; with the exact addresses of the members whose name another session
@@ -236,6 +273,46 @@ fn sorted(s: &Snapshot, running: Vec<Running>) -> Sessions {
     found
 }
 
+impl Sessions {
+    /// `states` with these sessions: each member's, every one's name by process, and the exact addresses of the
+    /// members whose name another session carries too; until `claude agents` answers, those of the file as it was.
+    fn written(&self, states: States) -> States {
+        if let Some(kept) = &self.kept {
+            let (refs, sessions, pids) = (kept.refs.clone(), kept.sessions.clone(), kept.pids.clone());
+            return States { refs, sessions, pids, ..states };
+        }
+        let sessions = self.members.iter().filter_map(|(name, running)| {
+            let id = running.session_id.clone()?;
+            Some((name.clone(), Session { id, pid: running.pid }))
+        });
+        States {
+            sessions: sessions.collect(),
+            pids: self.by_pid.iter().map(|(pid, name)| (*pid, name.clone())).collect(),
+            refs: self.refs.clone(),
+            ..states
+        }
+    }
+
+    /// The sessions as the dashboard wrote them in `states`, for the journal: the members' ids and processes, and every
+    /// one's name by process. None from a dashboard older than 2.0.1, which wrote members without their sessions.
+    fn of(states: States) -> Option<Sessions> {
+        if states.sessions.is_empty() && !states.members.is_empty() {
+            return None;
+        }
+        let members = states.sessions.into_iter().map(|(name, session)| {
+            let running = Running {
+                name: Some(name.clone()),
+                cwd: None,
+                status: None,
+                session_id: Some(session.id),
+                pid: session.pid,
+            };
+            (name, running)
+        });
+        Some(Sessions { members: members.collect(), by_pid: states.pids.into_iter().collect(), ..Default::default() })
+    }
+}
+
 /// How far back the activity curves go, in seconds.
 const HISTORY: i64 = 30 * 60;
 /// From no activity to all the time.
@@ -302,18 +379,53 @@ fn dashboard(first: &Snapshot, state: &Path) -> Result<()> {
     queue!(out, cursor::Hide)?;
     let redraw = Arc::new(AtomicBool::new(false));
     let _quiet = quiet_input(Arc::clone(&redraw));
+    // Whether a member's pane does not tell its state: `claude agents` is then asked each second.
+    let eager = &AtomicBool::new(true);
     std::thread::scope(|scope| {
-        // `claude agents --json` takes a tenth of a second or more: asked on the side, it does not stall the spinners.
+        // `claude agents --json` takes a tenth of a second or more, and far more on a loaded machine: asked on the side,
+        // it stalls neither the spinners nor the looks of each second.
+        let (found, agents) = mpsc::channel();
+        scope.spawn(move || {
+            let mut s = first.clone();
+            loop {
+                reread(&mut s, state);
+                let asked = Instant::now();
+                if found.send(sessions(&s, Some(state))).is_err() {
+                    break;
+                }
+                // Again in a while; each second while a member's pane does not tell its state.
+                while asked.elapsed() < AGENTS_EVERY && !eager.load(Ordering::Relaxed) {
+                    std::thread::sleep(TICK);
+                }
+                if eager.load(Ordering::Relaxed) {
+                    std::thread::sleep(TICK);
+                }
+            }
+        });
+        // Each second, the states as the members' panes tell them (one question to the server), with what `claude
+        // agents` last said: the states file is written each second, however long `claude agents` takes.
         let (sender, news) = mpsc::channel();
         scope.spawn(move || {
             // The clients asked at each look: one can attach again from another terminal.
             let backend = backend::of(first);
             let clients = || backend.client_terminals(&first.session);
             let mut s = first.clone();
+            // The first look waits a moment for `claude agents`, no more: the panes' states are enough to draw.
+            let mut last = match agents.recv_timeout(TICK) {
+                Ok(found) => found,
+                Err(RecvTimeoutError::Timeout) => Sessions { kept: kept(state), ..Default::default() },
+                Err(RecvTimeoutError::Disconnected) => return,
+            };
             loop {
                 reread(&mut s, state);
-                let look = (sessions(&s, Some(state)), Glyphs::of(&clients()));
-                if sender.send((s.clone(), look)).is_err() {
+                while let Ok(found) = agents.try_recv() {
+                    last = found;
+                }
+                let panes = backend.panes(&s.session).ok();
+                let mut sessions = Sessions { told: told(panes.as_deref()), ..last.clone() };
+                eager.store(s.members.iter().any(|m| !sessions.told.contains_key(&m.name)), Ordering::Relaxed);
+                with_a_command(&mut sessions, |pid| claude::session_status(s.config_dir.as_deref(), pid));
+                if sender.send((s.clone(), (sessions, Glyphs::of(&clients())))).is_err() {
                     break;
                 }
                 std::thread::sleep(TICK);
@@ -341,8 +453,8 @@ fn dashboard(first: &Snapshot, state: &Path) -> Result<()> {
                 board = Board { glyphs, ..memory.board(&s, state, &sessions) };
                 // A look that failed says nothing of the states: left to age, the file sends the menu to ask itself.
                 if board.error.is_none() {
-                    let refs = sessions.refs.clone();
-                    let _ = states.send(States { refs, ..memory.states(&board, SystemTime::now(), Instant::now()) });
+                    let seen = memory.states(&board, SystemTime::now(), Instant::now());
+                    let _ = states.send(sessions.written(seen));
                 }
             }
             for card in &mut board.cards {
@@ -416,6 +528,8 @@ impl Memory {
             members: members.collect(),
             absent: board.absent.clone(),
             refs: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+            pids: BTreeMap::new(),
         }
     }
 
@@ -432,12 +546,16 @@ impl Memory {
         }
         // The contacts first, as in the tabs.
         let members = s.members.iter().filter(|m| m.contact).chain(s.members.iter().filter(|m| !m.contact));
+        // Since when a member's pane says its state, counted back from this moment.
+        let at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         for member in members {
-            let Some(session) = sessions.members.get(&member.name) else {
+            let session = sessions.members.get(&member.name);
+            let told = sessions.told.get(&member.name);
+            if session.is_none() && told.is_none() {
                 board.absent.push(member.name.clone());
                 continue;
-            };
-            if let Some(id) = &session.session_id {
+            }
+            if let Some(id) = session.and_then(|session| session.session_id.as_ref()) {
                 if let Some((old, _)) = self.sessions.get(id).filter(|(old, _)| *old != member.name) {
                     let old = old.clone();
                     if let Some(since) = self.since.remove(&old) {
@@ -449,10 +567,18 @@ impl Memory {
                 }
                 self.sessions.insert(id.clone(), (member.name.clone(), seen));
             }
-            let st = State::of(session.status.as_deref().unwrap_or_default());
+            // As its pane tells it, else as `claude agents` last said.
+            let st = match told {
+                Some((st, _)) => *st,
+                None => State::of(session.and_then(|s| s.status.as_deref()).unwrap_or_default()),
+            };
             let entry = self.since.entry(member.name.clone()).or_insert((st, seen));
             if entry.0 != st {
                 *entry = (st, seen);
+            }
+            if let Some((_, Some(since))) = told {
+                let back = Duration::from_millis(at.saturating_sub(since.saturating_mul(1000)));
+                entry.1 = seen.checked_sub(back).unwrap_or(seen);
             }
             // At rest with a command running: since its file says, a panel opened again included.
             if let Some(Some(at)) = sessions.shell.get(&member.name).filter(|_| st == State::Idle) {
@@ -503,25 +629,35 @@ impl Memory {
     }
 }
 
-/// What the pane shows, so that a frame writes only the lines that changed: with the spinners turning ten times a
-/// second, rewriting the whole board each time would keep the multiplexer busy for nothing.
-#[derive(Default)]
+/// What the pane shows, sent by difference cell by cell ([`Painter`]): with the spinners turning ten times a second,
+/// a frame sends the few cells that changed, not the lines they are on. Each frame a synchronized update: the
+/// multiplexer, which may read a whole one in several goes, shows it only once it is all there.
 struct Screen {
-    size: (u16, u16),
-    lines: Vec<String>,
+    /// The frame being drawn, in the same buffers from one to the next.
+    canvas: Canvas,
+    painter: Painter,
     zones: Vec<Zone>,
 }
 
+impl Default for Screen {
+    fn default() -> Self {
+        Screen {
+            canvas: Canvas::default(),
+            painter: Painter::new(Features { sync: true, ..Features::default() }),
+            zones: Vec::new(),
+        }
+    }
+}
+
 impl Screen {
-    /// Forgets what the pane shows: the next frame writes every line.
+    /// Forgets what the pane shows: the next frame is sent whole.
     fn forget(&mut self) {
-        self.lines.clear();
+        self.painter.forget();
     }
 
-    /// The board over the pane, each changed line written over the old one rather than cleared, so that nothing
-    /// flickers.
+    /// The board over the pane, only what changed.
     fn draw(&mut self, out: &mut impl Write, board: &Board) -> Result<()> {
-        let changes = self.changes(terminal::size().unwrap_or((80, 24)), board)?;
+        let changes = self.changes(terminal::size().unwrap_or((80, 24)), board);
         if !changes.is_empty() {
             out.write_all(&changes)?;
             out.flush()?;
@@ -529,55 +665,17 @@ impl Screen {
         Ok(())
     }
 
-    /// What to write for `board` on a pane of `size`: the lines that changed, in one write.
-    fn changes(&mut self, size: (u16, u16), board: &Board) -> Result<Vec<u8>> {
-        if size != self.size {
-            *self = Screen { size, ..Default::default() };
+    /// What to write for `board` on a pane of `size`: the cells that changed, in one write; nothing if none did.
+    fn changes(&mut self, size: (u16, u16), board: &Board) -> Vec<u8> {
+        let (width, height) = (size.0 as usize, size.1 as usize);
+        let Drawn { lines, zones } = render(board, width, height);
+        self.canvas.reset(width, height);
+        for (y, line) in lines.iter().enumerate() {
+            line.draw(&mut self.canvas, y);
         }
-        let Drawn { lines, zones } = render(board, size.0 as usize, size.1 as usize);
-        let mut changes = Vec::new();
-        for (row, line) in lines.iter().enumerate() {
-            if self.lines.get(row) != Some(line) {
-                queue!(changes, cursor::MoveTo(0, row as u16))?;
-                write!(changes, "{line}")?;
-                // A line as wide as the pane leaves the cursor on its last cell, the wrap pending: EL would erase that
-                // cell (xterm, Ghostty and recruit's own multiplexer do).
-                if shown_columns(line) < size.0 as usize {
-                    queue!(changes, terminal::Clear(ClearType::UntilNewLine))?;
-                }
-            }
-        }
-        if !changes.is_empty() {
-            // Below the board, what was typed in the pane, if anything.
-            queue!(changes, cursor::MoveTo(0, lines.len() as u16), terminal::Clear(ClearType::FromCursorDown))?;
-        }
-        self.lines = lines;
         self.zones = zones;
-        Ok(changes)
+        self.painter.frame(&self.canvas)
     }
-}
-
-/// Columns a line of the board takes on screen: its text without its escape sequences.
-fn shown_columns(line: &str) -> usize {
-    crate::canvas::columns(&visible(line))
-}
-
-/// A painted line's text, its SGR sequences left out.
-fn visible(line: &str) -> String {
-    let mut out = String::new();
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// The time before the clock's next second, and a little more so that it has moved on.
@@ -624,11 +722,11 @@ fn windows(reports: &[Report], now: i64) -> Vec<(String, f64, Option<u64>)> {
 fn render(b: &Board, width: usize, height: usize) -> Drawn {
     let mut top = Vec::new();
     if let Some(error) = &b.error {
-        top.extend([fit(error, width).red().to_string(), String::new()]);
+        top.extend([Line::of(fit(error, width), Paint::Color(Color::DarkRed)), Line::default()]);
     }
     let mut bottom = Vec::new();
     if !b.usage.is_empty() {
-        bottom.extend([String::new(), usage_line(&b.usage, width)]);
+        bottom.extend([Line::default(), usage_line(&b.usage, width)]);
     }
     let absent = names(&t!("absent", "absent"), &b.absent, width, Color::DarkGrey, usize::MAX).spaced();
     let room = height.saturating_sub(1 + top.len() + bottom.len() + absent.len());
@@ -636,13 +734,13 @@ fn render(b: &Board, width: usize, height: usize) -> Drawn {
 
     let mut middle = cards(&layout.rows, width, b);
     if layout.more > 0 {
-        middle.lines.push(t!("… et {} de plus", "… and {} more", layout.more).dim().to_string());
+        middle.lines.push(Line::of(t!("… et {} de plus", "… and {} more", layout.more), Paint::Dim));
     }
     middle.append(resting_names(&layout.named, width, layout.whole));
     middle.append(absent);
     // Sessions open elsewhere under a member's name, over the usage: in the room the cards leave, if any.
     if let Some(line) = elsewhere_line(&b.elsewhere, width) {
-        let mut with = if bottom.is_empty() { vec![String::new()] } else { bottom.clone() };
+        let mut with = if bottom.is_empty() { vec![Line::default()] } else { bottom.clone() };
         with.insert(1, line);
         if 1 + top.len() + middle.len() + with.len() <= height {
             bottom = with;
@@ -652,14 +750,14 @@ fn render(b: &Board, width: usize, height: usize) -> Drawn {
     let filler = height.saturating_sub(1 + top.len() + middle.len() + bottom.len());
     let mut drawn = Drawn::from(top);
     drawn.append(middle);
-    drawn.append(Drawn::from(vec![String::new(); filler]));
+    drawn.append(Drawn::from(vec![Line::default(); filler]));
     drawn.append(Drawn::from(bottom));
     // A pane too low for all that: the usage at the bottom only, if it holds.
     let rows = height.saturating_sub(1);
     if drawn.len() > rows {
         let mut low = Vec::new();
         if !b.usage.is_empty() && rows >= 1 {
-            low.extend(vec![String::new(); rows - 1]);
+            low.extend(vec![Line::default(); rows - 1]);
             low.push(usage_line(&b.usage, width));
         }
         drawn = Drawn::from(low);
@@ -670,12 +768,12 @@ fn render(b: &Board, width: usize, height: usize) -> Drawn {
 /// Lines of the dashboard, and where the members show in them, rows counted from the first line.
 #[derive(Debug, Default)]
 struct Drawn {
-    lines: Vec<String>,
+    lines: Vec<Line>,
     zones: Vec<Zone>,
 }
 
-impl From<Vec<String>> for Drawn {
-    fn from(lines: Vec<String>) -> Self {
+impl From<Vec<Line>> for Drawn {
+    fn from(lines: Vec<Line>) -> Self {
         Drawn { lines, zones: Vec::new() }
     }
 }
@@ -697,7 +795,7 @@ impl Drawn {
         if self.lines.is_empty() {
             return self;
         }
-        let mut spaced = Drawn::from(vec![String::new()]);
+        let mut spaced = Drawn::from(vec![Line::default()]);
         spaced.append(self);
         spaced
     }
@@ -760,6 +858,25 @@ pub struct States {
     /// (`live::prompt`); none most of the time.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub refs: BTreeMap<String, String>,
+    /// The session each member runs in the team's folder, as `claude agents` last said it: for the journal (the
+    /// transcripts) and the members' panes (`member.rs`, the session to resume), which no longer ask `claude agents`
+    /// themselves while the dashboard looks (2.0.1). Not as fresh as `at`: up to about 8 s old when `at` is (asked
+    /// every 5 s, the time it takes, then `FRESH`); a reader that acts on a process checks it is still there.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sessions: BTreeMap<String, Session>,
+    /// Every session open on this machine by its process, members or not: the names messages go to, for the journal.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pids: BTreeMap<u32, String>,
+}
+
+/// A member's session in [`States::sessions`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Session {
+    /// Its id, the name of its transcript.
+    pub id: String,
+    /// Its Claude's process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -781,27 +898,32 @@ mod state_name {
     use crate::look::State;
 
     pub fn serialize<S: Serializer>(state: &State, to: S) -> Result<S::Ok, S::Error> {
-        to.serialize_str(match state {
-            State::Working => "working",
-            State::Idle => "idle",
-            State::Waiting => "waiting",
-            State::Other => "other",
-        })
+        to.serialize_str(state.name())
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(from: D) -> Result<State, D::Error> {
-        Ok(match String::deserialize(from)?.as_str() {
-            "working" => State::Working,
-            "idle" => State::Idle,
-            "waiting" => State::Waiting,
-            _ => State::Other,
-        })
+        Ok(State::named(&String::deserialize(from)?))
     }
 }
 
 /// What the dashboard last wrote; none if it never did, or while the file cannot be read.
 pub fn read_states(state: &Path) -> Option<States> {
     fs::read(state.join(STATES)).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok())
+}
+
+/// Older than this, in seconds, `STATES` says the dashboard no longer looks: its readers ask for themselves.
+pub const FRESH: i64 = 3;
+
+/// What the dashboard last wrote, if it still looks (written less than [`FRESH`] seconds ago).
+pub fn fresh_states(state: &Path) -> Option<States> {
+    read_states(state).filter(|states| states.fresh(now()))
+}
+
+impl States {
+    /// Written less than [`FRESH`] seconds from `now`, either way: the clocks of two processes.
+    pub fn fresh(&self, now: i64) -> bool {
+        (now - self.at).abs() <= FRESH
+    }
 }
 
 /// Written in one go: the menu never reads half a file.
@@ -821,6 +943,19 @@ enum Paint {
 }
 
 impl Paint {
+    /// As a cell of a canvas is drawn.
+    fn style(self) -> Style {
+        let fg = |color: Color| Style { fg: (color != Color::Reset).then_some(color), ..Style::PLAIN };
+        match self {
+            Paint::Plain => Style::PLAIN,
+            Paint::Dim => Style::PLAIN.dim(),
+            Paint::Color(color) => fg(color),
+            Paint::Bold(color) => fg(color).bold(),
+            Paint::Faint(color) => fg(color).dim(),
+        }
+    }
+
+    /// `text` as a terminal prints it, in this paint.
     fn apply(self, text: &str) -> String {
         match self {
             Paint::Plain => text.to_string(),
@@ -832,23 +967,64 @@ impl Paint {
     }
 }
 
+/// A line of a panel: pieces of text one after the other, each in its paint.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Line(Vec<(String, Paint)>);
+
+impl Line {
+    fn of(text: impl Into<String>, paint: Paint) -> Line {
+        let mut line = Line::default();
+        line.push(text, paint);
+        line
+    }
+
+    fn push(&mut self, text: impl Into<String>, paint: Paint) {
+        let text = text.into();
+        if !text.is_empty() {
+            self.0.push((text, paint));
+        }
+    }
+
+    /// `other` after this one.
+    fn append(&mut self, other: Line) {
+        self.0.extend(other.0);
+    }
+
+    /// Its text, without its paints.
+    #[cfg(test)]
+    fn text(&self) -> String {
+        self.0.iter().map(|(text, _)| text.as_str()).collect()
+    }
+
+    /// On row `y` of `canvas`, from its first column.
+    fn draw(&self, canvas: &mut Canvas, y: usize) {
+        let mut x = 0;
+        for (text, paint) in &self.0 {
+            x = canvas.put(x, y, text, paint.style());
+        }
+    }
+
+    /// As a terminal prints it: for the journal, which writes its lines as they come.
+    fn printed(&self) -> String {
+        self.0.iter().map(|(text, paint)| paint.apply(text)).collect()
+    }
+}
+
 /// `pieces` one after the other, each in its paint, cut to `width` as `fit` cuts their text joined.
-fn painted(pieces: &[(impl AsRef<str>, Paint)], width: usize) -> String {
+fn painted(pieces: &[(impl AsRef<str>, Paint)], width: usize) -> Line {
     let joined: String = pieces.iter().map(|(text, _)| text.as_ref()).collect();
     let mut rest: Vec<char> = fit(&joined, width).chars().collect();
-    let mut line = String::new();
+    let mut line = Line::default();
     for (text, paint) in pieces {
         let taken: String = rest.drain(..text.as_ref().chars().count().min(rest.len())).collect();
-        if !taken.is_empty() {
-            line.push_str(&paint.apply(&taken));
-        }
+        line.push(taken, *paint);
     }
     line
 }
 
 /// ` 5 h ▰▰▰▰▱▱▱▱ 41 % ↻ 4h27   7 j ▰▱▱▱▱▱▱▱ 5 % ↻ 6j11h`, the bars as long as the line allows. Too narrow, the reset
 /// times go first, then the bars.
-fn usage_line(usage: &[(String, f64, Option<u64>)], width: usize) -> String {
+fn usage_line(usage: &[(String, f64, Option<u64>)], width: usize) -> Line {
     const MIN_CELLS: usize = 5;
     const MAX_CELLS: usize = 20;
     // What follows each bar: the share used, and the time before the window resets.
@@ -880,25 +1056,24 @@ fn usage_line(usage: &[(String, f64, Option<u64>)], width: usize) -> String {
         })
         .find(|(_, cells)| *cells >= MIN_CELLS)
         .unwrap_or_else(|| (tails(false), 0));
-    usage
-        .iter()
-        .zip(tails)
-        .map(|((label, percent, _), (used, left))| {
-            let bar = if cells == 0 {
-                String::new()
-            } else {
-                let filled = ((percent / 100.0 * cells as f64).round() as usize).min(cells);
-                let color = match percent {
-                    p if *p >= 90.0 => Color::Red,
-                    p if *p >= 70.0 => Color::Yellow,
-                    _ => Color::Green,
-                };
-                format!("{}{} ", "▰".repeat(filled).with(color), "▱".repeat(cells - filled).dark_grey())
+    let mut line = Line::default();
+    for (i, ((label, percent, _), (used, left))) in usage.iter().zip(tails).enumerate() {
+        line.push(format!("{} {label} ", if i == 0 { "" } else { "  " }), Paint::Plain);
+        if cells > 0 {
+            let filled = ((percent / 100.0 * cells as f64).round() as usize).min(cells);
+            let color = match percent {
+                p if *p >= 90.0 => Color::Red,
+                p if *p >= 70.0 => Color::Yellow,
+                _ => Color::Green,
             };
-            format!(" {label} {bar}{used}{}", left.dim())
-        })
-        .collect::<Vec<_>>()
-        .join("  ")
+            line.push("▰".repeat(filled), Paint::Color(color));
+            line.push("▱".repeat(cells - filled), Paint::Color(Color::DarkGrey));
+            line.push(" ", Paint::Plain);
+        }
+        line.push(used, Paint::Plain);
+        line.push(left, Paint::Dim);
+    }
+    line
 }
 
 /// `au repos  a · b · c`, wrapped under its label over at most `max` lines, each name a zone; the names left over
@@ -944,10 +1119,11 @@ fn names(label: &str, list: &[String], width: usize, color: Color, max: usize) -
     for (i, row) in rows.iter().enumerate() {
         let head = if i == 0 { format!("{label:<INDENT$}") } else { " ".repeat(INDENT) };
         let shown: Vec<&str> = row.iter().map(|(_, shown, _)| shown.as_str()).collect();
-        let mut line = format!("{}{}", head.dim(), shown.join(" · ").with(color));
+        let mut line = Line::of(head, Paint::Dim);
+        line.push(shown.join(" · "), Paint::Color(color));
         if left > 0 && i + 1 == rows.len() {
-            let gap = if row.is_empty() { "" } else { " " };
-            line.push_str(&format!("{gap}{}", others(left).dim()));
+            line.push(if row.is_empty() { "" } else { " " }, Paint::Plain);
+            line.push(others(left), Paint::Dim);
         }
         drawn.lines.push(line);
         drawn.zones.extend(row.iter().map(|(name, shown, col)| Zone {
@@ -969,7 +1145,7 @@ fn others(count: usize) -> String {
 
 /// ` nom en double ailleurs : coordinateur (shop)`, dimmed: sessions open elsewhere under a member's name, which
 /// messages by name could reach.
-fn elsewhere_line(list: &[(String, Option<String>)], width: usize) -> Option<String> {
+fn elsewhere_line(list: &[(String, Option<String>)], width: usize) -> Option<Line> {
     if list.is_empty() {
         return None;
     }
@@ -986,7 +1162,7 @@ fn elsewhere_line(list: &[(String, Option<String>)], width: usize) -> Option<Str
     } else {
         t!(" noms en double ailleurs : {}", " names in use elsewhere: {}", names)
     };
-    Some(fit(&text, width).dim().to_string())
+    Some(Line::of(fit(&text, width), Paint::Dim))
 }
 
 /// The working agents at rest that have no card: `au repos  a · b · c`, after an empty line; on one line, those that
@@ -1235,11 +1411,11 @@ fn cards(rows: &[Vec<(&Card, usize, Helpers)>], width: usize, b: &Board) -> Draw
     let mut drawn = Drawn::default();
     for (i, row) in placed.iter().enumerate() {
         if i > 0 {
-            drawn.lines.push(String::new());
+            drawn.lines.push(Line::default());
         }
         let top = drawn.len();
         let right = &rights[row.len() - 1];
-        let row: Vec<(&Card, usize, Vec<String>)> =
+        let row: Vec<(&Card, usize, Vec<Line>)> =
             row.iter().map(|&(c, w, lines, helpers)| (c, w, card(c, w, lines, helpers, right, b))).collect();
         let mut col = 0;
         for (c, w, card) in &row {
@@ -1255,12 +1431,12 @@ fn cards(rows: &[Vec<(&Card, usize, Helpers)>], width: usize, b: &Board) -> Draw
         }
         let height = row.iter().map(|(.., card)| card.len()).max().unwrap_or(0);
         for i in 0..height {
-            let mut line = String::new();
+            let mut line = Line::default();
             for (j, (_, w, card)) in row.iter().enumerate() {
                 match card.get(i) {
-                    Some(text) => line.push_str(text),
+                    Some(text) => line.append(text.clone()),
                     // Under a shorter card, room for the one on its right.
-                    None if j + 1 < row.len() => line.push_str(&" ".repeat(*w)),
+                    None if j + 1 < row.len() => line.push(" ".repeat(*w), Paint::Plain),
                     None => {}
                 }
             }
@@ -1339,7 +1515,7 @@ fn compaction_cells(c: &Card) -> Option<usize> {
 /// ┃   ⧗ Explore · Lire le tableau de bord  12s
 /// ╹   ⣀⣀⣠⣤⣶⣿⣿⣶⣤⣀⣀                   74 %
 /// ```
-fn card(c: &Card, width: usize, lines: usize, helpers: Helpers, right: &Right, b: &Board) -> Vec<String> {
+fn card(c: &Card, width: usize, lines: usize, helpers: Helpers, right: &Right, b: &Board) -> Vec<Line> {
     let doing = if lines == 0 { Vec::new() } else { doing_lines(c, width, lines) };
     let helpers = helpers_drawn(c, helpers, width.saturating_sub(4), b);
     let height = 2 + doing.len() + helpers.len();
@@ -1718,7 +1894,8 @@ fn journal(mut s: Snapshot, state: &Path) -> Result<()> {
     let mut first = true;
     loop {
         reread(&mut s, state);
-        let sessions = sessions(&s, None);
+        // As the dashboard last saw them while it looks: `claude agents` asked once for the team.
+        let sessions = fresh_states(state).and_then(Sessions::of).unwrap_or_else(|| sessions(&s, None));
         let mut fresh = Vec::new();
         for (name, session) in &sessions.members {
             let Some(id) = &session.session_id else { continue };
@@ -1761,7 +1938,7 @@ fn message_head(s: &Snapshot, time: &str, from: &str, to: &str, width: usize) ->
         (" ", Paint::Plain),
         (to, Paint::Color(recipient)),
     ];
-    painted(&pieces, width)
+    painted(&pieces, width).printed()
 }
 
 /// The name under column `x` on a message's first line in the journal, ` 14:32  dev-cli ──▶ coordinateur`: its
@@ -1845,11 +2022,13 @@ pub(crate) struct MemberLook {
 }
 
 /// Each member's look, by name, from the team as launched, the mod's reports and what the dashboard last wrote
-/// (`STATES`, kept whatever its age: `since` stays true while the state does). Reads a few small files: for a thread
+/// (`STATES`: `since` kept whatever its age, true while the state is; the state, and what follows from it, only while
+/// the dashboard looks, so that a dashboard stopped leaves no state frozen in the headers). Reads a few small files: for a thread
 /// of the server, every two seconds, never on the way to a frame. Empty if the team cannot be read.
 pub(crate) fn looks(state: &Path) -> BTreeMap<String, MemberLook> {
     let Ok(snapshot) = Snapshot::read(state) else { return BTreeMap::new() };
     let states = read_states(state);
+    let fresh = states.as_ref().is_some_and(|s| s.fresh(now()));
     snapshot
         .members
         .iter()
@@ -1860,15 +2039,16 @@ pub(crate) fn looks(state: &Path) -> BTreeMap<String, MemberLook> {
             let percent =
                 context.and_then(|c| c.percent).filter(|p| p.is_finite()).map(|p| p.round().clamp(0.0, 100.0) as u8);
             let seen = states.as_ref().and_then(|s| s.members.get(&member.name));
+            let state_seen = seen.filter(|_| fresh);
             let look = MemberLook {
                 model: model.map(|m| family(&m)),
                 effort: effort.filter(|e| bridge::EFFORTS.contains(&e.as_str())),
                 context: percent,
                 pressure: Pressure::of(context.and_then(|c| c.tokens), report.compacts_at()),
-                compactable: percent.is_some() && seen.is_some_and(|s| s.state == State::Idle),
+                compactable: percent.is_some() && state_seen.is_some_and(|s| s.state == State::Idle),
                 since: seen.map(|s| s.since),
-                state: seen.map(|s| s.state),
-                shell: seen.is_some_and(|s| s.shell),
+                state: state_seen.map(|s| s.state),
+                shell: state_seen.is_some_and(|s| s.shell),
             };
             (member.name.clone(), look)
         })
@@ -1976,6 +2156,47 @@ fn clock(epoch: i64) -> String {
 mod tests {
     use super::*;
     use crate::look::ALT;
+
+    trait Printed {
+        fn printed(&self) -> String;
+    }
+
+    impl Printed for str {
+        fn printed(&self) -> String {
+            self.to_string()
+        }
+    }
+
+    impl Printed for String {
+        fn printed(&self) -> String {
+            self.clone()
+        }
+    }
+
+    impl Printed for Line {
+        fn printed(&self) -> String {
+            Line::printed(self)
+        }
+    }
+
+    /// A line's text: a printed one without its SGR sequences.
+    fn visible(line: &(impl Printed + ?Sized)) -> String {
+        let line = line.printed();
+        let mut out = String::new();
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
 
     #[test]
     fn iso_times() {
@@ -2092,7 +2313,7 @@ mod tests {
     /// The dashboard in a pane `height` rows high as these tests measure it, from when it had a header of two rows:
     /// those two rows blank, then the cards in the room they leave. Each test keeps its room and its rows.
     fn padded(b: &Board, width: usize, height: usize) -> Drawn {
-        let mut drawn = Drawn::from(vec![String::new(); 2.min(height.saturating_sub(1))]);
+        let mut drawn = Drawn::from(vec![Line::default(); 2.min(height.saturating_sub(1))]);
         drawn.append(render(b, width, height.saturating_sub(2)));
         drawn
     }
@@ -2100,7 +2321,7 @@ mod tests {
     fn checked(b: &Board, width: usize, height: usize) -> Vec<String> {
         let drawn = padded(b, width, height);
         zones_match(&drawn);
-        let lines: Vec<String> = drawn.lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = drawn.lines.iter().map(Line::text).collect();
         assert!(lines.len() == height - 1 && lines.iter().all(|l| l.chars().count() <= width), "{lines:#?}");
         assert!(!lines.iter().any(|l| l.trim_end().ends_with('┃')), "{lines:#?}");
         lines
@@ -2224,12 +2445,12 @@ mod tests {
             assert!(!lines.iter().any(|l| visible(l).starts_with('…')), "{height}: {lines:#?}");
         }
         // The usage at the bottom only.
-        let lines: Vec<String> = render(&board(capture()), 60, 3).lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = render(&board(capture()), 60, 3).lines.iter().map(Line::text).collect();
         assert!(lines[0].is_empty() && lines[1].contains("41 % ↻ 1h22") && lines.len() == 2, "{lines:#?}");
         assert!(render(&board(capture()), 60, 3).zones.is_empty());
         // Room for how many more only.
         let lines: Vec<String> =
-            padded(&Board { absent: Vec::new(), ..board(capture()) }, 60, 6).lines.iter().map(|l| visible(l)).collect();
+            padded(&Board { absent: Vec::new(), ..board(capture()) }, 60, 6).lines.iter().map(Line::text).collect();
         assert_eq!(lines[2], t!("… et {} de plus", "… and {} more", 13));
     }
 
@@ -2238,18 +2459,14 @@ mod tests {
         let list: Vec<String> =
             ["devops", "traitement-cartes", "sécurité", "performance", "ui-ux"].map(String::from).into();
         let drawn = names("au repos", &list, 50, Color::DarkGrey, 1);
-        let lines: Vec<String> = drawn.lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = drawn.lines.iter().map(Line::text).collect();
         assert_eq!(lines, [format!("au repos  devops · traitement-cartes {}", others(3))]);
         // The names shown are zones, the others are not.
         zones_match(&drawn);
         assert_eq!(drawn.zones.iter().map(|z| z.member.as_str()).collect::<Vec<_>>(), ["devops", "traitement-cartes"]);
         // One left over; none that holds.
         let lines = |width| {
-            names("au repos", &list[..2], width, Color::DarkGrey, 1)
-                .lines
-                .iter()
-                .map(|l| visible(l))
-                .collect::<Vec<_>>()
+            names("au repos", &list[..2], width, Color::DarkGrey, 1).lines.iter().map(Line::text).collect::<Vec<_>>()
         };
         assert_eq!(lines(30), [format!("au repos  devops {}", others(1))]);
         assert_eq!(lines(20), [format!("au repos  {}", others(2))]);
@@ -2288,7 +2505,7 @@ mod tests {
             sample_card("lanceur", false, State::Idle),
             sample_card("interface", false, State::Waiting),
         ]);
-        let lines: Vec<String> = padded(&b, 70, 23).lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = padded(&b, 70, 23).lines.iter().map(Line::text).collect();
         assert_eq!(lines.len(), 22);
         assert!(lines.iter().all(|l| l.chars().count() <= 70), "{lines:#?}");
         let tops: Vec<&String> = lines.iter().filter(|l| l.starts_with('╻')).collect();
@@ -2317,7 +2534,7 @@ mod tests {
             doing("dev", State::Idle, "Je publie la version 0.6.2", Some("Version 0.6.2 publiée")),
             sample_card("ops", false, State::Waiting),
         ];
-        let lines: Vec<String> = padded(&board(cards.clone()), 50, 23).lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = padded(&board(cards.clone()), 50, 23).lines.iter().map(Line::text).collect();
         // The one waiting for the user first; nothing said yet, no line for it.
         assert!(lines[2].starts_with("╻ ⚑ ops ") && lines[3].starts_with("╹ "));
         assert!(lines[5].starts_with("╻ ⠋ coordinateur "));
@@ -2331,7 +2548,7 @@ mod tests {
         let right = Right { model: 4, effort: 7, time: 2 };
         let line = card(&unknown, 50, 1, Helpers::Left, &right, &board(Vec::new()))[1].clone();
         assert_eq!(visible(&line).trim_end(), "┃   Je publie la version 0.6.2");
-        assert!(line.contains(&"Je publie la version 0.6.2".dim().to_string()));
+        assert!(line.printed().contains(&"Je publie la version 0.6.2".dim().to_string()));
         // The model gave no form for it done: as it was.
         let undone = doing("review", State::Idle, "Je relis le clic", None);
         let right = Right { model: 4, effort: 7, time: 2 };
@@ -2340,7 +2557,7 @@ mod tests {
             "┃   ✓ Je relis le clic"
         );
         // Short of room, the agent at rest goes first, into the list of names; the one at work keeps its task.
-        let lines: Vec<String> = padded(&board(cards), 50, 15).lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = padded(&board(cards), 50, 15).lines.iter().map(Line::text).collect();
         assert!(lines.iter().any(|l| l.trim_end() == "┃   Je relis la maquette des cartes"), "{lines:#?}");
         assert_eq!(lines.iter().filter(|l| l.starts_with('╻')).count(), 2);
         assert!(lines.iter().any(|l| l.starts_with(&t!("au repos", "idle")) && l.ends_with(" dev")), "{lines:#?}");
@@ -2403,7 +2620,7 @@ mod tests {
 
     #[test]
     fn helpers_under_the_card() {
-        let lines: Vec<String> = render(&board(with_helpers()), 70, 30).lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = render(&board(with_helpers()), 70, 30).lines.iter().map(Line::text).collect();
         let top = title(&lines, "coordinateur").unwrap();
         let card: Vec<&str> = lines[top..top + 7].iter().map(|l| l.trim_end()).collect();
         // Under what it does, one line each, the time on the right as on the title: since the start, until the end;
@@ -2424,7 +2641,7 @@ mod tests {
     #[test]
     fn helpers_counted_then_left_before_what_they_do() {
         let at = |height: usize| -> Vec<String> {
-            render(&board(with_helpers()), 70, height).lines.iter().map(|l| visible(l)).collect()
+            render(&board(with_helpers()), 70, height).lines.iter().map(Line::text).collect()
         };
         let middles = |lines: &[String]| {
             let top = title(lines, "coordinateur").unwrap();
@@ -2497,7 +2714,7 @@ mod tests {
         };
         let mut before: Option<(usize, Vec<Option<usize>>)> = None;
         for height in 6..=40 {
-            let lines: Vec<String> = render(&board(probe()), 60, height).lines.iter().map(|l| visible(l)).collect();
+            let lines: Vec<String> = render(&board(probe()), 60, height).lines.iter().map(Line::text).collect();
             let now: Vec<Option<usize>> = ["coordinateur", "backend", "dev"].map(|n| doing(&lines, n)).into();
             // Never less of a task on a taller pane that shows the same cards (one more card, on a pane too low for all
             // of them, comes in its barest form).
@@ -2518,7 +2735,7 @@ mod tests {
             before = Some((height, now));
         }
         // Tall enough, all of them.
-        let lines: Vec<String> = render(&board(probe()), 60, 40).lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = render(&board(probe()), 60, 40).lines.iter().map(Line::text).collect();
         assert_eq!(lines.iter().filter(|l| l.starts_with("┃   ⧗")).count(), 6, "{lines:#?}");
     }
 
@@ -2529,7 +2746,7 @@ mod tests {
             description: "Lire tout le code du serveur et des tests pour trouver où les liens sont comptés".into(),
             ..helper("long", None, HelperStatus::Running)
         }];
-        let lines: Vec<String> = render(&board(cards), 60, 40).lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = render(&board(cards), 60, 40).lines.iter().map(Line::text).collect();
         let top = title(&lines, "coordinateur").unwrap();
         let line = lines.iter().find(|l| l.starts_with("┃   ⧗")).unwrap();
         // Cut before the time, which stays whole; as wide as the title.
@@ -2610,7 +2827,7 @@ mod tests {
             started: 0,
             since: 1000 - bridge::TEAMMATE_UNKNOWN,
         });
-        let lines: Vec<String> = render(&board(cards), 70, 30).lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = render(&board(cards), 70, 30).lines.iter().map(Line::text).collect();
         assert!(lines.iter().any(|l| l.starts_with("┃   ? critic")), "{lines:#?}");
     }
 
@@ -2619,7 +2836,7 @@ mod tests {
         let right = Right { model: 4, effort: 7, time: 2 };
         let lines: Vec<String> = card(&long_and_short()[0], 50, 2, Helpers::Left, &right, &board(Vec::new()))
             .iter()
-            .map(|l| visible(l))
+            .map(Line::text)
             .collect();
         let bars: Vec<char> = lines.iter().map(|l| l.chars().next().unwrap()).collect();
         assert_eq!(bars, ['╻', '┃', '┃', '╹']);
@@ -2633,7 +2850,7 @@ mod tests {
             ..sample_card("dev", false, State::Idle)
         };
         let lines: Vec<String> =
-            card(&done, 40, 2, Helpers::Left, &right, &board(Vec::new())).iter().map(|l| visible(l)).collect();
+            card(&done, 40, 2, Helpers::Left, &right, &board(Vec::new())).iter().map(Line::text).collect();
         assert_eq!(lines[1].trim_end(), "┃   ✓ Version 0.6.2 publiée et poussée");
         assert_eq!(lines[2].trim_end(), "┃     dans le tap");
     }
@@ -2642,7 +2859,7 @@ mod tests {
     fn forms_given_up_in_turn() {
         // The contact at work over two lines, the agent at rest with its task done: 15 lines leave them 8.
         let at = |height: usize| -> Vec<String> {
-            padded(&board(long_and_short()), 70, height).lines.iter().map(|l| visible(l)).collect()
+            padded(&board(long_and_short()), 70, height).lines.iter().map(Line::text).collect()
         };
         let middles = |lines: &[String], name: &str| {
             let top = lines.iter().position(|l| l.contains(&format!(" {name} "))).unwrap();
@@ -2725,7 +2942,7 @@ mod tests {
         ];
         let titles = |width: usize| -> Vec<String> {
             let lines = render(&board(cards.clone()), width, 23).lines;
-            lines.iter().map(|l| visible(l)).filter(|l| l.starts_with('╻')).collect()
+            lines.iter().map(Line::text).filter(|l| l.starts_with('╻')).collect()
         };
         let ends = |titles: Vec<String>, ends: [&str; 3]| {
             assert!(
@@ -2753,6 +2970,7 @@ mod tests {
             [0]
         .clone();
         let dim = "\x1b[2m";
+        let title = title.printed();
         assert!(title.contains(&format!("{dim}Opus")));
         let violet = "█".with(Color::AnsiValue(141)).to_string();
         assert!(!title.contains(&format!("{dim}█")) && title.contains(&violet));
@@ -2780,7 +2998,7 @@ mod tests {
             vec![sample_card("coordinateur", true, State::Idle), sample_card("archi", true, State::Working)];
         cards.extend((0..4).map(|i| sample_card(&format!("w{i}"), false, State::Working)));
         cards.extend((0..9).map(|i| sample_card(&format!("repos{i}"), false, State::Idle)));
-        let lines: Vec<String> = padded(&board(cards.clone()), 70, 23).lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = padded(&board(cards.clone()), 70, 23).lines.iter().map(Line::text).collect();
         assert!(lines.iter().all(|l| l.chars().count() <= 70), "{lines:#?}");
         // Nothing to say of what they do: two side by side rather than a name less. A contact at rest keeps its card,
         // the latest agents at rest too; the others are only named.
@@ -2789,10 +3007,10 @@ mod tests {
         assert_eq!(named(&lines), ["repos4", "repos5", "repos6", "repos7", "repos8"]);
 
         // Twice the height: every one in cards, two side by side.
-        let tall: Vec<String> = padded(&board(cards.clone()), 70, 47).lines.iter().map(|l| visible(l)).collect();
+        let tall: Vec<String> = padded(&board(cards.clone()), 70, 47).lines.iter().map(Line::text).collect();
         assert!(tall.iter().any(|l| l.contains("╻ ◷ repos0 ")));
         // Too narrow for two side by side.
-        let narrow: Vec<String> = padded(&board(cards), 50, 47).lines.iter().map(|l| visible(l)).collect();
+        let narrow: Vec<String> = padded(&board(cards), 50, 47).lines.iter().map(Line::text).collect();
         assert!(narrow.iter().all(|l| l.matches('╻').count() <= 1 && l.chars().count() <= 50));
     }
 
@@ -2879,7 +3097,7 @@ mod tests {
         // A name wider than its line: cut, its zone over what shows.
         let list = vec!["court".to_string(), "un-nom-bien-trop-long".to_string()];
         let drawn = names("au repos", &list, 20, Color::DarkGrey, usize::MAX);
-        let lines: Vec<String> = drawn.lines.iter().map(|l| visible(l)).collect();
+        let lines: Vec<String> = drawn.lines.iter().map(Line::text).collect();
         assert_eq!(lines, ["au repos  court", "          un-nom-bi…"]);
         zones_match(&drawn);
         let cut = Zone { member: list[1].clone(), kind: ZoneKind::Member, row: 1, col: 10, rows: 1, cols: 10 };
@@ -2967,6 +3185,83 @@ mod tests {
         assert!(title.starts_with(&format!("╻ {} server", Glyphs::Unicode.console())), "{title:?}");
     }
 
+    /// The states the members' panes tell (OSC 7501) come before `claude agents`, with since when they say; a member
+    /// told by its pane has a card before `claude agents` sees it; at rest by its pane, a command still running is read
+    /// in its session's file (2.0.1).
+    #[test]
+    fn states_told_by_the_panes() {
+        let pane = |member: &str, role: &str, status, since| backend::PaneState {
+            id: member.into(),
+            member: member.into(),
+            role: role.into(),
+            window: "Agents".into(),
+            status,
+            since,
+        };
+        let at = now() as u64;
+        let panes = [
+            pane("lead", "", Some(State::Working), Some(at - 120)),
+            pane("server", "", Some(State::Idle), Some(at - 30)),
+            pane("new", "", Some(State::Waiting), None),
+            pane("quiet", "", None, None),
+            pane("Dashboard", backend::DASHBOARD, Some(State::Working), None),
+        ];
+        let told = told(Some(&panes));
+        assert_eq!(
+            told.keys().map(String::as_str).collect::<std::collections::BTreeSet<_>>(),
+            ["lead", "new", "server"].into()
+        );
+        assert!(super::told(None).is_empty());
+
+        let session = |status: &str, pid| Running {
+            name: None,
+            cwd: None,
+            status: Some(status.into()),
+            session_id: None,
+            pid: Some(pid),
+        };
+        let mut found = Sessions {
+            // As `claude agents` said a while ago: the lead at rest, the server at work, `quiet` waiting.
+            members: [("lead", session("idle", 1)), ("server", session("busy", 2)), ("quiet", session("waiting", 3))]
+                .map(|(name, session)| (name.to_string(), session))
+                .into(),
+            shell: HashMap::from([("lead".to_string(), None)]),
+            told,
+            ..Default::default()
+        };
+        let files = |pid| (pid == 2).then(|| claude::SessionFile { status: "shell".into(), since: Some(now() - 600) });
+        with_a_command(&mut found, files);
+        assert_eq!(found.shell.keys().collect::<Vec<_>>(), ["server"]);
+
+        let s = snapshot(&["lead", "server", "new", "quiet", "gone"]);
+        let state = tempfile::tempdir().unwrap();
+        let seen = Memory::default().board(&s, state.path(), &found);
+        let card = |name: &str| seen.cards.iter().find(|c| c.name == name).unwrap();
+        assert_eq!(card("lead").state, State::Working);
+        assert!((120..123).contains(&card("lead").since), "{}", card("lead").since);
+        assert_eq!((card("server").state, card("server").shell), (State::Idle, true));
+        assert!((600..603).contains(&card("server").since), "{}", card("server").since);
+        assert_eq!((card("new").state, card("new").since), (State::Waiting, 0));
+        assert_eq!(card("quiet").state, State::Waiting);
+        assert_eq!(seen.absent, ["gone"]);
+    }
+
+    /// The looks of the headers: the state only while the dashboard looks; stopped, its last states are not shown
+    /// as if they held (the pane says « ◌ »), the time and the rest stay (2.0.1).
+    #[test]
+    fn looks_without_a_stale_state() {
+        let state = tempfile::tempdir().unwrap();
+        snapshot(&["dev"]).write(state.path()).unwrap();
+        let member = MemberState { state: State::Idle, since: 90, shell: true };
+        let states = |at| States { at, members: BTreeMap::from([("dev".into(), member)]), ..Default::default() };
+        save_states(state.path(), &states(now())).unwrap();
+        let look = &looks(state.path())["dev"];
+        assert_eq!((look.state, look.shell, look.since), (Some(State::Idle), true, Some(90)));
+        save_states(state.path(), &states(now() - 60)).unwrap();
+        let look = &looks(state.path())["dev"];
+        assert_eq!((look.state, look.shell, look.compactable, look.since), (None, false, false, Some(90)));
+    }
+
     #[test]
     fn at_rest_the_latest_first_by_the_moment() {
         let s = snapshot(&["a", "b", "c"]);
@@ -3033,27 +3328,38 @@ mod tests {
         assert_eq!(samples(&memory.board(&other, state.path(), &look("qa", "s2"))), Some(1));
     }
 
-    /// A line as wide as the pane keeps its last cell: no EL after it, which would erase it with the wrap pending.
+    /// The pane shows the lines as drawn, a line as wide as the pane with its last cell; and while members work, a
+    /// frame of the spinners sends their cells only (2.0.1: the title lines whole before, 733 bytes a frame).
     #[test]
-    fn a_full_line_keeps_its_last_cell() {
-        let b = board(capture());
-        let width = 60;
-        let lines = render(&b, width, 23).lines;
-        let full: Vec<&String> = lines.iter().filter(|l| shown_columns(l) == width).collect();
-        assert!(
-            !full.is_empty(),
-            "the header fills the line: {:?}",
-            lines.iter().map(|l| visible(l)).collect::<Vec<_>>()
-        );
-        let changes = String::from_utf8(Screen::default().changes((width as u16, 23), &b).unwrap()).unwrap();
-        for line in &full {
-            let at = changes.find(line.as_str()).unwrap() + line.len();
-            assert!(!changes[at..].starts_with("\x1b[K"), "EL after a full line: {:?}", visible(line));
+    fn a_spinner_frame_sends_its_cells_only() {
+        let working = |name: &str| Card { since: 30, ..sample_card(name, false, State::Working) };
+        let mut b = board(vec![working("dev-a"), working("dev-b"), working("dev-c")]);
+        let (width, height) = (60, 23);
+        let mut screen = Screen::default();
+        let whole = screen.changes((width as u16, height as u16), &b);
+        assert!(!whole.is_empty());
+        let lines = render(&b, width, height).lines;
+        assert!(lines.iter().any(|l| crate::canvas::columns(&l.text()) == width), "{lines:#?}");
+        for (y, line) in lines.iter().enumerate() {
+            assert_eq!(screen.canvas.row(y).trim_end(), line.text().trim_end());
         }
-        // A shorter one is cleared to its end, over what it covered before.
-        let short = lines.iter().find(|l| !l.is_empty() && shown_columns(l) < width).unwrap();
-        let at = changes.find(short.as_str()).unwrap() + short.len();
-        assert!(changes[at..].starts_with("\x1b[K"));
+        // The same board: nothing; the next spinners' image: a few bytes for each.
+        assert!(screen.changes((width as u16, height as u16), &b).is_empty());
+        b.frame += 1;
+        let spun = screen.changes((width as u16, height as u16), &b);
+        assert!(!spun.is_empty() && spun.len() <= 3 * 24, "{} bytes: {:?}", spun.len(), String::from_utf8_lossy(&spun));
+        // A second of it, the times moving on once: under a kilobyte (the goal of 2.0.1).
+        let mut second = 0;
+        for i in 0..10 {
+            b.frame += 1;
+            if i == 9 {
+                b.cards.iter_mut().for_each(|c| c.since += 1);
+                b.now += 1;
+            }
+            second += screen.changes((width as u16, height as u16), &b).len();
+        }
+        eprintln!("a frame: {} bytes, a second: {second} bytes", spun.len());
+        assert!(second < 1000, "{second} bytes in a second");
     }
 
     #[test]
@@ -3161,6 +3467,57 @@ mod tests {
         );
     }
 
+    /// The sessions written in the states for the journal and the members' panes, and read back (2.0.1).
+    #[test]
+    fn sessions_in_the_states() {
+        let s = snapshot(&["coordinateur", "dev"]);
+        let running: Vec<Running> = serde_json::from_value(serde_json::json!([
+            {"name": "coordinateur", "cwd": "/tmp/web", "status": "busy", "pid": 1, "sessionId": "s1"},
+            {"name": "dev", "cwd": "/tmp/web", "status": "idle", "pid": 3},
+            {"name": "inconnu", "cwd": "/tmp/ailleurs", "pid": 7, "sessionId": "s7"},
+        ]))
+        .unwrap();
+        let states = sorted(&s, running).written(States { at: 100, ..Default::default() });
+        assert_eq!(
+            states.sessions,
+            BTreeMap::from([("coordinateur".into(), Session { id: "s1".into(), pid: Some(1) })])
+        );
+        assert_eq!(states.pids, BTreeMap::from([(1, "coordinateur".into()), (3, "dev".into()), (7, "inconnu".into())]));
+        let text = serde_json::to_string(&states).unwrap();
+        let read = Sessions::of(serde_json::from_str(&text).unwrap()).unwrap();
+        assert_eq!(read.members["coordinateur"].session_id.as_deref(), Some("s1"));
+        assert_eq!(read.by_pid.get(&7).map(String::as_str), Some("inconnu"));
+        // Before `claude agents` first answers: the file's addresses, sessions and processes written again, not emptied.
+        let refs = BTreeMap::from([("coordinateur".to_string(), "coordinateur [ceeb11]".to_string())]);
+        let file = States { refs: refs.clone(), ..states.clone() };
+        let waiting = Sessions { kept: Some(Box::new(file.clone())), ..Default::default() };
+        let again = waiting.written(States { at: 101, ..Default::default() });
+        assert_eq!((again.at, &again.refs, &again.sessions, &again.pids), (101, &refs, &file.sessions, &file.pids));
+        // Once it answered, its own: the addresses included.
+        let answered = Sessions { refs: BTreeMap::new(), ..sorted(&s, Vec::new()) };
+        assert!(answered.written(States { at: 102, ..Default::default() }).refs.is_empty());
+        let named = Sessions { refs: refs.clone(), ..Default::default() };
+        assert_eq!(named.written(States::default()).refs, refs);
+        // Kept from the file only when a dashboard wrote it moments ago: not a launch before's.
+        let folder = tempfile::tempdir().unwrap();
+        assert!(kept(folder.path()).is_none(), "no file");
+        save_states(folder.path(), &States { at: now(), ..file.clone() }).unwrap();
+        assert_eq!(kept(folder.path()).map(|k| k.refs), Some(refs.clone()));
+        save_states(folder.path(), &States { at: now() - FRESH - 2, ..file.clone() }).unwrap();
+        assert!(kept(folder.path()).is_none(), "older than FRESH");
+        // A dashboard older than 2.0.1: members, no sessions; the journal asks `claude agents` itself.
+        let member = MemberState { state: State::Idle, since: 90, shell: false };
+        let old = States { at: 100, members: BTreeMap::from([("dev".into(), member)]), ..Default::default() };
+        assert!(Sessions::of(old).is_none());
+        // No member running: nothing to read, nothing to ask.
+        assert!(
+            Sessions::of(States { at: 100, absent: vec!["dev".into()], ..Default::default() })
+                .unwrap()
+                .members
+                .is_empty()
+        );
+    }
+
     #[test]
     fn names_in_use_elsewhere_over_the_usage() {
         let cards = || {
@@ -3171,14 +3528,13 @@ mod tests {
             ]
         };
         let b = Board { elsewhere: vec![("coordinateur".into(), Some("shop".into()))], ..board(cards()) };
-        let lines =
-            |height: usize| -> Vec<String> { padded(&b, 70, height).lines.iter().map(|l| visible(l)).collect() };
+        let lines = |height: usize| -> Vec<String> { padded(&b, 70, height).lines.iter().map(Line::text).collect() };
         let line = t!(" nom en double ailleurs : {}", " name in use elsewhere: {}", "coordinateur (shop)");
         // Right over the usage, dimmed.
         let tall = lines(23);
         assert_eq!(tall[20], line);
         assert!(tall[21].contains("41 % ↻ 1h22") && tall[19].is_empty());
-        assert!(padded(&b, 70, 23).lines[20].contains(&line.clone().dim().to_string()));
+        assert_eq!(padded(&b, 70, 23).lines[20], Line::of(line.clone(), Paint::Dim));
         // The cards first: no room left, no line.
         assert_eq!(lines(16)[13], line);
         assert!(!lines(15).contains(&line), "{:#?}", lines(15));
@@ -3188,11 +3544,8 @@ mod tests {
             elsewhere: vec![("coordinateur".into(), Some("shop".into())), ("dev".into(), None)],
             ..board(cards())
         };
-        let shown = padded(&b, 30, 23)
-            .lines
-            .iter()
-            .map(|l| visible(l))
-            .find(|l| l.contains("ailleurs") || l.contains("elsewhere"));
+        let shown =
+            padded(&b, 30, 23).lines.iter().map(Line::text).find(|l| l.contains("ailleurs") || l.contains("elsewhere"));
         assert_eq!(shown.map(|l| (l.chars().count(), l.ends_with('…'))), Some((30, true)));
     }
 
@@ -3373,7 +3726,7 @@ mod tests {
                             for (i, b) in boards.iter().enumerate() {
                                 let size = (width as u16, height as u16);
                                 let drawn = std::panic::catch_unwind(|| {
-                                    Screen::default().changes(size, b).unwrap();
+                                    Screen::default().changes(size, b);
                                     render(b, width, height)
                                 });
                                 if drawn.is_err() {
@@ -3405,7 +3758,7 @@ mod tests {
         assert!(drawn.lines.iter().all(|line| !visible(line).contains(&format!("{ALT}r menu"))));
         // An error first, then a blank.
         let failing = render(&Board { error: Some("boom".into()), ..board(Vec::new()) }, 60, 20);
-        assert_eq!((visible(&failing.lines[0]).as_str(), failing.lines[1].as_str()), ("boom", ""));
+        assert_eq!((visible(&failing.lines[0]).as_str(), failing.lines[1].text().as_str()), ("boom", ""));
         // A pane too low: the usage at the bottom only.
         let low = render(&board(vec![sample_card("a", true, State::Working); 6]), 60, 4);
         assert_eq!(low.lines.len(), 3);

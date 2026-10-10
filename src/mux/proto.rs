@@ -364,6 +364,14 @@ pub(crate) struct PaneInfo {
     pub pid: u32,
     pub cols: u16,
     pub rows: u16,
+    /// What its program last said of its state (OSC 7501), by its [`crate::look::State::name`]: `working`, `waiting` or
+    /// `idle`; none while it says nothing, or no longer. For the dashboard, which then asks `claude agents` less often
+    /// (2.0.1). An optional field: older peers skip it, and get none from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Since when it is in that state, in seconds since the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<u64>,
 }
 
 /// What [`Request::Stats`] gives.
@@ -672,6 +680,22 @@ mod tests {
             ClientInfo { id: "c1".into(), term: "xterm-ghostty".into(), name: None, cols: 80, rows: 24, since: 0 };
         assert_eq!(json(&client), r#"{"id":"c1","term":"xterm-ghostty","name":null,"cols":80,"rows":24,"since":0}"#);
         assert_eq!(json(&MenuOpened::NoClient), r#""no_client""#);
+        // Its program's state (2.0.1): optional, absent while none; a 2.0.0 server's pane reads with none.
+        let pane = PaneInfo {
+            id: "p1".into(),
+            member: "dev".into(),
+            role: String::new(),
+            tab: "Agents".into(),
+            pid: 42,
+            cols: 80,
+            rows: 24,
+            status: Some("working".into()),
+            since: Some(7),
+        };
+        let older = r#"{"id":"p1","member":"dev","role":"","tab":"Agents","pid":42,"cols":80,"rows":24}"#;
+        assert_eq!(json(&pane), older.replace('}', r#","status":"working","since":7}"#));
+        assert_eq!(json(&PaneInfo { status: None, since: None, ..pane.clone() }), older);
+        assert_eq!(read::<PaneInfo>(older), PaneInfo { status: None, since: None, ..pane });
         // A field a later version adds: the sheet, on its first field.
         assert_eq!(
             read::<Request>(r#"{"open_menu":{"member":"dev","field":"color"}}"#),

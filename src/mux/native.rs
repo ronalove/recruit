@@ -19,6 +19,7 @@ use super::proto::{ClientInfo, MenuOpened as Opened, PaneInfo, PaneSpec, Reply, 
 use super::socket;
 use crate::backend::{Backend, JournalSize, MenuOpened, Pane, PaneState, Plan, RunningTeam};
 use crate::layout::Tab;
+use crate::look;
 use crate::{state, t};
 
 /// How long `Build` may take: it starts every pane.
@@ -228,7 +229,15 @@ impl Backend for Native {
         let panes: Vec<PaneInfo> = self.ask(&self.state_of(session), Request::Panes, client::ANSWER)?;
         Ok(panes
             .into_iter()
-            .map(|pane| PaneState { id: pane.id, member: pane.member, role: pane.role, window: pane.tab })
+            .map(|pane| PaneState {
+                id: pane.id,
+                member: pane.member,
+                role: pane.role,
+                window: pane.tab,
+                // A name this recruit does not know (a later server's): none, as said.
+                status: pane.status.as_deref().map(look::State::named).filter(|s| *s != look::State::Other),
+                since: pane.since,
+            })
             .collect())
     }
 

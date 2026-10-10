@@ -263,7 +263,8 @@ fn osc_7501(rest: &str) -> Option<Sniffed> {
     if rest.starts_with('?') {
         return Some(Sniffed::StatusQuery);
     }
-    let mut status = Status { state: State::Clear, kind: None, progress: None, title: None, message: None, id: None };
+    let mut status =
+        Status { state: State::Clear, kind: None, progress: None, title: None, message: None, id: None, app: None };
     let mut state = None;
     let decoded = |text: &str| base64_decode(text).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
     for field in rest.split(':') {
@@ -274,13 +275,15 @@ fn osc_7501(rest: &str) -> Option<Sniffed> {
                     "idle" => Some(State::Idle),
                     "working" => Some(State::Working),
                     "blocked" => Some(State::Blocked),
-                    "done" => Some(State::Done),
+                    // A turn that failed (an API error; Claude Code 2.1.296, its message the failure): over too.
+                    "done" | "error" => Some(State::Done),
                     "clear" => Some(State::Clear),
                     _ => None,
                 }
             }
             "kind" => status.kind = Some(value.to_string()),
             "id" => status.id = Some(value.to_string()),
+            "app" => status.app = Some(value.to_string()),
             "progress" => status.progress = value.parse::<u32>().ok().map(|p| p.min(100) as u8),
             "title" => status.title = decoded(value),
             "msg" => status.message = decoded(value),
@@ -415,23 +418,44 @@ mod tests {
         let msg = base64_encode("approve Write: /tmp/note.txt".as_bytes());
         let blocked = format!("\x1b]7501;state=blocked:app=claude-code:kind=permission:msg={msg}\x07");
         let working = b"\x1b]7501;state=working:app=claude-code:id=7:progress=140:title=Q2xhdWRl\x1b\\";
-        let status = |state| Status { state, kind: None, progress: None, title: None, message: None, id: None };
+        let status =
+            |state| Status { state, kind: None, progress: None, title: None, message: None, id: None, app: None };
+        let claude = |state| Status { app: Some("claude-code".into()), ..status(state) };
         assert_eq!(
             sniff(&[blocked.as_bytes(), working, b"\x1b]7501;state=sleeping\x07\x1b]7501;state=clear\x07"]),
             [
                 Sniffed::Status(Status {
                     kind: Some("permission".into()),
                     message: Some("approve Write: /tmp/note.txt".into()),
-                    ..status(State::Blocked)
+                    ..claude(State::Blocked)
                 }),
                 Sniffed::Status(Status {
                     progress: Some(100),
                     title: Some("Claude".into()),
                     id: Some("7".into()),
-                    ..status(State::Working)
+                    ..claude(State::Working)
                 }),
                 Sniffed::Status(status(State::Clear)),
             ]
+        );
+        // As Claude Code 2.1.296 writes them: a sub-agent's end (no `app`), then its own state; and what
+        // `recruit _member` writes once its Claude stopped.
+        assert_eq!(
+            sniff(&[
+                b"\x1b]7501;state=clear:id=a1b2\x1b\\\x1b]7501;state=working:app=claude-code\x1b\\",
+                b"\x1b]7501;state=clear:app=recruit\x07"
+            ]),
+            [
+                Sniffed::Status(Status { id: Some("a1b2".into()), ..status(State::Clear) }),
+                Sniffed::Status(claude(State::Working)),
+                Sniffed::Status(Status { app: Some("recruit".into()), ..status(State::Clear) }),
+            ]
+        );
+        // A turn that failed: over.
+        let failed = format!("\x1b]7501;state=error:app=claude-code:msg={}\x1b\\", base64_encode(b"API Error: 529"));
+        assert_eq!(
+            sniff(&[failed.as_bytes()]),
+            [Sniffed::Status(Status { message: Some("API Error: 529".into()), ..claude(State::Done) })]
         );
     }
 
