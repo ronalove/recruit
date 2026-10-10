@@ -302,9 +302,13 @@ fn click_command(exe: &str) -> String {
 
 /// What a member's pane runs: `recruit _member`, which starts Claude again when it stops on its own, then the
 /// user's shell if it gives up.
+/// The script catches SIGINT and does nothing with it: a Ctrl-C during the pause before a restart reaches the whole
+/// foreground group, and dash or busybox ash (`/bin/sh` on Debian, Alpine) would end there, the pane with them, rather
+/// than go on to the shell. A caught signal goes back to its default in what the script runs, unlike an ignored one:
+/// `_member` and Claude get their Ctrl-C as before.
 pub fn member_script(exe: &str, state: &Path, name: &str, resume: bool) -> String {
     let resume = if resume { " --resume" } else { "" };
-    format!("{} _member{resume} {} {}; {SHELL}", quote(exe), quote(&state.to_string_lossy()), quote(name))
+    format!("trap : INT; {} _member{resume} {} {}; {SHELL}", quote(exe), quote(&state.to_string_lossy()), quote(name))
 }
 
 /// The environment of a member's pane: who it is; for the mod, who to call, where the team is, which language it
@@ -512,6 +516,22 @@ fn print_plan(plan: &Plan, commands: &[(String, String, std::path::PathBuf)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ctrl_c_in_the_pause_leaves_the_shell() {
+        let script = member_script("/opt/re cruit", Path::new("/tmp/x"), "dev", true);
+        assert_eq!(script, r#"trap : INT; '/opt/re cruit' _member --resume /tmp/x dev; exec "${SHELL:-/bin/sh}" -l"#);
+        // dash behaves as busybox ash: a Ctrl-C to the group while it waits for `_member` (here a subshell that
+        // sends it) ends the script before its shell, unless it is caught. In a process group of its own: the
+        // signal reaches the script and what it runs, not the tests.
+        if !Path::new("/bin/dash").exists() {
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+        let script = "trap : INT; (kill -INT 0; sleep 1); echo after";
+        let out = std::process::Command::new("/bin/dash").args(["-c", script]).process_group(0).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("after"));
+    }
 
     #[test]
     fn the_menu_line_reads_back() {

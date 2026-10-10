@@ -1255,8 +1255,11 @@ fn cards(rows: &[Vec<(&Card, usize, Helpers)>], width: usize, b: &Board) -> Draw
         for (c, w, card) in &row {
             let zone = |kind, row, col, rows, cols| Zone { member: c.name.clone(), kind, row, col, rows, cols };
             drawn.zones.push(zone(ZoneKind::Member, top, col, card.len(), *w));
-            if let Some(cols) = compaction_cells(c) {
-                drawn.zones.push(zone(ZoneKind::Compact, top + card.len() - 1, col + w - 1 - cols, 1, cols));
+            // A card too narrow for its context shows none of it: nothing to compact there.
+            if let Some(cols) = compaction_cells(c).filter(|cols| cols < w)
+                && let Some(last) = card.len().checked_sub(1)
+            {
+                drawn.zones.push(zone(ZoneKind::Compact, top + last, col + w - 1 - cols, 1, cols));
             }
             col += w;
         }
@@ -2001,6 +2004,28 @@ mod tests {
             absent: vec!["ops".into()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn no_size_too_small() {
+        // The cards of the captures, the same with long names, in Unicode and Nerd Font: no size makes it panic.
+        let long: Vec<Card> = capture()
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| Card { name: format!("{}-avec-un-nom-très-long-{i}", c.name), ..c })
+            .collect();
+        let boards = [board(capture()), Board { glyphs: Glyphs::Nerd, ..board(long) }, board(Vec::new())];
+        let mut failed = Vec::new();
+        for width in (0..=40).chain((44..=120).step_by(8)) {
+            for height in (0..=16).chain((20..=40).step_by(5)) {
+                for (i, b) in boards.iter().enumerate() {
+                    if std::panic::catch_unwind(|| render(b, width, height)).is_err() {
+                        failed.push(format!("the dashboard {i} at {width} × {height}"));
+                    }
+                }
+            }
+        }
+        assert!(failed.is_empty(), "{} failed: {}", failed.len(), failed.join(", "));
     }
 
     /// The team of a capture: thirteen members, the contact and nine agents at rest (two who just finished, some
