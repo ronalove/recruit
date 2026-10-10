@@ -30,10 +30,13 @@ pub(super) enum Sniffed {
     Status(Status),
     /// RIS (`ESC c`): the terminal back to its initial state, program status included.
     Reset,
+    /// `CSI ? 2026 l` (mode 2026 among others, maybe): the end of a synchronized update, wherever it is in a read.
+    SyncEnd,
 }
 
-/// Bytes of a CSI kept, enough for those looked for.
-const CSI_KEPT: usize = 16;
+/// Bytes of a CSI kept, enough for those looked for: a mode reset that lists 2026 among a dozen others too. Past it,
+/// what is kept is cut, and a cut parameter that would read 2026 does no harm (the engine checks the mode itself).
+const CSI_KEPT: usize = 64;
 
 /// Bytes of an OSC kept, past which a notification is dropped.
 const OSC_KEPT: usize = 64 * 1024;
@@ -128,6 +131,13 @@ impl Sniffer {
                     return match (&self.kept[..], byte) {
                         (b">" | b">0", b'q') => Some(Sniffed::Version),
                         (b"?996", b'n') => Some(Sniffed::ColorScheme),
+                        (kept, b'l')
+                            if kept
+                                .strip_prefix(b"?")
+                                .is_some_and(|modes| modes.split(|&byte| byte == b';').any(|mode| mode == b"2026")) =>
+                        {
+                            Some(Sniffed::SyncEnd)
+                        }
                         _ => None,
                     };
                 }
@@ -359,6 +369,18 @@ mod tests {
         );
         // Cut anywhere.
         assert_eq!(sniff(&[b"\x1b", b"[", b">", b"0", b"q"]), [Sniffed::Version]);
+    }
+
+    #[test]
+    fn ends_of_synchronized_updates_are_found() {
+        assert_eq!(
+            sniff(&[b"\x1b[?2026h a \x1b[?2026l b \x1b[?1000;2026l\x1b[?20260l\x1b[2026l\x1b[?2026h"]),
+            [Sniffed::SyncEnd, Sniffed::SyncEnd]
+        );
+        assert_eq!(sniff(&[b"\x1b[?20", b"26", b"l"]), [Sniffed::SyncEnd]);
+        // At the end of a long list of modes, cut anywhere.
+        assert_eq!(sniff(&[b"\x1b[?1000;1002;1006;2026l"]), [Sniffed::SyncEnd]);
+        assert_eq!(sniff(&[b"\x1b[?1000;1002;10", b"06;1004;2004;2026l"]), [Sniffed::SyncEnd]);
     }
 
     #[test]

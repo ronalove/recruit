@@ -97,6 +97,13 @@ impl Server {
         serde_json::from_str(&self.ctl(["where"])).expect("where: JSON")
     }
 
+    /// Whether the server of this state folder still lives, from outside: its lock file is held (`flock` fails for
+    /// us). Cheap, and true only while a server holds it: a process that took the server's pid since is no proof.
+    pub fn alive(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let lock = self.state.join("server.lock");
+        move || holds_lock(&lock)
+    }
+
     /// The server's pid.
     pub fn pid(&self) -> u32 {
         self.where_json()["pid"].as_u64().expect("where: pid") as u32
@@ -296,5 +303,60 @@ fn processes() -> Vec<String> {
             .filter(|l| l.split_whitespace().next().and_then(|p| p.parse::<u32>().ok()) != Some(me))
             .map(String::from)
             .collect()
+    }
+}
+
+/// Whether something holds the lock file `lock` (`flock`): trying to take it fails. A file that is not there, or
+/// that cannot be opened, is no one's.
+fn holds_lock(lock: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(file) = std::fs::OpenOptions::new().write(true).open(lock) else { return false };
+    // SAFETY: `flock` on a descriptor we own; taken, it is let go with the file when this function ends.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
+}
+
+/// Stops a process now and then (SIGSTOP, then SIGCONT `pause` later), so that its reads come late, as on a slow
+/// runner. Made to be harmless: before each SIGSTOP `alive` must say the process is still the one meant (a pid
+/// may be taken by another once it is gone), a SIGCONT always follows a SIGSTOP, and dropping it (a failed
+/// assertion included) ends the thread, waits for it and lets the process go.
+pub struct Staller {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Staller {
+    pub fn start(
+        pid: u32,
+        every: Duration,
+        pause: Duration,
+        alive: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Staller {
+        use std::sync::atomic::Ordering;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        let pid = pid as libc::pid_t;
+        let thread = std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                std::thread::sleep(every);
+                // Checked at the last moment, and again for nothing else: no signal to what may not be the server.
+                if flag.load(Ordering::Relaxed) || !alive() {
+                    break;
+                }
+                // SAFETY: plain signals to the process the test started; the SIGCONT always follows.
+                unsafe { libc::kill(pid, libc::SIGSTOP) };
+                std::thread::sleep(pause);
+                unsafe { libc::kill(pid, libc::SIGCONT) };
+            }
+        });
+        Staller { done, thread: Some(thread) }
+    }
+}
+
+impl Drop for Staller {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }

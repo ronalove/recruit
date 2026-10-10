@@ -278,7 +278,23 @@ impl Ghostty {
             }
             Sniffed::Status(_) => {}
             Sniffed::Reset => self.armed = false,
+            Sniffed::SyncEnd => self.sync_ended(),
         }
+    }
+
+    /// The program ended a synchronized update, maybe in the middle of a read: the frame it made is shown whole, and
+    /// an update that begins further in the same read gets a deadline of its own ([`Ghostty::written`] sees the mode
+    /// at the end of a read only). Otherwise, when the reads come late (a busy machine), each one holds the end of an
+    /// update and the start of the next: the next would keep the old deadline, or none after an expiry, and show half
+    /// made; and the frames between would never show.
+    fn sync_ended(&mut self) {
+        if self.term.mode(Mode::SYNC_OUTPUT).unwrap_or(false) {
+            return;
+        }
+        self.sync_until = None;
+        self.sync_expired = false;
+        let mut view = self.view.borrow_mut();
+        self.capture(&mut view);
     }
 
     fn syncing(&self) -> bool {
@@ -844,6 +860,44 @@ mod tests {
         answer(&mut engine, b"\x1b]7501;?\x1b\\\x1bc");
         answer(&mut engine, working);
         assert!(relays(&mut engine).is_empty());
+    }
+
+    #[test]
+    fn an_update_that_ends_and_begins_in_one_read() {
+        // Output read late: the end of one update and the start of the next come in one read.
+        let mut engine = engine();
+        answer(&mut engine, b"\x1b[?2026h\x1b[2J\x1b[Hone");
+        let first = engine.sync_until.expect("a deadline");
+        std::thread::sleep(Duration::from_millis(2));
+        answer(&mut engine, b"\x1b[?2026l\x1b[?2026h\x1b[2J\x1b[Htwo");
+        // The next update has a deadline of its own, and holds the frame: the first update, whole.
+        assert!(engine.sync_until.is_some_and(|next| next > first), "the first update's deadline kept");
+        assert_eq!(rows(&engine)[0], "one");
+        // Past its deadline, frames go on; then it ends, and the next begins, in one read: held all the same.
+        let mut replies = Vec::new();
+        assert!(engine.expire(engine.sync_until.unwrap(), &mut replies));
+        assert_eq!(rows(&engine)[0], "two");
+        answer(&mut engine, b"\x1b[?2026l\x1b[?2026h\x1b[2J\x1b[Hthr");
+        assert!(engine.sync_until.is_some(), "the next update not held");
+        assert_eq!(rows(&engine)[0], "two", "half of the next update shown");
+        // Its end shows it whole.
+        answer(&mut engine, b"ee\x1b[?2026l");
+        assert_eq!(rows(&engine)[0], "three");
+    }
+
+    #[test]
+    fn every_whole_frame_of_a_late_read_shows() {
+        // A read that holds several updates, the last one unfinished: the last whole frame shows, not the first one,
+        // nor the unfinished one.
+        let mut engine = engine();
+        rows(&engine);
+        answer(&mut engine, b"\x1b[?2026h\x1b[Ha\x1b[?2026l\x1b[?2026h\x1b[Hb\x1b[?2026l\x1b[?2026h\x1b[Hc");
+        assert!(engine.sync_until.is_some());
+        assert_eq!(rows(&engine)[0], "b");
+        // A mode 2026 reset among others ends it too.
+        answer(&mut engine, b"\x1b[?1000;2026l");
+        assert_eq!(rows(&engine)[0], "c");
+        assert!(engine.sync_until.is_none());
     }
 
     #[test]

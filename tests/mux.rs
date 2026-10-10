@@ -16,7 +16,7 @@ use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::Processor;
 use common::fakes;
 use common::pty::{Profile, TestTerm};
-use common::server::Server;
+use common::server::{Server, Staller};
 
 #[test]
 #[ignore = "started by the other tests only"]
@@ -117,11 +117,32 @@ fn relays(xtversion: Option<&'static str>) {
 /// letters at once.
 #[test]
 fn no_partial_frame() {
+    let (frames, partial) = partial_frames(20, false);
+    assert!(frames > 0, "no synchronized frame at all");
+    assert_eq!(partial, 0, "{partial} partial frames out of {frames}");
+}
+
+/// The same, with a server that reads late, as on a slow CI runner (the macOS one: 61 partial frames out of 88): it is
+/// stopped for 45 ms every 175 ms (SIGSTOP, SIGCONT: more than the 30 ms the fake leaves between two rounds, and, with a round's own 50 ms, well under the 150 ms the multiplexer waits for an end of update), so that a read holds the end of a synchronized update and the
+/// start of the next one together. The fake's own pauses stay under the multiplexer's 150 ms limit.
+#[test]
+fn no_partial_frame_when_the_server_reads_late() {
+    let (frames, partial) = partial_frames(24, true);
+    assert!(frames > 0, "no synchronized frame at all");
+    assert_eq!(partial, 0, "{partial} partial frames out of {frames}");
+}
+
+/// Plays the multiplexer's frames for `rounds` rounds of the `sync` fake, one by one on a terminal of its own; the
+/// frames, and those that show two letters at once. With `stall`, the server is stopped now and then.
+fn partial_frames(rounds: usize, stall: bool) -> (usize, usize) {
     let dir = tempfile::tempdir().expect("temp dir");
     let (cols, rows) = (100u16, 30u16);
-    let rounds = 20;
     let (mut server, term) = served(dir.path(), "sync", &[("SYNC_ROUNDS", rounds.to_string())], cols, rows, None);
+    // Dropped at the end of the function, or by a failed assertion on the way: the server is let go either way.
+    let staller = stall
+        .then(|| Staller::start(server.pid(), Duration::from_millis(130), Duration::from_millis(45), server.alive()));
     assert!(term.wait_for("SYNC DONE", Duration::from_secs(30)), "{:#?}", term.screen());
+    drop(staller);
     let raw = term.raw();
     drop(term);
     server.stop();
@@ -153,8 +174,7 @@ fn no_partial_frame() {
         }
     }
     println!("{frames} images, {partial} partielles, {} lettres vues sur {rounds}", seen.len());
-    assert!(frames > 0, "no synchronized frame at all");
-    assert_eq!(partial, 0, "{partial} partial frames out of {frames}");
+    (frames, partial)
 }
 
 /// The fake's letters that show on `term`'s screen.
@@ -177,4 +197,105 @@ fn letters_on<T>(term: &Term<T>) -> std::collections::BTreeSet<char> {
 
 fn common_listener() -> alacritty_terminal::event::VoidListener {
     alacritty_terminal::event::VoidListener
+}
+
+/// Whether process `pid` is stopped (SIGSTOP), by `ps`.
+fn stopped(pid: u32) -> bool {
+    let out = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().expect("ps");
+    String::from_utf8_lossy(&out.stdout).trim_start().starts_with('T')
+}
+
+/// Whether process `pid` is stopped at any moment of `window`, looked at every 5 ms.
+fn stops_within(pid: u32, window: Duration) -> bool {
+    let until = std::time::Instant::now() + window;
+    while std::time::Instant::now() < until {
+        if stopped(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+/// A process of the test's that the staller may be pointed at: it only sleeps. Killed when dropped.
+struct Sleeper(std::process::Child);
+
+impl Sleeper {
+    fn new() -> Sleeper {
+        Sleeper(std::process::Command::new("sleep").arg("60").spawn().expect("sleep"))
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for Sleeper {
+    fn drop(&mut self) {
+        // SAFETY: a signal to our own child, which may be stopped.
+        unsafe { libc::kill(self.0.id() as libc::pid_t, libc::SIGCONT) };
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The staller is the one thing in the tests that signals a process by its pid: it stops when what it was started
+/// on is gone (the server's lock no longer held), and sends no SIGSTOP after that, so that a pid taken by another
+/// process is never touched. Here the process stays and `alive` turns false: no stop after the thread's last one.
+#[test]
+fn the_staller_sends_no_signal_once_the_server_is_gone() {
+    let sleeper = Sleeper::new();
+    let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flag = alive.clone();
+    let staller = Staller::start(sleeper.pid(), Duration::from_millis(20), Duration::from_millis(30), move || {
+        flag.load(std::sync::atomic::Ordering::Relaxed)
+    });
+    // It does stop the process while the server lives (the test would prove nothing otherwise).
+    assert!(stops_within(sleeper.pid(), Duration::from_secs(2)), "the staller never stopped the process");
+    alive.store(false, std::sync::atomic::Ordering::Relaxed);
+    // The pause in progress ends (SIGCONT), then nothing more for a good while.
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!stops_within(sleeper.pid(), Duration::from_millis(800)), "a SIGSTOP went out after the server was gone");
+    drop(staller);
+}
+
+/// Dropping the staller, in the middle of a pause, lets the process go at once and for good.
+#[test]
+fn dropping_the_staller_lets_the_process_go() {
+    let sleeper = Sleeper::new();
+    // A pause long enough to be in the middle of it when it is dropped.
+    let staller = Staller::start(sleeper.pid(), Duration::from_millis(10), Duration::from_millis(400), || true);
+    assert!(stops_within(sleeper.pid(), Duration::from_secs(2)), "the staller never stopped the process");
+    drop(staller);
+    assert!(!stopped(sleeper.pid()), "the process is still stopped after the drop");
+    assert!(!stops_within(sleeper.pid(), Duration::from_millis(600)), "stopped again after the drop");
+}
+
+/// A failed assertion with the staller on the way (the way the late-reading test can fail) leaves nothing stopped,
+/// and no signal after.
+#[test]
+fn a_failed_assertion_leaves_no_stopped_process() {
+    let sleeper = Sleeper::new();
+    let pid = sleeper.pid();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _staller = Staller::start(pid, Duration::from_millis(10), Duration::from_millis(400), || true);
+        assert!(stops_within(pid, Duration::from_secs(2)), "the staller never stopped the process");
+        panic!("the test fails in the middle of a pause");
+    }));
+    assert!(result.is_err(), "the assertion should have failed");
+    assert!(!stopped(pid), "the process is still stopped after the failure");
+    assert!(!stops_within(pid, Duration::from_millis(600)), "stopped again after the failure");
+}
+
+/// The staller's `alive` for a real server: true while it runs, false once it is stopped (its lock let go), and for a
+/// folder that never had one.
+#[test]
+fn the_servers_lock_says_whether_it_lives() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (mut server, term) = served(dir.path(), "sync", &[("SYNC_ROUNDS", "1".to_string())], 100, 30, None);
+    let alive = server.alive();
+    assert!(alive(), "a running server does not hold its lock");
+    drop(term);
+    server.stop();
+    assert!(!alive(), "a stopped server still holds its lock");
 }
