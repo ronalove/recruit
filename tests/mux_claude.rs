@@ -786,7 +786,8 @@ model = \"haiku\"
     phase(
         &term,
         "work",
-        "Create the file note-{member}.txt containing the word hello, then run the shell command `sleep 6`, then reply with the single word done.",
+        "Create the file note-{member}.txt containing the word hello, then run the shell command `sleep 6`, \
+         then reply with the single word done.",
         Duration::from_secs(8),
         &mut event,
         &mut rows,
@@ -795,7 +796,8 @@ model = \"haiku\"
     phase(
         &term,
         "background",
-        "Start the shell command `sleep 25` in the background (run_in_background), then reply with the single word started, and stop.",
+        "Start the shell command `sleep 25` in the background (run_in_background), \
+         then reply with the single word started, and stop.",
         Duration::from_secs(35),
         &mut event,
         &mut rows,

@@ -249,7 +249,8 @@ impl Drop for Server {
 }
 
 /// The processes still running whose command line (or, under Linux, environment) names `root` (the test's own
-/// folder): the server, its client, the fakes (`spawn_fake` puts the folder on their command line). Each as "pid command line environment".
+/// folder): the server, its client, the fakes (`spawn_fake` puts the folder on their command line). Each as "pid
+/// command line environment".
 pub fn leftovers(root: &Path) -> Vec<String> {
     let root = root.to_string_lossy();
     processes()

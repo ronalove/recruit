@@ -123,8 +123,12 @@ fn no_partial_frame() {
 }
 
 /// The same, with a server that reads late, as on a slow CI runner (the macOS one: 61 partial frames out of 88): it is
-/// stopped for 45 ms every 175 ms (SIGSTOP, SIGCONT: more than the 30 ms the fake leaves between two rounds, and, with a round's own 50 ms, well under the 150 ms the multiplexer waits for an end of update), so that a read holds the end of a synchronized update and the
-/// start of the next one together. The fake's own pauses stay under the multiplexer's 150 ms limit.
+/// stopped for 120 ms every 130 ms (SIGSTOP, SIGCONT). A read then holds the end of a synchronized update and the start
+/// of the next one together (the fake leaves 30 ms between two rounds), and a round takes the fake's own 50 ms and the
+/// server's stop: about 170 ms from the start of an update to its end on the screen, more than the 150 ms the engine
+/// once
+/// waited for an end of update, and far less than its 1 s (Ghostty's `sync_reset_ms`). So it also keeps the limit from
+/// going back down.
 #[test]
 fn no_partial_frame_when_the_server_reads_late() {
     let (frames, partial) = partial_frames(24, true);
@@ -140,7 +144,7 @@ fn partial_frames(rounds: usize, stall: bool) -> (usize, usize) {
     let (mut server, term) = served(dir.path(), "sync", &[("SYNC_ROUNDS", rounds.to_string())], cols, rows, None);
     // Dropped at the end of the function, or by a failed assertion on the way: the server is let go either way.
     let staller = stall
-        .then(|| Staller::start(server.pid(), Duration::from_millis(130), Duration::from_millis(45), server.alive()));
+        .then(|| Staller::start(server.pid(), Duration::from_millis(130), Duration::from_millis(120), server.alive()));
     assert!(term.wait_for("SYNC DONE", Duration::from_secs(30)), "{:#?}", term.screen());
     drop(staller);
     let raw = term.raw();

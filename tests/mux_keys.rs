@@ -967,7 +967,8 @@ fn colors_in(png: &Path) -> Result<usize, String> {
 /// come to the front), and `window_shots` named:
 ///
 /// ```sh
-/// SHOTS_CONSENT=$(date +%F) SHOTS_FILE=<file> SHOTS_OUT=<folder> cargo test --test mux_keys -- --ignored --nocapture --test-threads=1 window_shots
+/// SHOTS_CONSENT=$(date +%F) SHOTS_FILE=<file> SHOTS_OUT=<folder> cargo test --test mux_keys -- --ignored --nocapture
+/// --test-threads=1 window_shots
 /// ```
 ///
 /// `SHOTS_TERMINALS` (comma-separated, all by default), `SHOTS_SECS` (how long each window stays, 8 by default).

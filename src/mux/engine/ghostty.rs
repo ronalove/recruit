@@ -37,8 +37,10 @@ const CELL_PIXELS: (u32, u32) = (8, 16);
 /// What XTVERSION reports.
 const VERSION: &str = concat!("recruit ", env!("CARGO_PKG_VERSION"));
 
-/// How long a synchronized update may hold the frame, as terminals do.
-const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
+/// How long a synchronized update may hold the frame, from its start, against a program that never ends it: Ghostty's
+/// value (`sync_reset_ms`). Shorter, an update that takes its time to come through (a slow machine, a reader late
+/// behind a small PTY buffer) shows half made, frame after frame, while its program is fine.
+const SYNC_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Bytes written between two steps of history compression while a program writes.
 const COMPRESS_EVERY: usize = 64 * 1024;
@@ -860,6 +862,26 @@ mod tests {
         answer(&mut engine, b"\x1b]7501;?\x1b\\\x1bc");
         answer(&mut engine, working);
         assert!(relays(&mut engine).is_empty());
+    }
+
+    #[test]
+    fn an_update_may_take_its_time() {
+        // A slow machine: the update comes through in pieces, well past 150 ms; held all the same, up to a second.
+        let mut engine = engine();
+        answer(&mut engine, b"\x1b[Hold");
+        rows(&engine);
+        let start = Instant::now();
+        answer(&mut engine, b"\x1b[?2026h\x1b[Hne");
+        let mut replies = Vec::new();
+        assert!(!engine.expire(start + Duration::from_millis(500), &mut replies));
+        assert_eq!(rows(&engine)[0], "old");
+        answer(&mut engine, b"w\x1b[?2026l");
+        assert_eq!(rows(&engine)[0], "new");
+        // A program that never ends one: shown after a second.
+        answer(&mut engine, b"\x1b[?2026h\x1b[Hstuck");
+        assert_eq!(rows(&engine)[0], "new");
+        assert!(engine.expire(Instant::now() + SYNC_TIMEOUT, &mut replies));
+        assert_eq!(rows(&engine)[0], "stuck");
     }
 
     #[test]

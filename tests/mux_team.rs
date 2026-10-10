@@ -96,7 +96,7 @@ fn noted(team: &Team, member: &str) -> String {
 /// S1, S2: a member that stops on its own comes back 2 s later on its conversation (`-r <session>`); stopped twice
 /// just after starting, it is not started again; and the team's stop starts nothing again.
 #[test]
-#[ignore = "5 s, the 2 s before member.rs notes a session and the 2 s before it starts Claude again: run with --ignored"]
+#[ignore = "5 s: the 2 s before member.rs notes a session, and the 2 s before it starts Claude again"]
 fn a_stopped_member_comes_back() {
     let mut team = Team::new("back", &tables("back", &["lead"], &[("dev", None)], ""));
     team.launch(&["lead", "dev"]);
@@ -304,7 +304,10 @@ fn client_keys_and_buttons() {
     let (lead, board, journal) = (find(&term, "lead"), find(&term, "Tableau de bord"), find(&term, "Journal"));
     check(
         "D3 dashboard right of the contact, journal under the dashboard",
-        matches!((lead, board, journal), (Some(l), Some(b), Some(j)) if b.0 > l.0 && b.1 == l.1 && j.0 == b.0 && j.1 > b.1),
+        matches!(
+            (lead, board, journal),
+            (Some(l), Some(b), Some(j)) if b.0 > l.0 && b.1 == l.1 && j.0 == b.0 && j.1 > b.1
+        ),
         format!("{lead:?} {board:?} {journal:?}"),
     );
     // D4: reduced at launch, then hidden, full, reduced.
@@ -991,7 +994,8 @@ fn screenshots_backend_native() {
     let mut term = client(&team, "lead");
     let lib = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/shots-backend.sh");
     let prelude = format!(
-        "set -euo pipefail; source '{}'; backend=native; session=$TEAM_NAME; state=$TEAM_STATE; OWN_RECRUIT=$RECRUIT; SOCKET=x; ",
+        "set -euo pipefail; source '{}'; backend=native; session=$TEAM_NAME; state=$TEAM_STATE; \
+         OWN_RECRUIT=$RECRUIT; SOCKET=x; ",
         lib.display()
     );
     let sh = |script: &str| {
@@ -1347,7 +1351,8 @@ fn hover_redraws_only_on_change() {
 }
 
 /// R2: `/recruit` (the mod calls `recruit _mod command <state> <member> recruit`): with a client, opens the same
-/// menu and says so; with the menu already open, says so; with no client, says how to get one. In words that name no tmux.
+/// menu and says so; with the menu already open, says so; with no client, says how to get one. In words that name no
+/// tmux.
 #[test]
 fn slash_recruit_opens_the_menu() {
     let mut team = Team::new("slash", &tables("slash", &["lead"], &[("dev", None)], ""));

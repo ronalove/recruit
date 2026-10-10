@@ -173,7 +173,13 @@ fn gallery() {
     term.send(&keys);
     wait(Duration::from_secs(3), || find_in_header(&term, "work").is_some());
     println!("panes at 140x40: {}", team.ctl(["panes", "--json"]));
-    gallery.shot(&team, &term, "02-work-tab-140x40", "tab 2: at work, waiting, at rest, done (a pane whose program ended is closed at once: no « ended » frame to show)");
+    gallery.shot(
+        &team,
+        &term,
+        "02-work-tab-140x40",
+        "tab 2: at work, waiting, at rest, done \
+         (a pane whose program ended is closed at once: no « ended » frame to show)",
+    );
     // The pointer over the parts of a header and of the bar.
     if let Some(at) = find_in_header(&term, "work") {
         hover(&mut term, at);

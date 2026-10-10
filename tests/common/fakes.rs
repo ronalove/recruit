@@ -377,7 +377,8 @@ fn claude() -> ! {
                     let _ = write!(out, "\x1b]7501;state={}\x07", &command[4..]);
                     let _ = out.flush();
                 }
-                // `msg <to> <text>`: the conversation records a message to a teammate (a `SendMessage` of the model), for
+                // `msg <to> <text>`: the conversation records a message to a teammate (a `SendMessage` of the model),
+                // for
                 // the journal.
                 command if command.starts_with("msg ") => {
                     let (to, text) = command[4..].split_once(' ').unwrap_or((&command[4..], "hello"));
