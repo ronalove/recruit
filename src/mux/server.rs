@@ -17,7 +17,7 @@ mod choice;
 mod pane;
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -37,8 +37,8 @@ use super::engine::{MouseTracking, Relay, State};
 use super::input::{self, Button, Event, Mods, Mouse, MouseKind};
 use super::keys::{self, Action, Shortcut};
 use super::proto::{
-    self, Bye, Captured, ClientInfo, ClientMsg, Hello, Kind, MenuOpened, PaneInfo, PaneModes, PaneSpec, PaneStats,
-    Refusal, Reply, Request, ServerMsg, Stats, TabSpec, Welcome,
+    self, Bye, Captured, ClientInfo, ClientMsg, Hello, Kind, MenuField, MenuOpened, PaneInfo, PaneModes, PaneSpec,
+    PaneStats, Refusal, Reply, Request, ServerMsg, Stats, TabSpec, Welcome,
 };
 use super::screen::{self, View};
 use super::select::{self, Selection};
@@ -101,6 +101,8 @@ enum Msg {
     Ready(String),
     /// A command, where its answer goes, and where the connection says it wrote it.
     Command(Request, Sender<Reply>, Receiver<()>),
+    /// The members' looks for their headers, changed (`watch_looks`).
+    Looks(BTreeMap<String, board::MemberLook>),
 }
 
 /// Who asked the team to stop: where its answer goes, and where the connection says it wrote it.
@@ -226,6 +228,8 @@ struct Tab {
     side: Option<Side>,
     /// The pane that had the focus when the tab was last shown: it gets it back, as a tmux window does.
     last: Option<String>,
+    /// The member's pane that takes the tab's room (⌥z, ⤢), the others hidden.
+    zoomed: Option<String>,
 }
 
 /// The panels' column: the dashboard over the journal, by pane ids.
@@ -237,7 +241,7 @@ struct Side {
 
 impl Tab {
     fn new(title: String, panes: Vec<String>) -> Tab {
-        Tab { title, panes, side: None, last: None }
+        Tab { title, panes, side: None, last: None, zoomed: None }
     }
 
     /// Every pane of the tab: the members', then the panels'.
@@ -253,6 +257,9 @@ impl Tab {
     /// Takes pane `id` out of the tab.
     fn forget(&mut self, id: &str) {
         self.panes.retain(|pane| pane != id);
+        if self.zoomed.as_deref() == Some(id) {
+            self.zoomed = None;
+        }
         if let Some(side) = self.side.as_mut() {
             if side.dashboard.as_deref() == Some(id) {
                 side.dashboard = None;
@@ -283,7 +290,7 @@ const COLUMNS: usize = 3;
 struct Server {
     state: PathBuf,
     socket: PathBuf,
-    socket_id: (u64, u64),
+    socket_id: socket::FileId,
     tx: Sender<Msg>,
     gate: Arc<Gate>,
     welcome: Arc<Mutex<Welcome>>,
@@ -347,7 +354,34 @@ struct Server {
     /// The members in the team's order, for their colors (`member_color`).
     order: Vec<String>,
     written: u64,
+    /// What each member's header shows besides its state (model, effort, context), as `watch_looks` last read it.
+    looks: BTreeMap<String, board::MemberLook>,
+    /// When a time in a header shown next changes (12s, 13s; 22m, 23m); `None` when none shows.
+    clock: Option<Instant>,
+    /// A member gone waiting out of sight (F5): its notice, until when it shows.
+    notice: Option<(chrome::Notice, Instant)>,
+    /// Where the notice can be clicked, as last drawn.
+    notice_zone: Option<Rect>,
+    /// Where the headers' parts can be clicked, by pane, as last drawn.
+    parts: Vec<(Rect, String, chrome::Part)>,
+    /// What the pointer is over, among what a click reaches (F3).
+    hover: Option<Hover>,
 }
+
+/// What the pointer can be over, lit (F3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Hover {
+    /// A part of a pane's header, by its pane.
+    Part(String, chrome::Part),
+    /// A tab, a button of the bar.
+    Bar(Target),
+}
+
+/// How often the members' looks are read for their headers.
+const LOOKS: Duration = Duration::from_secs(2);
+
+/// How long a notice shows (F5).
+const NOTICE: Duration = Duration::from_secs(6);
 
 /// `recruit _server <state>`: starts the team's server, detached, and returns once it is ready.
 pub(crate) fn run(state: &Path) -> Result<()> {
@@ -528,6 +562,7 @@ fn prepare(state: &Path, session: &str) -> Result<Ready> {
     let signals = tx.clone();
     std::thread::Builder::new().name("signals".into()).spawn(move || wait_signals(&signals))?;
     accept(listener, tx.clone(), Arc::clone(&welcome))?;
+    watch_looks(state.to_path_buf(), tx.clone())?;
     let server = Server::new(state, session, (path, socket_id), tx, welcome);
     Ok((server, rx, lock))
 }
@@ -538,7 +573,7 @@ impl Server {
     fn new(
         state: &Path,
         session: &str,
-        socket: (PathBuf, (u64, u64)),
+        socket: (PathBuf, socket::FileId),
         tx: Sender<Msg>,
         welcome: Arc<Mutex<Welcome>>,
     ) -> Server {
@@ -585,6 +620,12 @@ impl Server {
             frames: 0,
             order: Vec::new(),
             written: 0,
+            looks: BTreeMap::new(),
+            clock: None,
+            notice: None,
+            notice_zone: None,
+            parts: Vec::new(),
+            hover: None,
         }
     }
 }
@@ -617,6 +658,29 @@ fn redirect(fd: libc::c_int, file: &Path, append: bool) -> Result<()> {
 /// Seconds since the epoch.
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Every [`LOOKS`], the members' looks for their headers (`board::looks`: a few small files), to the loop when they
+/// changed: never on the way to a frame, and no message while nothing changes.
+fn watch_looks(state: PathBuf, tx: Sender<Msg>) -> io::Result<()> {
+    std::thread::Builder::new().name("looks".into()).spawn(move || {
+        let mut last = BTreeMap::new();
+        loop {
+            // A panic in its reading would end the server (the hook): caught, and tried again later.
+            match super::caught(|| board::looks(&state)) {
+                Ok(looks) if looks != last => {
+                    if tx.send(Msg::Looks(looks.clone())).is_err() {
+                        return;
+                    }
+                    last = looks;
+                }
+                Ok(_) => {}
+                Err(why) => log(&format!("looks: {why}")),
+            }
+            std::thread::sleep(LOOKS);
+        }
+    })?;
+    Ok(())
 }
 
 /// A line in `server.log`.
@@ -815,7 +879,8 @@ impl Server {
             let now = Instant::now();
             let frame_due =
                 self.dirty.then(|| if self.echo { now } else { self.last_frame.map_or(now, |at| at + FRAME) });
-            let first = match [frame_due, self.deadline, self.animate].into_iter().flatten().min() {
+            let notice = self.notice.as_ref().map(|(_, until)| *until);
+            let first = match [frame_due, self.deadline, self.animate, self.clock, notice].into_iter().flatten().min() {
                 Some(at) => match rx.recv_timeout(at.saturating_duration_since(now)) {
                     Ok(msg) => Some(msg),
                     Err(RecvTimeoutError::Timeout) => None,
@@ -856,10 +921,16 @@ impl Server {
                 self.stop(&rx, bye, asker);
                 return Ok(());
             }
-            if self.animate.is_some_and(|at| at <= Instant::now()) {
+            let now = Instant::now();
+            if self.animate.is_some_and(|at| at <= now) {
                 self.animate = None;
                 self.dirty = true;
             }
+            if self.clock.is_some_and(|at| at <= now) {
+                self.clock = None;
+                self.dirty = true;
+            }
+            self.check_notice();
             self.expire();
             self.repair();
             self.frame();
@@ -882,10 +953,22 @@ impl Server {
                     return;
                 };
                 log(&format!("pane {id} ({}) ended: {code:?}", self.panes[i].member));
+                // Failed: what it said last (a panic's message), before its pane goes with it.
+                if code != Some(0) {
+                    let rows = self.panes[i].size.1;
+                    let said = self.panes[i].with(|engine| last_words(engine, rows)).unwrap_or_default();
+                    if !said.is_empty() {
+                        log(&format!("pane {id} said: {said}"));
+                    }
+                }
                 self.panes[i].exited = true;
                 self.close_pane(&id);
             }
             Msg::Broken => self.dirty = true,
+            Msg::Looks(looks) => {
+                self.looks = looks;
+                self.dirty = true;
+            }
             Msg::Attach(attaching) => self.attach(*attaching),
             Msg::Client(id, message) => {
                 if self.client.as_ref().is_some_and(|client| client.id == id) {
@@ -953,6 +1036,8 @@ impl Server {
             self.close_pane(&menu);
         }
         self.choice = None;
+        // Its pointer with it.
+        self.hover = None;
         let client = self.client.take()?;
         self.set_attached();
         let Client { out, stream, .. } = client;
@@ -1008,6 +1093,11 @@ impl Server {
 
     fn pane(&self, id: &str) -> Option<&Pane> {
         self.panes.iter().find(|pane| pane.id == id)
+    }
+
+    /// The member whose pane has the focus; `None` for a panel or the menu.
+    fn focused_member(&self) -> Option<&str> {
+        self.focused().filter(|pane| pane.role.is_empty()).map(|pane| pane.member.as_str())
     }
 
     /// An event from the client: the server's keys first, then the focused pane's.
@@ -1138,6 +1228,80 @@ impl Server {
             // The menu open has its own way out.
             Action::Quit if self.menu.is_some() => {}
             Action::Quit => self.ask_quit(),
+            Action::Zoom => {
+                if let Some(id) = self.focused_member().and(self.focus.clone()) {
+                    self.zoom(&id);
+                }
+            }
+            Action::Waiting => self.go_waiting(),
+        }
+    }
+
+    /// What the pointer is over at `col`, `row`, among what a click reaches: lit when it changes (F3). The notice
+    /// first, which hides what is under it, then the bar, then the headers.
+    fn hover_at(&mut self, col: usize, row: usize) {
+        let hover = if self.notice_zone.is_some_and(|zone| zone.contains(col, row)) {
+            None
+        } else if let Some((_, target)) = self.zones.iter().find(|(zone, _)| zone.contains(col, row)) {
+            Some(Hover::Bar(*target))
+        } else {
+            let part = self.parts.iter().find(|(zone, _, _)| zone.contains(col, row));
+            part.map(|(_, id, part)| Hover::Part(id.clone(), *part))
+        };
+        if hover != self.hover {
+            self.hover = hover;
+            self.dirty = true;
+        }
+    }
+
+    /// A press on a part of pane `id`'s header (F2): the name, the model, the effort open the member's sheet in the
+    /// menu, on that field; the context of a member at rest offers to compact it; ⤢ and ⤡ zoom.
+    fn part_click(&mut self, id: &str, part: chrome::Part) {
+        let Some(member) = self.pane(id).filter(|pane| pane.role.is_empty()).map(|pane| pane.member.clone()) else {
+            return;
+        };
+        let field = match part {
+            chrome::Part::Name => MenuField::Name,
+            chrome::Part::Model => MenuField::Model,
+            chrome::Part::Effort => MenuField::Effort,
+            chrome::Part::Context => {
+                // As the header shows it: no file read here.
+                let percent = self.looks.get(&member).and_then(|looks| looks.context);
+                self.open_choice(Open::new(chrome::compact_choice(&member, percent), Purpose::Compact { member }));
+                return;
+            }
+            chrome::Part::Zoom => {
+                self.zoom(id);
+                return;
+            }
+        };
+        if let Err(error) = self.open_menu(None, Some((&member, Some(field)))) {
+            log(&format!("menu: {error:#}"));
+        }
+    }
+
+    /// Member pane `id` takes its tab's room, with the focus; zoomed already, the grid comes back (F4).
+    fn zoom(&mut self, id: &str) {
+        if !self.pane(id).is_some_and(|pane| pane.role.is_empty()) {
+            return;
+        }
+        let Some(tab) = self.tabs.iter().position(|tab| tab.panes.iter().any(|pane| pane == id)) else { return };
+        if self.tabs[tab].zoomed.as_deref() == Some(id) {
+            self.tabs[tab].zoomed = None;
+        } else {
+            self.focus_on(id);
+            self.tabs[tab].zoomed = Some(id.to_string());
+        }
+        self.unselect();
+        self.layout();
+    }
+
+    /// To the member who has waited the longest (⌥g, F6); nothing when none waits.
+    fn go_waiting(&mut self) {
+        let waiting =
+            self.panes.iter().filter(|pane| pane.role.is_empty() && look_state(pane.state) == look::State::Waiting);
+        if let Some(id) = waiting.min_by_key(|pane| pane.since.unwrap_or(u64::MAX)).map(|pane| pane.id.clone()) {
+            self.focus_on(&id);
         }
     }
 
@@ -1226,6 +1390,10 @@ impl Server {
         if let Some(tab) = self.tabs.iter().position(|tab| tab.has(id)) {
             self.active = tab;
             self.tabs[tab].last = Some(id.to_string());
+            // Another pane of a zoomed tab: the grid back, as in tmux.
+            if self.tabs[tab].zoomed.as_deref().is_some_and(|zoomed| zoomed != id) {
+                self.tabs[tab].zoomed = None;
+            }
         }
         if self.focus.as_deref() == Some(id) {
             return;
@@ -1257,6 +1425,35 @@ impl Server {
             return;
         }
         let (col, row) = (mouse.col as usize, mouse.row as usize);
+        if mouse.kind == MouseKind::Moved {
+            self.hover_at(col, row);
+        }
+        // The notice over everything: a click on it goes to its member.
+        if let MouseKind::Down(_) = mouse.kind
+            && self.notice_zone.is_some_and(|zone| zone.contains(col, row))
+        {
+            self.unselect();
+            if let Some((notice, _)) = self.notice.take() {
+                let target = self.panes.iter().find(|pane| pane.role.is_empty() && pane.member == notice.member);
+                if let Some(target) = target.map(|pane| pane.id.clone()) {
+                    self.focus_on(&target);
+                }
+            }
+            // Its release is over the pane under it: not for its program.
+            self.swallowing = true;
+            self.dirty = true;
+            return;
+        }
+        if let MouseKind::Down(Button::Left) = mouse.kind
+            && let Some((id, part)) =
+                self.parts.iter().find(|(zone, _, _)| zone.contains(col, row)).map(|(_, id, part)| (id.clone(), *part))
+        {
+            self.unselect();
+            self.part_click(&id, part);
+            self.swallowing = true;
+            self.dirty = true;
+            return;
+        }
         if let MouseKind::Down(_) = mouse.kind
             && let Some(target) = self.zones.iter().find(|(zone, _)| zone.contains(col, row)).map(|(_, t)| *t)
         {
@@ -1270,7 +1467,7 @@ impl Server {
             self.dirty = true;
             return;
         }
-        let mut shown = self.tabs.get(self.active).map(Tab::ids).unwrap_or_default();
+        let mut shown = self.shown_ids();
         // The menu over the others: first under the pointer, and the only one while it is open.
         if let Some((menu, _)) = &self.menu {
             shown = vec![menu.clone()];
@@ -1440,11 +1637,15 @@ impl Server {
                 dashboard: side.dashboard.clone(),
                 journal: side.journal.clone().map(|id| (id, self.reduced.then_some(JOURNAL_ROWS))),
             });
+            // Zoomed, one pane takes the tab's room, the others keep their size, hidden (their programs are not
+            // resized for nothing); in a tab not shown too, so that going back to it resizes nothing.
+            let zoomed = tab.zoomed.as_deref();
             for (id, area) in layout::rects(width, height, &tab.panes, self.columns, side.as_ref()) {
+                let area = if zoomed == Some(id.as_str()) { Rect { x: 0, y: 0, width, height } } else { area };
                 if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id) {
-                    let shown = if t == self.active { area } else { Rect::default() };
+                    let shown = t == self.active && zoomed.is_none_or(|zoomed| zoomed == id);
                     pane.place(area, screen::content(area));
-                    pane.area = shown;
+                    pane.area = if shown { area } else { Rect::default() };
                 }
             }
         }
@@ -1483,10 +1684,12 @@ impl Server {
     }
 
     /// The relays of every engine taken: kept for the client, or dropped without one (a clipboard filled hours
-    /// later would surprise); the states noted.
+    /// later would surprise); the states noted, and since when; a member gone waiting out of sight noticed (F5).
     fn take_relays(&mut self) {
         let focus = self.focus.clone();
+        let shown = self.shown_ids();
         let mut relays = Vec::new();
+        let mut waiting = None;
         let held = self.gate.hold();
         for pane in &mut self.panes {
             relays.clear();
@@ -1496,6 +1699,13 @@ impl Server {
             }
             for relay in relays.drain(..) {
                 if let Relay::Status(status) = &relay {
+                    let state = look_state(Some(status.state));
+                    if pane.since.is_none() || look_state(pane.state) != state {
+                        pane.since = Some(now());
+                        if state == look::State::Waiting && pane.role.is_empty() && !shown.contains(&pane.id) {
+                            waiting = Some(pane.id.clone());
+                        }
+                    }
                     pane.state = Some(status.state);
                 }
                 if matches!(relay, Relay::Title(_)) && focus.as_deref() != Some(pane.id.as_str()) {
@@ -1507,6 +1717,54 @@ impl Server {
             }
         }
         drop(held);
+        if let Some(id) = waiting {
+            self.notify(&id);
+        }
+    }
+
+    /// The notice of a member gone waiting out of sight, for [`NOTICE`]: the latest only; the others keep their tab's
+    /// badge (⚑). None under a layer (the menu, a choice): nothing covers it, the menu shows each member's state, and
+    /// the notice is forgotten, not shown once the layer goes (architect's decision).
+    fn notify(&mut self, id: &str) {
+        // Without a client, no one to tell: no notice, nor its wake-up.
+        if self.client.is_none() || self.menu.is_some() || self.choice.is_some() {
+            return;
+        }
+        let Some(pane) = self.pane(id) else { return };
+        let Some(tab) = self.tabs.iter().find(|tab| tab.has(id)) else { return };
+        let notice = chrome::Notice {
+            member: pane.member.clone(),
+            color: Some(member_color(&self.order, &pane.member)),
+            text: chrome::notice_text(&pane.member),
+            tab: tab.title.clone(),
+        };
+        self.notice = Some((notice, Instant::now() + NOTICE));
+        self.dirty = true;
+    }
+
+    /// The notice gone once its time is up, once its member is in sight or no longer waits, or once a layer opens.
+    fn check_notice(&mut self) {
+        let Some((notice, until)) = &self.notice else { return };
+        let pane = self.panes.iter().find(|pane| pane.role.is_empty() && pane.member == notice.member);
+        let over = *until <= Instant::now()
+            || self.menu.is_some()
+            || self.choice.is_some()
+            || pane.is_none_or(|pane| {
+                look_state(pane.state) != look::State::Waiting || self.shown_ids().contains(&pane.id)
+            });
+        if over {
+            self.notice = None;
+            self.dirty = true;
+        }
+    }
+
+    /// The panes the active tab shows: the zoomed one alone, else all of them.
+    fn shown_ids(&self) -> Vec<String> {
+        let Some(tab) = self.tabs.get(self.active) else { return Vec::new() };
+        match &tab.zoomed {
+            Some(id) => vec![id.clone()],
+            None => tab.ids(),
+        }
     }
 
     /// The next frame, if one is due and the client can take it.
@@ -1535,9 +1793,9 @@ impl Server {
         if !self.compose() {
             return;
         }
-        // Every move: for the focused pane that asks, and for a choice, whose selection follows the pointer.
-        let motion = self.choice.is_some()
-            || self.focused().is_some_and(|pane| pane.modes().mouse == Some(MouseTracking::Motion));
+        // Every move, always: the headers' parts, the tabs and the buttons light up under the pointer (F3), a choice's
+        // selection follows it, the focused pane may ask. Only a change of what is lit draws again.
+        let motion = true;
         let Some(client) = self.client.as_mut() else { return };
         let relays = client.relays.take();
         self.written += relays.len() as u64;
@@ -1549,13 +1807,95 @@ impl Server {
             client.out.message(&ServerMsg::Motion(motion));
         }
         let bytes = client.painter.frame(self.screen.borrow().canvas());
+        self.dirty = false;
+        // Nothing changed on screen, the cursor included (the pointer lit what was lit already): no frame, no round
+        // trip with the client, and the next one is not held back.
+        if bytes.is_empty() {
+            self.echo = false;
+            return;
+        }
         self.frames += 1;
         self.written += bytes.len() as u64;
         client.out.push(Out::Output(bytes));
         client.busy = true;
         self.last_frame = Some(started);
-        self.dirty = false;
         self.echo = false;
+    }
+
+    /// A pane's header: a member's state, since when, its model, effort and context (`looks`), its zoom, and the
+    /// part under the pointer; a panel's title (the dashboard, the journal, the menu). `epoch`: now, in seconds.
+    fn header<'a>(
+        &'a self,
+        pane: &'a Pane,
+        note: Option<&'a str>,
+        zoomed: Option<&str>,
+        epoch: u64,
+    ) -> chrome::Header<'a> {
+        let hint = match pane.role.as_str() {
+            JOURNAL => Some(chrome::Hint::JournalSize),
+            DASHBOARD => Some(self.counts()),
+            _ => None,
+        };
+        let base = chrome::Header {
+            name: &pane.member,
+            state: look_state(pane.state),
+            note,
+            hint,
+            ..chrome::Header::default()
+        };
+        if !pane.role.is_empty() {
+            return base;
+        }
+        let looks = self.looks.get(&pane.member);
+        let context = looks.and_then(|looks| looks.context);
+        // Its program says its state: at rest by it. Else as the dashboard last saw it.
+        let compactable = match pane.state {
+            Some(_) => base.state == look::State::Idle && context.is_some(),
+            None => looks.is_some_and(|looks| looks.compactable),
+        };
+        // At rest by its program, a command still running by `claude agents` (`"status": "shell"`, which OSC 7501 does
+        // not tell): the command's sign, and since when it runs, as its card (architect's decision). At work, or
+        // waiting, its program wins.
+        let shell = looks.is_some_and(|looks| looks.shell)
+            && !matches!(base.state, look::State::Working | look::State::Waiting);
+        let seen = || looks?.since.and_then(|since| u64::try_from(since).ok());
+        let since = if shell { seen().or(pane.since) } else { pane.since.or_else(seen) };
+        let hover = match &self.hover {
+            Some(Hover::Part(id, part)) if *id == pane.id => Some(*part),
+            _ => None,
+        };
+        chrome::Header {
+            // A member's color, as on the dashboard; none for the dashboard, the journal, the menu.
+            color: Some(member_color(&self.order, &pane.member)),
+            model: looks.and_then(|looks| looks.model.as_deref()),
+            effort: looks.and_then(|looks| looks.effort.as_deref()),
+            context,
+            pressure: looks.map(|looks| looks.pressure).unwrap_or_default(),
+            compactable,
+            shell,
+            since: since.map(|since| epoch.saturating_sub(since)),
+            zoom: Some(if zoomed == Some(pane.id.as_str()) { chrome::Zoom::Out } else { chrome::Zoom::In }),
+            hover,
+            ..base
+        }
+    }
+
+    /// How many members work, wait for the user and rest, for the dashboard's border (mock-up B1), as their programs
+    /// say it; for one whose program says nothing (no OSC 7501), as the dashboard last saw it (`looks`).
+    fn counts(&self) -> chrome::Hint {
+        let (mut working, mut waiting, mut idle) = (0, 0, 0);
+        for pane in self.panes.iter().filter(|pane| pane.role.is_empty()) {
+            let seen = || self.looks.get(&pane.member).and_then(|looks| looks.state);
+            let state =
+                if pane.state.is_some() { look_state(pane.state) } else { seen().unwrap_or(look::State::Other) };
+            match state {
+                look::State::Working => working += 1,
+                look::State::Waiting => waiting += 1,
+                look::State::Idle => idle += 1,
+                look::State::Other => {}
+            }
+        }
+        chrome::Hint::Counts { working, waiting, idle }
     }
 
     /// The screen as it is, in `self.screen`: the shown tab's panes in their frames, the bar. False while an engine
@@ -1563,10 +1903,8 @@ impl Server {
     fn compose(&mut self) -> bool {
         let (width, height) = (self.size.0 as usize, self.size.1 as usize);
         let held = self.gate.hold();
-        let mut shown: Vec<&Pane> = match self.tabs.get(self.active) {
-            Some(tab) => tab.ids().into_iter().filter_map(|id| self.pane(&id)).collect(),
-            None => Vec::new(),
-        };
+        let mut shown: Vec<&Pane> = self.shown_ids().into_iter().filter_map(|id| self.pane(&id)).collect();
+        let zoomed = self.tabs.get(self.active).and_then(|tab| tab.zoomed.as_deref());
         // The menu last: drawn over the others.
         shown.extend(self.menu.as_ref().and_then(|(menu, _)| self.pane(menu)));
         let engines: Vec<_> =
@@ -1575,7 +1913,8 @@ impl Server {
             return false;
         }
         let notes: Vec<Option<String>> = shown.iter().map(|pane| note(pane)).collect();
-        let views: Vec<View<'_>> = shown
+        let epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let mut views: Vec<View<'_>> = shown
             .iter()
             .zip(&engines)
             .zip(&notes)
@@ -1583,15 +1922,7 @@ impl Server {
                 id: &pane.id,
                 engine: engine.as_ref(),
                 area: pane.area,
-                header: chrome::Header {
-                    name: &pane.member,
-                    // A member's color, as on the dashboard; none for the dashboard, the journal, the menu.
-                    color: pane.role.is_empty().then(|| member_color(&self.order, &pane.member)),
-                    state: look_state(pane.state),
-                    note: note.as_deref(),
-                    scroll: None,
-                    hint: (pane.role == JOURNAL).then_some(chrome::Hint::JournalSize),
-                },
+                header: self.header(pane, note.as_deref(), zoomed, epoch.as_secs()),
                 focused: self.focus.as_deref() == Some(pane.id.as_str()),
                 selection: self
                     .selection
@@ -1600,13 +1931,15 @@ impl Server {
                     .and_then(|(selection, _)| selection.range()),
             })
             .collect();
+        common_forms(&mut views);
         let tabs: Vec<chrome::Tab<'_>> = self
             .tabs
             .iter()
             .enumerate()
             .map(|(i, tab)| {
                 let states = tab.panes.iter().filter_map(|id| self.pane(id)).map(|pane| look_state(pane.state));
-                chrome::Tab { title: &tab.title, active: i == self.active, state: urgent(states) }
+                let zoomed = tab.zoomed.as_deref().and_then(|id| self.pane(id)).map(|pane| pane.member.as_str());
+                chrome::Tab { title: &tab.title, active: i == self.active, state: urgent(states), zoomed }
             })
             .collect();
         // The spinner turns while a member at work shows, in a header or a tab.
@@ -1623,8 +1956,24 @@ impl Server {
             (None, Some(_)) => screen::Over::LastView,
             (None, None) => screen::Over::Nothing,
         };
-        let composed =
-            super::caught(|| screen.borrow_mut().compose(width, height, &views, team, &tabs, bar, look, over));
+        let hover = match &self.hover {
+            Some(Hover::Bar(target)) => Some(*target),
+            _ => None,
+        };
+        let notice = self.notice.as_ref().map(|(notice, _)| notice);
+        let composed = super::caught(|| {
+            screen.borrow_mut().compose(width, height, &views, team, &tabs, bar, hover, look, over, notice)
+        });
+        // The times shown, ticking: the next image when the first of them changes (not under a layer, dimmed). Under a
+        // minute, only those a header has room for (`shows_since` lays the header out: asked of these only); beyond,
+        // a wake-up a minute costs nothing worth asking.
+        let covered = self.choice.is_some() || self.menu.is_some();
+        let shows = |view: &View<'_>| {
+            view.header.since.filter(|secs| *secs >= 60 || chrome::shows_since(&view.header, view.area.width))
+        };
+        let ticks = views.iter().filter_map(shows).map(|secs| tick(secs, epoch.subsec_nanos()));
+        let clock = if covered { None } else { ticks.min().map(|after| Instant::now() + after) };
+        let ids: Vec<String> = shown.iter().map(|pane| pane.id.clone()).collect();
         // The zones, or whether an engine is to blame.
         let zones = match composed {
             Ok(zones) => Ok(zones),
@@ -1661,11 +2010,14 @@ impl Server {
             }
         };
         self.zones = zones.bar;
+        self.parts =
+            zones.parts.into_iter().filter_map(|(at, i, part)| Some((at, ids.get(i)?.clone(), part))).collect();
+        self.notice_zone = zones.notice;
+        self.clock = clock;
         if let Some(open) = self.choice.as_mut() {
             open.zones = zones.options;
         }
         // Under a layer (the menu, a choice), the spinner shows dimmed: not worth a frame each `look::FRAME`.
-        let covered = self.choice.is_some() || self.menu.is_some();
         self.animate = (working && !covered).then(|| Instant::now() + look::FRAME);
         true
     }
@@ -1758,9 +2110,12 @@ impl Server {
         self.layout();
     }
 
-    /// A pane by its id, else by its member's name.
+    /// A pane by its id, else by its member's name, else by the role of a pane that is no member's (« menu »,
+    /// « dashboard », « journal »).
     fn find(&self, which: &str) -> Option<&Pane> {
-        self.pane(which).or_else(|| self.panes.iter().find(|pane| pane.member == which))
+        self.pane(which)
+            .or_else(|| self.panes.iter().find(|pane| pane.member == which))
+            .or_else(|| self.panes.iter().find(|pane| !pane.role.is_empty() && pane.role == which))
     }
 
     /// A command's answer. The members' order, which gives their colors, is read again after a request that may
@@ -1789,17 +2144,21 @@ impl Server {
         let unknown = |which: &str| Reply::Err(t!("panneau inconnu : {}", "unknown pane: {}", which));
         match request {
             Request::Stop => Reply::Ok(serde_json::Value::Null),
+            // The tabs' panes, then the menu's, floating, in no tab (`_ctl` finds it by its member, « recruit »);
+            // whoever looks for members goes by their role.
             Request::Panes => {
+                let menu = self.menu.as_ref().map(|(menu, _)| (None, menu.clone()));
                 let list: Vec<PaneInfo> = self
                     .tabs
                     .iter()
-                    .flat_map(|tab| tab.ids().into_iter().map(move |id| (tab, id)))
+                    .flat_map(|tab| tab.ids().into_iter().map(move |id| (Some(tab), id)))
+                    .chain(menu)
                     .filter_map(|(tab, id)| self.pane(&id).map(|pane| (tab, pane)))
                     .map(|(tab, pane)| PaneInfo {
                         id: pane.id.clone(),
                         member: pane.member.clone(),
                         role: pane.role.clone(),
-                        tab: tab.title.clone(),
+                        tab: tab.map(|tab| tab.title.clone()).unwrap_or_default(),
                         pid: pane.pty.pid(),
                         cols: pane.size.0,
                         rows: pane.size.1,
@@ -1989,7 +2348,11 @@ impl Server {
             }
             Request::RestoreDashboard { dashboard } => answer(self.restore_dashboard(dashboard)),
             Request::ToggleJournal { journal } => answer(self.toggle_journal(journal)),
-            Request::OpenMenu { member: _, client } => answer(self.open_menu(client.as_deref())),
+            // The member names the client (one only, policy A); with a field, the sheet too.
+            Request::OpenMenu { member, client, field } => {
+                let sheet = member.as_deref().zip(field).map(|(member, field)| (member, Some(field)));
+                answer(self.open_menu(client.as_deref(), sheet))
+            }
         }
     }
 
@@ -2068,10 +2431,15 @@ impl Server {
                 }
             }
         }
-        // Each tab keeps the pane it last had the focus on, wherever that pane went.
+        // Each tab keeps the pane it last had the focus on, wherever that pane went; and its zoom, if the pane zoomed
+        // stays in a tab of the same title (any change from the menu ends here: a new effort keeps the zoom).
         let lasts: Vec<String> = self.tabs.iter().filter_map(|tab| tab.last.clone()).collect();
+        let zooms: Vec<(&str, &str)> =
+            self.tabs.iter().filter_map(|tab| Some((tab.title.as_str(), tab.zoomed.as_deref()?))).collect();
         for tab in &mut arranged {
             tab.last = lasts.iter().find(|last| tab.has(last)).cloned();
+            let zoom = zooms.iter().find(|(title, id)| *title == tab.title && tab.panes.iter().any(|pane| pane == id));
+            tab.zoomed = zoom.map(|(_, id)| id.to_string());
         }
         self.tabs = arranged;
         self.active = self.focus.as_deref().and_then(|id| self.tabs.iter().position(|tab| tab.has(id))).unwrap_or(0);
@@ -2093,7 +2461,7 @@ impl Server {
 
     /// The team's menu (`recruit _menu`) in a pane floating over the team, on the client: `client`, else the one there
     /// is. A menu already open stays: one at a time.
-    fn open_menu(&mut self, client: Option<&str>) -> Result<MenuOpened> {
+    fn open_menu(&mut self, client: Option<&str>, sheet: Option<(&str, Option<MenuField>)>) -> Result<MenuOpened> {
         let Some(attached) = self.client.as_ref().filter(|c| client.is_none_or(|id| c.id == id)) else {
             return Ok(MenuOpened::NoClient);
         };
@@ -2108,6 +2476,12 @@ impl Server {
         argv.extend(["--client".into(), attached.id.clone()]);
         if glyphs(attached) == Glyphs::Nerd {
             argv.push("--nerd".into());
+        }
+        if let Some((member, field)) = sheet {
+            argv.extend(["--member".into(), member.to_string()]);
+            if let Some(field) = field.and_then(MenuField::arg) {
+                argv.extend(["--field".into(), field.into()]);
+            }
         }
         let cwd = self.welcome.lock().unwrap_or_else(PoisonError::into_inner).dir.clone();
         let cwd = if cwd.is_empty() { "/".to_string() } else { cwd };
@@ -2127,9 +2501,11 @@ impl Server {
         Rect { x: (width - w) / 2, y: (height - h) / 2, width: w, height: h }
     }
 
-    /// The menu, on the client.
+    /// The menu, on the client: on the sheet of the active pane's member (⌥r and the bar's button, F7), else on the
+    /// menu's first sheet (the dashboard or the journal active).
     fn menu_here(&mut self) {
-        if let Err(error) = self.open_menu(None) {
+        let member = self.focused_member().map(str::to_string);
+        if let Err(error) = self.open_menu(None, member.as_deref().map(|member| (member, None))) {
             log(&format!("menu: {error:#}"));
         }
     }
@@ -2283,6 +2659,61 @@ fn next_member(members: &[String], focus: Option<&str>) -> Option<String> {
     (Some(next.as_str()) != focus).then(|| next.clone())
 }
 
+/// The members' panes as wide as each other take the same form of header, the poorest that one of them needs (but one
+/// with nothing left at the right: `chrome::common_form`), for their columns to line up (designer, 2026-10-10): a
+/// layout of each header on its own, as `chrome::frame` makes it for its drawing.
+fn common_forms(views: &mut [View<'_>]) {
+    let forms: Vec<Option<(usize, usize)>> = views
+        .iter()
+        .map(|view| view.header.zoom.map(|_| (view.area.width, chrome::form(&view.header, view.area.width))))
+        .collect();
+    for (view, form) in views.iter_mut().zip(&forms) {
+        let Some((width, _)) = form else { continue };
+        view.header.form =
+            chrome::common_form(forms.iter().flatten().filter(|(w, _)| w == width).map(|(_, form)| *form));
+    }
+}
+
+/// What a pane's program wrote last, for the log when it fails: its last lines up to the live screen's last row (its
+/// `rows` rows),
+/// a line wrapped joined to the next, the others by « ⏎ », at most [`LAST_WORDS`] characters.
+fn last_words(engine: &mut dyn super::engine::Engine, rows: u16) -> String {
+    const LINES: u64 = 40;
+    let end = engine.top() + engine.scrolled() as u64 + u64::from(rows);
+    let mut text = String::new();
+    for line in end.saturating_sub(LINES).max(engine.oldest())..end {
+        let Some(line) = engine.line(line) else { continue };
+        if line.wrapped {
+            text.push_str(&line.text);
+        } else if !line.text.trim().is_empty() {
+            text.push_str(line.text.trim_end());
+            text.push_str(" ⏎ ");
+        }
+    }
+    // What a program wrote goes to the log: no control (C0, C1) nor direction mark (as `canvas::bidi`), which would
+    // act on whoever reads it in a terminal.
+    let text: String = text.chars().filter(|&c| !c.is_control() && !direction(c)).collect();
+    let text = text.trim_end_matches(" ⏎ ").trim();
+    let skip = text.chars().count().saturating_sub(LAST_WORDS);
+    text.chars().skip(skip).collect()
+}
+
+/// A mark that changes the direction of the text after it, as `canvas::bidi` knows them.
+fn direction(c: char) -> bool {
+    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// The most of a failed pane's last words the log keeps.
+const LAST_WORDS: usize = 600;
+
+/// How long until a time shown as `secs` (12s, 22m, 1h05) reads otherwise: the next second under a minute, else the
+/// next minute; `nanos`: how far into its second now is.
+fn tick(secs: u64, nanos: u32) -> Duration {
+    let into = Duration::from_nanos(u64::from(nanos));
+    let whole = if secs < 60 { 1 } else { 60 - secs % 60 };
+    Duration::from_secs(whole).saturating_sub(into).max(Duration::from_millis(1))
+}
+
 /// A member's own color, by its place in the team's order, as `board` gives it; one the order does not know yet
 /// (a pane opened by `_ctl`) comes after the others.
 fn member_color(order: &[String], member: &str) -> crossterm::style::Color {
@@ -2390,6 +2821,350 @@ mod tests {
         }
     }
 
+    /// A server for a test, built with `tabs` on an 80 × 24 screen, its members `names` in team.json.
+    fn built(state: &Path, names: &[&str], tabs: Vec<TabSpec>) -> Server {
+        let members =
+            names.iter().map(|name| crate::state::MemberInfo { name: name.to_string(), ..Default::default() });
+        Snapshot { members: members.collect(), ..Default::default() }.write(state).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let welcome = Arc::new(Mutex::new(Welcome::default()));
+        let mut server = Server::new(state, "t", (state.join("s.sock"), socket::FileId::default()), tx, welcome);
+        let build = Request::Build {
+            team: "t".into(),
+            dir: "/".into(),
+            columns: 3,
+            tabs,
+            cols: 80,
+            rows: 24,
+            exe: String::new(),
+            lang: String::new(),
+        };
+        assert!(matches!(server.request(build), Reply::Ok(_)));
+        server
+    }
+
+    /// A client attached to `server`, whose frames nothing reads: the notices are for a client only.
+    fn attached(server: &mut Server) -> UnixStream {
+        let (stream, other) = UnixStream::pair().unwrap();
+        let caps = Caps::default();
+        server.client = Some(Client {
+            id: "c1".into(),
+            stream,
+            out: Arc::new(Outbox::default()),
+            painter: Painter::new(caps.output),
+            caps,
+            term: "xterm".into(),
+            size: (80, 24),
+            since: 0,
+            busy: false,
+            late: false,
+            motion: None,
+            relays: Relays::default(),
+        });
+        other
+    }
+
+    fn id_of(server: &Server, member: &str) -> String {
+        server.panes.iter().find(|pane| pane.member == member).unwrap().id.clone()
+    }
+
+    #[test]
+    fn a_failed_panes_last_words_are_logged_clean() {
+        let state = tempfile::tempdir().unwrap();
+        let mut said = sleeper("dev-a");
+        let script = "printf 'thread main panicked at src/board.rs:9:\\n\\033]0;x\\007over\\302\\233[2J\\342\\200\\256flow\\n'; sleep 30";
+        said.argv = ["/bin/sh", "-c", script].map(String::from).to_vec();
+        let tabs = vec![TabSpec { title: "1".into(), panes: vec![said], side: None }];
+        let server = built(state.path(), &["dev-a"], tabs);
+        let rows = server.panes[0].size.1;
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut words = String::new();
+        while !words.contains("flow") && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+            words = server.panes[0].with(|engine| last_words(engine, rows)).unwrap_or_default();
+        }
+        assert_eq!(words, "thread main panicked at src/board.rs:9: ⏎ over[2Jflow");
+    }
+
+    #[test]
+    fn a_time_shown_ticks_when_its_text_changes() {
+        assert_eq!(tick(12, 0), Duration::from_secs(1));
+        assert_eq!(tick(12, 250_000_000), Duration::from_millis(750));
+        // 2m: 2m30s now, 3m in 30s.
+        assert_eq!(tick(150, 0), Duration::from_secs(30));
+        assert_eq!(tick(3600 + 5 * 60 + 59, 900_000_000), Duration::from_millis(100));
+        assert!(tick(59, 999_999_999) > Duration::ZERO, "never at once");
+    }
+
+    #[test]
+    fn the_clock_ticks_for_a_time_drawn_only() {
+        let state = tempfile::tempdir().unwrap();
+        let tabs = vec![TabSpec { title: "1".into(), panes: vec![sleeper("dev-a")], side: None }];
+        let mut server = built(state.path(), &["dev-a"], tabs);
+        server.panes[0].since = Some(now() - 5);
+        assert!(server.compose());
+        let next = server.clock.expect("seconds shown").saturating_duration_since(Instant::now());
+        assert!(next <= Duration::from_secs(1), "{next:?}");
+        // Too narrow for the time: no wake-up each second.
+        server.size = (12, 24);
+        server.layout();
+        assert!(server.compose());
+        assert_eq!(server.clock, None);
+        // Under a minute no more: a wake-up a minute, whatever the room.
+        server.panes[0].since = Some(now() - 600);
+        assert!(server.compose());
+        assert!(server.clock.is_some());
+    }
+
+    #[test]
+    fn panes_as_wide_share_a_form_and_the_dashboard_counts() {
+        let state = tempfile::tempdir().unwrap();
+        let tabs = vec![TabSpec { title: "1".into(), panes: vec![sleeper("dev-a"), sleeper("dev-b")], side: None }];
+        let mut server = built(state.path(), &["dev-a", "dev-b"], tabs);
+        let rich = board::MemberLook {
+            model: Some("Sonnet".into()),
+            effort: Some("xhigh".into()),
+            context: Some(100),
+            compactable: true,
+            ..Default::default()
+        };
+        server.looks.insert("dev-a".into(), rich);
+        server.looks.insert("dev-b".into(), board::MemberLook { model: Some("Opus".into()), ..Default::default() });
+
+        // Narrow enough that dev-a's right part cannot show all of it.
+        server.size = (60, 24);
+        server.layout();
+        let panes: Vec<&Pane> = server.panes.iter().collect();
+        let engines: Vec<_> = panes.iter().map(|pane| pane.engine.lock().unwrap()).collect();
+        let mut views: Vec<View<'_>> = panes
+            .iter()
+            .zip(&engines)
+            .map(|(pane, engine)| View {
+                id: &pane.id,
+                engine: engine.as_ref(),
+                area: pane.area,
+                header: server.header(pane, None, None, now()),
+                focused: false,
+                selection: None,
+            })
+            .collect();
+        let width = views[0].area.width;
+        assert_eq!(views[1].area.width, width);
+        let alone: Vec<usize> = views.iter().map(|view| chrome::form(&view.header, width)).collect();
+        assert!(alone[0] > alone[1], "{alone:?}: dev-a needs a poorer form");
+        common_forms(&mut views);
+        assert_eq!([views[0].header.form, views[1].header.form], [alone[0]; 2]);
+        // A header with nothing on its right yet fits whole: it holds no one back.
+        views[1].header = chrome::Header { model: None, ..views[1].header };
+        views[0].header.form = 0;
+        common_forms(&mut views);
+        assert_eq!(views[0].header.form, alone[0]);
+        drop(views);
+        drop(engines);
+        // The dashboard's border counts the members by their programs' states.
+        server.panes[0].state = Some(State::Working);
+        server.panes[1].state = Some(State::Blocked);
+        assert_eq!(server.counts(), chrome::Hint::Counts { working: 1, waiting: 1, idle: 0 });
+        // A program that says nothing: as the dashboard saw it; the program, once it says, first.
+        server.panes[1].state = None;
+        assert_eq!(server.counts(), chrome::Hint::Counts { working: 1, waiting: 0, idle: 0 }, "seen nowhere yet");
+        server.looks.get_mut("dev-b").unwrap().state = Some(look::State::Idle);
+        assert_eq!(server.counts(), chrome::Hint::Counts { working: 1, waiting: 0, idle: 1 });
+        server.looks.get_mut("dev-a").unwrap().state = Some(look::State::Idle);
+        assert_eq!(server.counts(), chrome::Hint::Counts { working: 1, waiting: 0, idle: 1 }, "its program says");
+    }
+
+    #[test]
+    fn a_command_running_shows_as_on_its_card() {
+        let state = tempfile::tempdir().unwrap();
+        let tabs = vec![TabSpec { title: "1".into(), panes: vec![sleeper("dev-a")], side: None }];
+        let mut server = built(state.path(), &["dev-a"], tabs);
+        let now = now();
+        let running = board::MemberLook {
+            state: Some(look::State::Idle),
+            shell: true,
+            since: Some(now as i64 - 600),
+            ..Default::default()
+        };
+        server.looks.insert("dev-a".into(), running);
+        server.panes[0].since = Some(now - 5);
+        let header = |server: &Server| {
+            let header = server.header(&server.panes[0], None, None, now);
+            (header.state, header.shell, header.since)
+        };
+        // At rest by its program, the command running by `claude agents`: since the command started.
+        server.panes[0].state = Some(State::Idle);
+        assert_eq!(header(&server), (look::State::Idle, true, Some(600)));
+        server.panes[0].state = Some(State::Done);
+        assert_eq!(header(&server), (look::State::Idle, true, Some(600)));
+        // Its program says nothing: the same.
+        server.panes[0].state = None;
+        assert!(header(&server).1);
+        // At work, or waiting: its program wins.
+        server.panes[0].state = Some(State::Working);
+        assert_eq!(header(&server), (look::State::Working, false, Some(5)));
+        server.panes[0].state = Some(State::Blocked);
+        assert_eq!(header(&server), (look::State::Waiting, false, Some(5)));
+        // The dashboard's border counts it at rest, as its cards do.
+        server.panes[0].state = Some(State::Idle);
+        assert_eq!(server.counts(), chrome::Hint::Counts { working: 0, waiting: 0, idle: 1 });
+    }
+
+    #[test]
+    fn a_zoomed_pane_takes_its_tabs_room() {
+        let state = tempfile::tempdir().unwrap();
+        let panes = vec![sleeper("dev-a"), sleeper("dev-b")];
+        let mut server =
+            built(state.path(), &["dev-a", "dev-b"], vec![TabSpec { title: "1".into(), panes, side: None }]);
+        let (a, b) = (id_of(&server, "dev-a"), id_of(&server, "dev-b"));
+        let grid = server.pane(&b).unwrap().area;
+        assert!(grid.width > 0 && grid.width < 80);
+        server.zoom(&a);
+        assert_eq!(server.pane(&a).unwrap().area, Rect { x: 0, y: 0, width: 80, height: 23 }, "the bar left out");
+        assert_eq!(server.pane(&b).unwrap().area, Rect::default(), "hidden");
+        assert_eq!(server.pane(&b).unwrap().size, (grid.width as u16 - 2, grid.height as u16 - 2), "not resized");
+        assert_eq!(server.shown_ids(), [a.as_str()]);
+        assert_eq!(server.focus.as_deref(), Some(a.as_str()));
+        // Again: the grid.
+        server.zoom(&a);
+        assert_eq!(server.pane(&b).unwrap().area, grid);
+        // Another pane of the tab focused: the grid too, as in tmux.
+        server.zoom(&a);
+        server.focus_on(&b);
+        assert_eq!(server.pane(&b).unwrap().area, grid);
+        assert_eq!(server.tabs[0].zoomed, None);
+        // Arranged again (any change from the menu): kept while the pane stays in its tab, else the grid.
+        server.zoom(&a);
+        let arrange = |tabs: &[(&str, &[&str])]| Request::Arrange {
+            tabs: tabs
+                .iter()
+                .map(|(title, names)| (title.to_string(), names.iter().map(|n| n.to_string()).collect()))
+                .collect(),
+            columns: 3,
+        };
+        assert!(matches!(server.request(arrange(&[("1", &["dev-a", "dev-b"])])), Reply::Ok(_)));
+        assert_eq!(server.tabs[0].zoomed.as_deref(), Some(a.as_str()));
+        assert_eq!(server.pane(&b).unwrap().area, Rect::default());
+        assert!(matches!(server.request(arrange(&[("1", &["dev-b"]), ("2", &["dev-a"])])), Reply::Ok(_)));
+        assert!(server.tabs.iter().all(|tab| tab.zoomed.is_none()));
+        assert!(matches!(server.request(arrange(&[("1", &["dev-a", "dev-b"])])), Reply::Ok(_)));
+        // The zoomed pane gone: the grid.
+        server.zoom(&b);
+        server.close_pane(&b);
+        assert_eq!(server.tabs[0].zoomed, None);
+        assert_eq!(server.shown_ids(), [a]);
+    }
+
+    #[test]
+    fn a_member_waiting_out_of_sight_is_noticed_and_reached() {
+        let state = tempfile::tempdir().unwrap();
+        // It asks first, as Claude Code does: an engine relays the states of a program that asked.
+        let mut asking = sleeper("dev-b");
+        asking.argv = ["/bin/sh", "-c", "printf '\\033]7501;?\\007\\033]7501;state=blocked\\007'; sleep 30"]
+            .map(String::from)
+            .to_vec();
+        let tabs = vec![
+            TabSpec { title: "1".into(), panes: vec![sleeper("dev-a")], side: None },
+            TabSpec { title: "2".into(), panes: vec![asking], side: None },
+        ];
+        let mut server = built(state.path(), &["dev-a", "dev-b"], tabs);
+        let _client = attached(&mut server);
+        let b = id_of(&server, "dev-b");
+        let until = Instant::now() + Duration::from_secs(5);
+        while server.notice.is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+            server.take_relays();
+        }
+        let (notice, _) = server.notice.clone().expect("noticed");
+        assert_eq!((notice.member.as_str(), notice.tab.as_str()), ("dev-b", "2"));
+        assert_eq!(notice.text, chrome::notice_text("dev-b"));
+        assert!(server.pane(&b).unwrap().since.is_some());
+        // Under a layer: gone, and none comes.
+        server.choice = Some(Open::new(chrome::quit_choice("t"), Purpose::Quit { client: "c1".into() }));
+        server.check_notice();
+        assert!(server.notice.is_none());
+        server.notify(&b);
+        assert!(server.notice.is_none(), "none under a layer");
+        server.choice = None;
+        server.check_notice();
+        assert!(server.notice.is_none(), "not shown once the layer goes");
+        server.notify(&b);
+        assert!(server.notice.is_some());
+        // Nor without a client.
+        let client = server.client.take();
+        server.notice = None;
+        server.notify(&b);
+        assert!(server.notice.is_none(), "no one to tell");
+        server.client = client;
+        server.notify(&b);
+        // ⌥g: to it, and the notice goes once it is in sight.
+        server.go_waiting();
+        assert_eq!((server.active, server.focus.as_deref()), (1, Some(b.as_str())));
+        server.check_notice();
+        assert!(server.notice.is_none());
+    }
+
+    #[test]
+    fn the_headers_parts_and_the_notice_answer_the_pointer() {
+        let state = tempfile::tempdir().unwrap();
+        let tabs = vec![
+            TabSpec { title: "1".into(), panes: vec![sleeper("dev-a"), sleeper("dev-b")], side: None },
+            TabSpec { title: "2".into(), panes: vec![sleeper("dev-c")], side: None },
+        ];
+        let mut server = built(state.path(), &["dev-a", "dev-b", "dev-c"], tabs);
+        let _client = attached(&mut server);
+        let (a, b, c) = (id_of(&server, "dev-a"), id_of(&server, "dev-b"), id_of(&server, "dev-c"));
+        let look = board::MemberLook {
+            model: Some("Opus".into()),
+            effort: Some("high".into()),
+            context: Some(40),
+            compactable: true,
+            ..Default::default()
+        };
+        server.looks.insert("dev-a".into(), look);
+        assert!(server.compose());
+        let part = |server: &Server, id: &str, part: chrome::Part| {
+            let found = server.parts.iter().find(|(_, of, p)| of == id && *p == part);
+            found.map(|(at, _, _)| (at.x as u16, at.y as u16)).unwrap_or_else(|| panic!("{part:?} of {id}"))
+        };
+        let press = |server: &mut Server, (col, row): (u16, u16), kind: MouseKind| {
+            server.mouse(&Mouse { kind, col, row, mods: Mods::NONE });
+        };
+        // Hovered: lit, once.
+        let name = part(&server, &a, chrome::Part::Name);
+        server.dirty = false;
+        press(&mut server, name, MouseKind::Moved);
+        assert_eq!(server.hover, Some(Hover::Part(a.clone(), chrome::Part::Name)));
+        assert!(server.dirty);
+        server.dirty = false;
+        press(&mut server, name, MouseKind::Moved);
+        assert!(!server.dirty, "the same part: nothing to draw");
+        // Its context: the compaction's confirmation.
+        let context = part(&server, &a, chrome::Part::Context);
+        press(&mut server, context, MouseKind::Down(Button::Left));
+        assert_eq!(
+            server.choice.as_ref().map(|open| &open.purpose),
+            Some(&Purpose::Compact { member: "dev-a".into() })
+        );
+        server.choice = None;
+        press(&mut server, context, MouseKind::Up(Button::Left));
+        assert!(!server.swallowing, "its release swallowed");
+        // ⤢: zoomed, with the focus.
+        assert!(server.compose());
+        let zoom = part(&server, &b, chrome::Part::Zoom);
+        press(&mut server, zoom, MouseKind::Down(Button::Left));
+        assert_eq!(server.tabs[0].zoomed.as_deref(), Some(b.as_str()));
+        assert_eq!(server.focus.as_deref(), Some(b.as_str()));
+        press(&mut server, zoom, MouseKind::Up(Button::Left));
+        // A member out of sight waiting: its notice, and a click on it goes to it.
+        server.notify(&c);
+        assert!(server.compose());
+        let at = server.notice_zone.expect("drawn");
+        press(&mut server, (at.x as u16 + 1, at.y as u16), MouseKind::Down(Button::Left));
+        assert_eq!((server.active, server.focus.as_deref()), (1, Some(c.as_str())));
+        assert!(server.notice.is_none());
+    }
+
     #[test]
     fn the_colors_follow_the_team() {
         let state = tempfile::tempdir().unwrap();
@@ -2401,7 +3176,7 @@ mod tests {
         write(&["chef", "dev-a", "dev-b"]);
         let (tx, _rx) = mpsc::channel();
         let welcome = Arc::new(Mutex::new(Welcome::default()));
-        let socket = (state.path().join("s.sock"), (0, 0));
+        let socket = (state.path().join("s.sock"), socket::FileId::default());
         let mut server = Server::new(state.path(), "t", socket, tx, welcome);
         let tabs = vec![TabSpec { title: "1".into(), panes: vec![sleeper("dev-a")], side: None }];
         let build = Request::Build {

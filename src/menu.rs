@@ -34,11 +34,16 @@ use crate::{bridge, claude, generate, layout, t};
 use draw::{Drawn, Look};
 use sheet::{Done, Effect, Env, Key, Person, Said, Sheet, Team};
 
-pub fn run(state: &Path, client: Option<&str>, nerd: bool) -> Result<()> {
+/// The menu of the team whose folder is `state`, on `member`'s sheet if given (else the first member's), its `field`
+/// focused: `name`, `model` or `effort`; another word is left out.
+pub fn run(state: &Path, client: Option<&str>, nerd: bool, member: Option<&str>, field: Option<&str>) -> Result<()> {
     // For `/recruit`, which cannot tell otherwise whether tmux opened the window.
     mark_opened(state);
     let mut running = Running::open(state)?;
     let mut sheet = Sheet::new(load(&running, client.is_some()));
+    if let Some(member) = member {
+        sheet.open_on(member, field.and_then(field_of));
+    }
     // What the dashboard saw, if it still looks: a small file, read before the first frame.
     if let Some(states) = fresh_states(state, board::now()) {
         sheet.seen(Some(states));
@@ -60,6 +65,16 @@ pub fn run(state: &Path, client: Option<&str>, nerd: bool) -> Result<()> {
     let result = menu.run(&mut sheet);
     menu.close();
     result
+}
+
+/// A field of a member's sheet by its name on the command line.
+fn field_of(name: &str) -> Option<sheet::Fid> {
+    match name {
+        "name" => Some(sheet::Fid::Name),
+        "model" => Some(sheet::Fid::Model),
+        "effort" => Some(sheet::Fid::Effort),
+        _ => None,
+    }
 }
 
 /// Written in the team's folder each time the menu starts, with a token of its own.

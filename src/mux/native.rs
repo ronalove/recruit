@@ -291,7 +291,8 @@ impl Backend for Native {
 
     fn open_menu(&self, state: &Path, session: &str, member: Option<&str>, client: Option<&str>) -> Result<MenuOpened> {
         let _ = session;
-        let request = Request::OpenMenu { member: member.map(String::from), client: client.map(String::from) };
+        let request =
+            Request::OpenMenu { member: member.map(String::from), client: client.map(String::from), field: None };
         let opened: Opened = self.ask(state, request, client::ANSWER)?;
         Ok(match opened {
             Opened::Opened => MenuOpened::Opened,

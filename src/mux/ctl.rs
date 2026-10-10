@@ -249,7 +249,9 @@ fn value<T: serde::de::DeserializeOwned>(reply: Reply) -> Result<T, Failure> {
 /// Fails with `NoPane` unless the team has `pane`, by its id or its member's name.
 fn known(state: &Path, pane: &str) -> Result<(), Failure> {
     let panes: Vec<PaneInfo> = value(request_to(state, Request::Panes)?)?;
-    if panes.iter().any(|p| p.id == pane || p.member == pane) { Ok(()) } else { Err(Failure::NoPane(pane.to_string())) }
+    // By its id, its member, or the role of a pane that is no member's (menu, dashboard, journal), as `find` does.
+    let found = panes.iter().any(|p| p.id == pane || p.member == pane || (!p.role.is_empty() && p.role == pane));
+    if found { Ok(()) } else { Err(Failure::NoPane(pane.to_string())) }
 }
 
 /// `\e`, `\r`, `\n`, `\t`, `\\`, `\0` and `\xNN` in `text`, as bytes.

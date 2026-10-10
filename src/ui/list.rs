@@ -646,6 +646,73 @@ mod tests {
         texts(&list.frame(message, "aide", cols, lines, lines))
     }
 
+    /// No size, however small, makes a list panic: with no choice to forty, boxes or not, a filter that keeps none,
+    /// whatever room is left below it (reviewer's sweep, kept).
+    #[test]
+    fn no_size_too_small() {
+        let labels =
+            |n: usize| (0..n).map(|i| format!("choix {i} {}", "日本語 long ".repeat(i % 4))).collect::<Vec<_>>();
+        // Each list as drawn: with no choice to eight, boxes or not, moved; one filtered down to none; forty
+        // choices, at a few sizes only (each image of them costs milliseconds in a debug build).
+        let make = |i: usize| -> List {
+            let Some((n, boxes)) = [0, 1, 3, 8, 40].into_iter().flat_map(|n| [(n, false), (n, true)]).nth(i) else {
+                let mut list = List::new(labels(8), None, None);
+                typed(&mut list, "日本zz");
+                return list;
+            };
+            let mut list = List::new(labels(n), boxes.then(|| BTreeSet::from([0])), Some(2));
+            press(&mut list, &[Key::Down, Key::Down, Key::PageDown]);
+            list
+        };
+        let (forty, filtered) = ([8, 9], 10);
+        let failed = std::sync::Mutex::new(Vec::new());
+        // Every small width, which carry nearly all the overflows, then a step; heights likewise.
+        let widths: Vec<usize> = (0..=24).chain([30, 40, 60, 120]).collect();
+        let lines = [0, 1, 2, 3, 5, 8, 12, 40];
+        std::thread::scope(|scope| {
+            for chunk in widths.chunks(widths.len().div_ceil(8)) {
+                let (make, lines, failed) = (&make, &lines, &failed);
+                scope.spawn(move || {
+                    for &cols in chunk {
+                        for below in [0, 3] {
+                            for &height in lines {
+                                for i in 0..=filtered {
+                                    // Room below matters to the smallest only.
+                                    let few = [0, 1, 5, 20, 120].contains(&cols)
+                                        && [0, 1, 3, 40].contains(&height)
+                                        && below == 0;
+                                    if forty.contains(&i) && !few || below > 0 && cols > 12 {
+                                        continue;
+                                    }
+                                    let drawn = std::panic::catch_unwind(|| {
+                                        let mut list = make(i);
+                                        let rows = list.frame(
+                                            "Une question un peu longue pour voir ?",
+                                            "↑↓ ⏎ Échap",
+                                            cols,
+                                            below,
+                                            height,
+                                        );
+                                        let widths: Vec<usize> = rows.iter().map(columns).collect();
+                                        let _ = rows_up(&widths, cols);
+                                        let _ = super::frame(&rows, cols, widths.len());
+                                        settled("✔", "Une question", "une réponse 日本語", Paint::Chosen, cols)
+                                    });
+                                    if drawn.is_err() {
+                                        let at = format!("list {i} at {cols} × {height}, {below} below");
+                                        failed.lock().unwrap().push(at);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let failed = failed.into_inner().unwrap();
+        assert!(failed.is_empty(), "{} failed: {}", failed.len(), failed.join(", "));
+    }
+
     #[test]
     fn moves_round_and_by_page() {
         let mut list = List::single(labels(30));

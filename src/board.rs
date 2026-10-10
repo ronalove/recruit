@@ -25,7 +25,9 @@ use crate::canvas::PanicGuard;
 use crate::claude::{self, Running};
 use crate::config::write_atomic;
 use crate::i18n::Lang;
-use crate::look::{self, FRAME, Glyphs, RAINBOW, State, duration, effort_color, effort_sign, family, frame};
+use crate::look::{
+    self, FRAME, Glyphs, ORANGE, Pressure, RAINBOW, State, duration, effort_color, effort_sign, family, frame,
+};
 use crate::member;
 use crate::state::Snapshot;
 use crate::tmux::{self, ALT, Pane};
@@ -271,35 +273,6 @@ struct Card {
     shell: bool,
 }
 
-/// How near a session is to compacting on its own, which colors its context.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Pressure {
-    /// Far from it, or not measured yet.
-    #[default]
-    Calm,
-    Near,
-    /// Where Claude Code warns.
-    Warning,
-}
-
-/// From this share of the tokens at which a session compacts on its own, its context turns orange.
-const NEAR_COMPACTION: f64 = 0.8;
-/// So many tokens before them, Claude Code warns, and the context turns red.
-const COMPACTION_WARNING: u64 = 20_000;
-
-impl Pressure {
-    fn of(tokens: Option<u64>, compacts_at: Option<u64>) -> Self {
-        let (Some(tokens), Some(at)) = (tokens, compacts_at) else { return Pressure::Calm };
-        if tokens >= at.saturating_sub(COMPACTION_WARNING) {
-            Pressure::Warning
-        } else if tokens as f64 >= at as f64 * NEAR_COMPACTION {
-            Pressure::Near
-        } else {
-            Pressure::Calm
-        }
-    }
-}
-
 /// What the dashboard draws.
 #[derive(Debug, Clone, Default)]
 struct Board {
@@ -314,6 +287,8 @@ struct Board {
     glyphs: Glyphs,
     /// Sessions open elsewhere under a member's name, with their folder.
     elsewhere: Vec<(String, Option<String>)>,
+    /// In recruit's own multiplexer: no header, its frame says the counts and the bar the keys (mock-up B1).
+    native: bool,
 }
 
 /// The team as it stands, `team.json` read again: members added, removed or renamed while it runs. As it was, when the
@@ -365,7 +340,8 @@ fn dashboard(first: &Snapshot, state: &Path) -> Result<()> {
         let mut clock = now();
         loop {
             if let Some((s, (sessions, glyphs))) = fresh.take() {
-                board = Board { glyphs, ..memory.board(&s, state, &sessions) };
+                let native = s.backend == backend::Kind::Native;
+                board = Board { glyphs, native, ..memory.board(&s, state, &sessions) };
                 // A look that failed says nothing of the states: left to age, the file sends the menu to ask itself.
                 if board.error.is_none() {
                     let refs = sessions.refs.clone();
@@ -436,7 +412,7 @@ impl Memory {
         let members = board.cards.iter().filter_map(|card| {
             let (state, since) = self.since.get(&card.name)?;
             let since = (at - seen.saturating_duration_since(*since).as_millis() as i64).div_euclid(1000);
-            Some((card.name.clone(), MemberState { state: *state, since }))
+            Some((card.name.clone(), MemberState { state: *state, since, shell: card.shell }))
         });
         States {
             at: at.div_euclid(1000),
@@ -648,9 +624,12 @@ fn windows(reports: &[Report], now: i64) -> Vec<(String, f64, Option<u64>)> {
 /// The dashboard's lines for a pane of `width` × `height`: the header, the cards right under it, each in the form
 /// the room leaves it (see [`arrange`]), the account's usage at the bottom.
 fn render(b: &Board, width: usize, height: usize) -> Drawn {
-    let mut top = vec![header(b, width), String::new()];
+    let mut top = if b.native { Vec::new() } else { vec![header(b, width), String::new()] };
     if let Some(error) = &b.error {
-        top.insert(1, fit(error, width).red().to_string());
+        top.insert(usize::from(!b.native), fit(error, width).red().to_string());
+        if b.native {
+            top.push(String::new());
+        }
     }
     let mut bottom = Vec::new();
     if !b.usage.is_empty() {
@@ -683,9 +662,9 @@ fn render(b: &Board, width: usize, height: usize) -> Drawn {
     // A pane too low for all that: the header, and the usage at the bottom if it holds.
     let rows = height.saturating_sub(1);
     if drawn.len() > rows {
-        let mut low = vec![header(b, width)];
+        let mut low = if b.native { Vec::new() } else { vec![header(b, width)] };
         if !b.usage.is_empty() && rows >= 2 {
-            low.extend(vec![String::new(); rows - 2]);
+            low.extend(vec![String::new(); rows - 1 - low.len()]);
             low.push(usage_line(&b.usage, width));
         }
         low.truncate(rows);
@@ -794,8 +773,11 @@ pub struct MemberState {
     #[serde(with = "state_name")]
     pub state: State,
     /// Since when, in seconds since the epoch, as long as the dashboard has seen it so; for a member renamed on its
-    /// conversation, since before its new name.
+    /// conversation, since before its new name. At rest with a command running, since the command started.
     pub since: i64,
+    /// At rest while a command it started still runs (decision of 2026-10-09): shown with a terminal's sign.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shell: bool,
 }
 
 /// A state by its name in `STATES`: `working`, `idle`, `waiting` or `other`.
@@ -1313,8 +1295,11 @@ fn cards(rows: &[Vec<(&Card, usize, Helpers)>], width: usize, b: &Board) -> Draw
         for (c, w, card) in &row {
             let zone = |kind, row, col, rows, cols| Zone { member: c.name.clone(), kind, row, col, rows, cols };
             drawn.zones.push(zone(ZoneKind::Member, top, col, card.len(), *w));
-            if let Some(cols) = compaction_cells(c) {
-                drawn.zones.push(zone(ZoneKind::Compact, top + card.len() - 1, col + w - 1 - cols, 1, cols));
+            // A card too narrow for its context shows none of it: nothing to compact there.
+            if let Some(cols) = compaction_cells(c).filter(|cols| cols < w)
+                && let Some(last) = card.len().checked_sub(1)
+            {
+                drawn.zones.push(zone(ZoneKind::Compact, top + last, col + w - 1 - cols, 1, cols));
             }
             col += w;
         }
@@ -1636,9 +1621,6 @@ fn model_and_effort(c: &Card, right: &Right, frame: usize) -> Vec<(String, Paint
     pieces
 }
 
-/// A context near compaction.
-const ORANGE: Color = Color::AnsiValue(208);
-
 /// The context's field, `CONTEXT` wide: the share of the window, orange near compaction, red where Claude Code
 /// warns; `⟳` before it for a member at rest.
 fn context(c: &Card) -> Vec<(String, Paint)> {
@@ -1905,6 +1887,58 @@ pub enum Clicked {
     Show(String),
     /// A member at rest, by its context on the dashboard: compacting it is offered, after confirmation.
     Compact(String),
+}
+
+/// What a member's header shows in recruit's own multiplexer (step 3, F1), as its card on the dashboard shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MemberLook {
+    /// Its model's family: Opus, Sonnet, Haiku, Fable.
+    pub model: Option<String>,
+    /// Its effort, one of `bridge::EFFORTS`.
+    pub effort: Option<String>,
+    /// Its context, in percent of its window.
+    pub context: Option<u8>,
+    /// How near it is to compacting on its own.
+    pub pressure: Pressure,
+    /// At rest as the dashboard last saw it, its context known: a click on its context compacts it.
+    pub compactable: bool,
+    /// Since when it is in its state as the dashboard last saw it, in seconds since the epoch.
+    pub since: Option<i64>,
+    /// Its state as the dashboard last saw it: for a member whose program does not tell its own (no OSC 7501).
+    pub state: Option<State>,
+    /// At rest as the dashboard last saw it, a command it started still running: `since` is when the command started.
+    pub shell: bool,
+}
+
+/// Each member's look, by name, from the team as launched, the mod's reports and what the dashboard last wrote
+/// (`STATES`, kept whatever its age: `since` stays true while the state does). Reads a few small files: for a thread
+/// of the server, every two seconds, never on the way to a frame. Empty if the team cannot be read.
+pub(crate) fn looks(state: &Path) -> BTreeMap<String, MemberLook> {
+    let Ok(snapshot) = Snapshot::read(state) else { return BTreeMap::new() };
+    let states = read_states(state);
+    snapshot
+        .members
+        .iter()
+        .map(|member| {
+            let report = bridge::report(state, &member.name).unwrap_or_default();
+            let (model, effort) = bridge::model_and_effort_in(&report, member);
+            let context = report.context.as_ref();
+            let percent =
+                context.and_then(|c| c.percent).filter(|p| p.is_finite()).map(|p| p.round().clamp(0.0, 100.0) as u8);
+            let seen = states.as_ref().and_then(|s| s.members.get(&member.name));
+            let look = MemberLook {
+                model: model.map(|m| family(&m)),
+                effort: effort.filter(|e| bridge::EFFORTS.contains(&e.as_str())),
+                context: percent,
+                pressure: Pressure::of(context.and_then(|c| c.tokens), report.compacts_at()),
+                compactable: percent.is_some() && seen.is_some_and(|s| s.state == State::Idle),
+                since: seen.map(|s| s.since),
+                state: seen.map(|s| s.state),
+                shell: seen.is_some_and(|s| s.shell),
+            };
+            (member.name.clone(), look)
+        })
+        .collect()
 }
 
 /// A member's context as its card shows it, in percent: for the compaction's confirmation. None while its mod has
@@ -3150,13 +3184,21 @@ mod tests {
         // Written whole, read back as it was.
         assert_eq!(read_states(state.path()), None);
         save_states(state.path(), &states).unwrap();
-        assert_eq!(read_states(state.path()), Some(states));
+        assert_eq!(read_states(state.path()), Some(states.clone()));
         let text = fs::read_to_string(state.path().join(STATES)).unwrap();
         assert!(text.contains(r#""qa":{"state":"idle","#), "{text}");
         // A state of a later recruit, as one it does not know.
         fs::write(state.path().join(STATES), r#"{"at":1,"members":{"a":{"state":"asleep","since":0}},"absent":[]}"#)
             .unwrap();
-        assert_eq!(read_states(state.path()).unwrap().members["a"].state, State::Other);
+        let read = read_states(state.path()).unwrap();
+        assert_eq!((read.members["a"].state, read.members["a"].shell), (State::Other, false));
+        // A command running: written only then, read back.
+        assert!(!text.contains("shell"), "{text}");
+        let mut states = states;
+        states.members.get_mut("qa").unwrap().shell = true;
+        save_states(state.path(), &states).unwrap();
+        assert!(fs::read_to_string(state.path().join(STATES)).unwrap().contains(r#""shell":true"#));
+        assert_eq!(read_states(state.path()), Some(states));
     }
 
     #[test]
@@ -3402,6 +3444,83 @@ mod tests {
         // No one running: the time alone, then the keys.
         let empty = board(Vec::new());
         assert_eq!(at(&empty, 11 + keys.chars().count()), format!(" {}  {keys}", clock(1000)));
+    }
+
+    /// No size, however small, makes the dashboard or the journal panic: a panel that panics is not started again.
+    #[test]
+    fn no_size_too_small() {
+        // Thirteen cards, the same with long names, twenty-six; with an error, none, natively.
+        let long: Vec<Card> = capture()
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| Card { name: format!("{}-avec-un-nom-très-long-{i}", c.name), ..c })
+            .collect();
+        let many: Vec<Card> = (0..2)
+            .flat_map(|k| capture().into_iter().map(move |c| Card { name: format!("{}{k}", c.name), ..c }))
+            .collect();
+        let boards = [
+            board(capture()),
+            Board { native: true, glyphs: Glyphs::Nerd, ..board(long) },
+            Board { native: true, ..board(many) },
+            Board { error: Some("claude agents: boom".into()), usage: Vec::new(), ..board(Vec::new()) },
+        ];
+        let s = snapshot(&["coordinateur", "dev-cli"]);
+        let failed = std::sync::Mutex::new(Vec::new());
+        // Every small size, which carry nearly all the overflows, then a step.
+        let widths: Vec<usize> = (0..=40).chain((44..=120).step_by(8)).collect();
+        let heights: Vec<usize> = (0..=16).chain((20..=40).step_by(5)).collect();
+        std::thread::scope(|scope| {
+            for chunk in widths.chunks(widths.len().div_ceil(8)) {
+                let (boards, heights, failed, s) = (&boards, &heights, &failed, &s);
+                scope.spawn(move || {
+                    for &width in chunk {
+                        for &height in heights {
+                            for (i, b) in boards.iter().enumerate() {
+                                let size = (width as u16, height as u16);
+                                let drawn = std::panic::catch_unwind(|| {
+                                    Screen::default().changes(size, b).unwrap();
+                                    render(b, width, height)
+                                });
+                                if drawn.is_err() {
+                                    failed.lock().unwrap().push(format!("the dashboard {i} at {width} × {height}"));
+                                }
+                            }
+                        }
+                        let journal = std::panic::catch_unwind(|| {
+                            message_head(s, "14:32", "dev-cli", "coordinateur", width);
+                            fit("Le texte d'un message", width.saturating_sub(11));
+                            journal_head(backend::Kind::Tmux, width)
+                        });
+                        if journal.is_err() {
+                            failed.lock().unwrap().push(format!("the journal at {width}"));
+                        }
+                    }
+                });
+            }
+        });
+        let failed = failed.into_inner().unwrap();
+        assert!(failed.is_empty(), "{} failed: {}", failed.len(), failed.join(", "));
+    }
+
+    /// In recruit's own multiplexer, no header: its frame says the counts, the bar the keys (mock-up B1).
+    #[test]
+    fn no_header_in_the_native_frame() {
+        let cards = vec![sample_card("a", true, State::Working), sample_card("b", false, State::Idle)];
+        let tmux = render(&board(cards.clone()), 60, 20);
+        assert!(visible(&tmux.lines[0]).contains(&keys()), "{:?}", tmux.lines[0]);
+        let native = render(&Board { native: true, ..board(cards) }, 60, 20);
+        assert!(native.lines.iter().all(|line| !visible(line).contains(&keys())));
+        // Two lines less above the cards, the same below.
+        assert_eq!(native.lines.len(), tmux.lines.len());
+        let first = |drawn: &Drawn| drawn.lines.iter().position(|line| visible(line).contains(" a")).unwrap();
+        assert_eq!(first(&native) + 2, first(&tmux));
+        // An error first, then a blank.
+        let failing = render(&Board { native: true, error: Some("boom".into()), ..board(Vec::new()) }, 60, 20);
+        assert_eq!((visible(&failing.lines[0]).as_str(), failing.lines[1].as_str()), ("boom", ""));
+        // A pane too low: the usage at the bottom only.
+        let low = render(&Board { native: true, ..board(vec![sample_card("a", true, State::Working); 6]) }, 60, 4);
+        assert_eq!(low.lines.len(), 3);
+        assert!(visible(&low.lines[2]).contains("5 h"), "{:?}", low.lines);
     }
 
     #[test]

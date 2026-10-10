@@ -631,7 +631,9 @@ mod tests {
             let words = shlex::split(&line).expect("a shell line");
             assert_eq!(words[0], "/opt/re cruit");
             let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(&words).unwrap();
-            let Some(crate::cli::Command::Menu { state, client, popup, nerd: read }) = cli.command else { panic!() };
+            let Some(crate::cli::Command::Menu { state, client, popup, nerd: read, .. }) = cli.command else {
+                panic!()
+            };
             assert_eq!(state, Path::new("/tmp/équipe x"));
             assert_eq!((client.as_deref(), popup, read), (Some("/dev/ttys004"), false, nerd));
         }

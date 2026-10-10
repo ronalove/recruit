@@ -619,3 +619,200 @@ fn claude_mouse_native() {
     drop(server);
     check_settings(&before);
 }
+
+/// The glyph a pane's header shows before its member's name (`┏━ ◷ lead ━`), on the client's screen.
+fn header_glyph(screen: &[String], name: &str) -> Option<char> {
+    let key = format!(" {name} ");
+    screen.iter().find_map(|row| {
+        if !row.chars().any(|c| matches!(c, '┏' | '╭')) {
+            return None;
+        }
+        let at = row.find(&key)?;
+        row[..at].chars().rev().find(|c| !c.is_whitespace())
+    })
+}
+
+/// The glyph the dashboard's card of `name` shows (`╻ ◷ lead`).
+fn card_glyph(screen: &[String], name: &str) -> Option<char> {
+    let key = format!(" {name} ");
+    screen.iter().find_map(|row| {
+        let from = row.find('╻')? + '╻'.len_utf8();
+        let rest = &row[from..];
+        let at = rest.find(&key)?;
+        rest[..at].chars().rev().find(|c| !c.is_whitespace())
+    })
+}
+
+/// A short code for a state glyph: W at work (a spinner), A waiting (⚑), R at rest (◷), O other (◌), else the glyph.
+fn state_of(glyph: Option<char>) -> String {
+    match glyph {
+        None => "-".into(),
+        Some('\u{2800}'..='\u{28ff}') => "W".into(),
+        Some('\u{2691}') => "A".into(),
+        Some('\u{25f7}') => "R".into(),
+        Some('\u{25cc}') => "O".into(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// What the header says of two members (OSC 7501, from Claude Code) against what the dashboard's card says
+/// (`claude agents --json`, every two seconds), through a work, a permission and a command left running. Two real
+/// Claude Code sessions on Haiku, in a folder of the tester's own, in the test's terminal only: no window. The
+/// timeline goes to `target/night/real-states.csv`: a row each 200 ms and an event column.
+///
+/// ```sh
+/// CLAUDE_SESSIONS=$(date +%F) cargo test --test mux_claude -- --ignored --nocapture claude_header_against_card
+/// ```
+#[test]
+#[ignore = "real Claude Code sessions (two, on Haiku, about 3 minutes): CLAUDE_SESSIONS and the test named"]
+fn claude_header_against_card() {
+    if !common::consented("CLAUDE_SESSIONS", "real Claude Code sessions", "claude_header_against_card") {
+        return;
+    }
+    use std::time::Instant;
+    let before = settings();
+    let tables = "\
+[teams.states]
+description = \"test\"
+[teams.states.members.lead]
+role = \"Contact\"
+contact = true
+model = \"haiku\"
+[teams.states.members.pm]
+role = \"Contact\"
+contact = true
+model = \"haiku\"
+";
+    let mut team = common::team::Team::real("states", tables, "en");
+    let out = team.recruit(["--detach"]);
+    assert!(out.status.success(), "recruit --detach: {}", String::from_utf8_lossy(&out.stderr));
+    let term = team.attach(150, 50, Profile::default());
+    let screen = |term: &TestTerm| term.screen();
+    let started = Instant::now();
+    let mut rows: Vec<String> = vec!["t,lead_header,lead_card,pm_header,pm_card,event".into()];
+    let mut event = String::new();
+    // One sample: both members' header and card.
+    let sample = |term: &TestTerm, event: &mut String, rows: &mut Vec<String>| {
+        let s = screen(term);
+        let row = format!(
+            "{:.1},{},{},{},{},{}",
+            started.elapsed().as_secs_f64(),
+            state_of(header_glyph(&s, "lead")),
+            state_of(card_glyph(&s, "lead")),
+            state_of(header_glyph(&s, "pm")),
+            state_of(card_glyph(&s, "pm")),
+            event
+        );
+        event.clear();
+        rows.push(row);
+        s
+    };
+    let send = |member: &str, text: &str| {
+        // Typed, then Enter a moment later: text and Enter in one burst is taken for a paste, and not sent.
+        team.ctl(["send", "--pane", member, text]);
+        std::thread::sleep(Duration::from_millis(700));
+        team.ctl(["send", "--pane", member, "\\r"]);
+    };
+    // Until both are at rest (Claude Code says it by OSC 7501 once it is up).
+    let mut trusted = std::collections::HashSet::new();
+    let up = common::team::wait(Duration::from_secs(120), || {
+        // Claude Code asks once whether it may trust a folder it has not seen, « No, exit » first: down, Enter.
+        for member in ["lead", "pm"] {
+            if !trusted.contains(member) && team.capture(member).iter().any(|r| r.contains("Yes, I trust this folder"))
+            {
+                trusted.insert(member);
+                team.ctl(["send", "--pane", member, "\\x1b[B"]);
+                std::thread::sleep(Duration::from_millis(500));
+                team.ctl(["send", "--pane", member, "\\r"]);
+                event = format!("{member}: trusted the folder");
+            }
+        }
+        let s = sample(&term, &mut event, &mut rows);
+        header_glyph(&s, "lead") == Some('\u{25f7}') && header_glyph(&s, "pm") == Some('\u{25f7}')
+    });
+    println!("members up: {up}, after {:.0} s", started.elapsed().as_secs_f64());
+    // Whatever stands in the way (a question on startup) is shown, not guessed.
+    if !up {
+        for row in term.screen() {
+            println!("{row}");
+        }
+    }
+    let mut answered = std::collections::HashSet::new();
+    let phase = |term: &TestTerm,
+                 label: &str,
+                 prompt: &str,
+                 rest_after: Duration,
+                 event: &mut String,
+                 rows: &mut Vec<String>,
+                 answered: &mut std::collections::HashSet<String>| {
+        *event = format!("{label}: sent");
+        for member in ["lead", "pm"] {
+            send(member, &prompt.replace("{member}", member));
+        }
+        let begun = Instant::now();
+        let mut rest_since: Option<Instant> = None;
+        let mut worked = false;
+        while begun.elapsed() < Duration::from_secs(150) {
+            let s = sample(term, event, rows);
+            for member in ["lead", "pm"] {
+                let key = format!("{label}-{member}-{}", begun.elapsed().as_secs() / 10);
+                if header_glyph(&s, member) == Some('\u{2691}') && answered.insert(key) {
+                    std::thread::sleep(Duration::from_millis(700));
+                    // The permission question, « 1. Yes » first: Enter allows it.
+                    team.ctl(["send", "--pane", member, "\\r"]);
+                    *event = format!("{label}: {member} allowed");
+                }
+            }
+            let working = ["lead", "pm"].iter().any(|m| matches!(state_of(header_glyph(&s, m)).as_str(), "W" | "A"));
+            worked |= working;
+            if !worked && begun.elapsed() > Duration::from_secs(20) && !answered.contains(&format!("{label}-shown")) {
+                answered.insert(format!("{label}-shown"));
+                println!("{label}: nothing after 20 s, lead's pane:");
+                for row in team.capture("lead") {
+                    println!("  |{row}");
+                }
+            }
+            if worked && !working {
+                let since = *rest_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= rest_after {
+                    break;
+                }
+            } else {
+                rest_since = None;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    phase(
+        &term,
+        "work",
+        "Create the file note-{member}.txt containing the word hello, then run the shell command `sleep 6`, then reply with the single word done.",
+        Duration::from_secs(8),
+        &mut event,
+        &mut rows,
+        &mut answered,
+    );
+    phase(
+        &term,
+        "background",
+        "Start the shell command `sleep 25` in the background (run_in_background), then reply with the single word started, and stop.",
+        Duration::from_secs(35),
+        &mut event,
+        &mut rows,
+        &mut answered,
+    );
+    std::fs::create_dir_all("target/night").ok();
+    std::fs::write("target/night/real-states.csv", rows.join("\n") + "\n").expect("csv");
+    let root = team.root.to_string_lossy().to_string();
+    team.stop();
+    check_settings(&before);
+    let key: String = root.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let projects = PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".claude/projects");
+    let left: Vec<String> = std::fs::read_dir(&projects)
+        .map(|d| {
+            d.flatten().map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| n.starts_with(&key)).collect()
+        })
+        .unwrap_or_default();
+    println!("folders left under {}: {left:?}", projects.display());
+    println!("timeline: target/night/real-states.csv ({} rows)", rows.len());
+}

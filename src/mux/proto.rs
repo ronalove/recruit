@@ -273,12 +273,15 @@ pub(crate) enum Request {
     Focus {
         member: String,
     },
-    /// Opens the team's menu: on the client that shows `member`, or on `client`. `MenuOpened`.
+    /// Opens the team's menu: on the client that shows `member`, or on `client`. With `field`, on `member`'s sheet,
+    /// on that field (written only when there is one: the form of step 2 stays). `MenuOpened`.
     OpenMenu {
         #[serde(default)]
         member: Option<String>,
         #[serde(default)]
         client: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<MenuField>,
     },
     Detach {
         client: String,
@@ -503,6 +506,30 @@ pub(crate) struct ClientInfo {
     pub since: u64,
 }
 
+/// The field of a member's sheet the menu opens on ([`Request::OpenMenu`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MenuField {
+    Name,
+    Model,
+    Effort,
+    /// One this side does not know: the sheet, on its first field.
+    #[serde(other)]
+    Other,
+}
+
+impl MenuField {
+    /// As `recruit _menu --field` takes it; `None` for a field it would not know.
+    pub(crate) fn arg(self) -> Option<&'static str> {
+        match self {
+            MenuField::Name => Some("name"),
+            MenuField::Model => Some("model"),
+            MenuField::Effort => Some("effort"),
+            MenuField::Other => None,
+        }
+    }
+}
+
 /// The answer to [`Request::OpenMenu`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -614,7 +641,8 @@ mod tests {
             Request::SetMember { id: "p1".into(), member: "dev".into() },
             Request::ClosePanels,
             Request::Focus { member: "dev".into() },
-            Request::OpenMenu { member: Some("dev".into()), client: None },
+            Request::OpenMenu { member: Some("dev".into()), client: None, field: None },
+            Request::OpenMenu { member: Some("dev".into()), client: None, field: Some(MenuField::Effort) },
             Request::Detach { client: "c1".into() },
             Request::Clients,
             Request::Capture { pane: None, styles: true, history: 0 },
@@ -630,6 +658,7 @@ mod tests {
                 r#""close_panels""#,
                 r#"{"focus":{"member":"dev"}}"#,
                 r#"{"open_menu":{"member":"dev","client":null}}"#,
+                r#"{"open_menu":{"member":"dev","client":null,"field":"effort"}}"#,
                 r#"{"detach":{"client":"c1"}}"#,
                 r#""clients""#,
                 r#"{"capture":{"pane":null,"styles":true,"history":0}}"#,
@@ -643,6 +672,11 @@ mod tests {
             ClientInfo { id: "c1".into(), term: "xterm-ghostty".into(), name: None, cols: 80, rows: 24, since: 0 };
         assert_eq!(json(&client), r#"{"id":"c1","term":"xterm-ghostty","name":null,"cols":80,"rows":24,"since":0}"#);
         assert_eq!(json(&MenuOpened::NoClient), r#""no_client""#);
+        // A field a later version adds: the sheet, on its first field.
+        assert_eq!(
+            read::<Request>(r#"{"open_menu":{"member":"dev","field":"color"}}"#),
+            Request::OpenMenu { member: Some("dev".into()), client: None, field: Some(MenuField::Other) }
+        );
     }
 
     #[test]

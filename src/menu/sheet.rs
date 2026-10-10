@@ -531,6 +531,21 @@ impl Sheet {
         self.clamp();
     }
 
+    /// Opens on `member`'s sheet, its `field` focused when it has one; the first member as before when it is not in
+    /// the team (`recruit _menu --member m --field f`: ⌥r on a member's pane, a click on a header's name, model or
+    /// effort in recruit's own multiplexer).
+    pub(crate) fn open_on(&mut self, member: &str, field: Option<Fid>) {
+        let Some(name) = self.team.person(member).map(|p| p.name.clone()) else { return };
+        self.entry = Entry::Member(name);
+        self.pane = Pane::List;
+        self.row = 0;
+        if let Some(row) = field.and_then(|field| self.focusable().iter().position(|f| *f == field)) {
+            self.pane = Pane::Sheet;
+            self.row = row;
+        }
+        self.clamp();
+    }
+
     /// The states as last seen: None when they cannot be seen (`claude agents` fails, nothing written lately).
     pub(crate) fn seen(&mut self, states: Option<HashMap<String, (State, i64)>>) {
         self.states_known = states.is_some();
@@ -1518,9 +1533,10 @@ impl Sheet {
             Action::Stop => {
                 let confirm = Confirm::new(
                     t!("Quitter l'équipe ?", "Quit the team?"),
+                    // True under tmux as in recruit's own multiplexer: no session named.
                     vec![t!(
-                        "Tous les membres s'arrêtent et sa session tmux se ferme.",
-                        "Every member stops and its tmux session closes."
+                        "Tous les membres s'arrêtent et l'équipe se ferme.",
+                        "Every member stops and the team closes."
                     )],
                     t!("Quitter", "Quit"),
                     vec![Effect::Stop],
@@ -2047,6 +2063,24 @@ mod tests {
     fn confirm(sheet: &Sheet) -> &Confirm {
         let Overlay::Confirm(confirm) = &sheet.overlay else { panic!("no dialog: {:?}", sheet.overlay) };
         confirm
+    }
+
+    /// `recruit _menu --member m --field f`: the member's sheet, its field focused; an unknown member or field left out.
+    #[test]
+    fn opened_on_a_member_and_a_field() {
+        let mut s = sheet();
+        s.open_on("dev", Some(Fid::Effort));
+        assert_eq!((s.entry.clone(), s.pane, s.field()), (Entry::Member("dev".into()), Pane::Sheet, Some(Fid::Effort)));
+        s.open_on("dev", Some(Fid::Name));
+        assert_eq!(s.field(), Some(Fid::Name));
+        // No field: the member chosen in the list.
+        let mut s = sheet();
+        s.open_on("dev", None);
+        assert_eq!((s.entry.clone(), s.pane), (Entry::Member("dev".into()), Pane::List));
+        // An unknown member: as without.
+        let mut s = sheet();
+        s.open_on("nobody", Some(Fid::Model));
+        assert_eq!((s.entry.clone(), s.pane), (Entry::Member("coordinateur".into()), Pane::List));
     }
 
     #[test]

@@ -29,12 +29,14 @@ pub(crate) fn member_color(index: usize) -> Color {
     COLORS[index % COLORS.len()]
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum State {
     Working,
     Idle,
     /// Waiting for the user, in its terminal.
     Waiting,
+    /// Not known: the default.
+    #[default]
     Other,
 }
 
@@ -152,6 +154,39 @@ pub(crate) fn stroke(row: usize, height: usize) -> &'static str {
         _ => "┃",
     }
 }
+
+/// How near a session is to compacting on its own: its context turns orange, then red.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pressure {
+    /// Far from it, or not measured yet.
+    #[default]
+    Calm,
+    Near,
+    /// Where Claude Code warns.
+    Warning,
+}
+
+/// From this share of the tokens at which a session compacts on its own, its context turns orange.
+const NEAR_COMPACTION: f64 = 0.8;
+/// So many tokens before them, Claude Code warns, and the context turns red.
+const COMPACTION_WARNING: u64 = 20_000;
+
+impl Pressure {
+    /// From the context's tokens and those at which the session compacts.
+    pub(crate) fn of(tokens: Option<u64>, compacts_at: Option<u64>) -> Self {
+        let (Some(tokens), Some(at)) = (tokens, compacts_at) else { return Pressure::Calm };
+        if tokens >= at.saturating_sub(COMPACTION_WARNING) {
+            Pressure::Warning
+        } else if tokens as f64 >= at as f64 * NEAR_COMPACTION {
+            Pressure::Near
+        } else {
+            Pressure::Calm
+        }
+    }
+}
+
+/// A context near compaction.
+pub(crate) const ORANGE: Color = Color::AnsiValue(208);
 
 /// An effort's sign of level.
 pub(crate) fn effort_sign(level: &str) -> char {

@@ -214,6 +214,7 @@ instructions = """
 - La performance : CPU au repos et en flux, latence ajoutée à la frappe, mémoire par panneau avec 100 000 lignes d'historique, 10 panneaux en flux ; des chiffres reproductibles, pas des impressions.
 - Toujours une copie du binaire dans un dossier temporaire, `XDG_*` et `RECRUIT_TMPDIR` temporaires, `tmux -L rtest-testeur` sous tmux ; jamais les équipes de l'utilisateur.
 - Tu rends des faits : ce qui passe, ce qui casse, comment le reproduire. Un bug va à l'architecte, qui le confie ; tu ne corriges pas le code des autres."""
+model = "sonnet"
 
 [teams.mux.members.reviewer]
 role = "Relecteur : relit chaque travail rendu, surveille le code système, tient la documentation."

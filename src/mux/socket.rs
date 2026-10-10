@@ -252,9 +252,25 @@ pub(crate) fn remove_stale(path: &Path) -> io::Result<()> {
     }
 }
 
+/// What tells a socket's file apart from another made at the same path: its device and inode, and the time of its
+/// last change. The inode alone is not enough: Linux gives the one just freed to the next file made, and a server
+/// that replaced a dead one's socket often gets its inode back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FileId {
+    dev: u64,
+    ino: u64,
+    ctime: (i64, i64),
+}
+
+impl FileId {
+    fn of(meta: &fs::Metadata) -> FileId {
+        FileId { dev: meta.dev(), ino: meta.ino(), ctime: (meta.ctime(), meta.ctime_nsec()) }
+    }
+}
+
 /// A server's socket, ready: what a dead server left there removed, never one a server answers on. Returns it with
-/// what tells the file apart (`st_dev`, `st_ino`), to remove it at the end only if it is still this one.
-pub(crate) fn listen(path: &Path) -> Result<(UnixListener, (u64, u64))> {
+/// what tells the file apart, to remove it at the end only if it is still this one.
+pub(crate) fn listen(path: &Path) -> Result<(UnixListener, FileId)> {
     remove_stale(path).map_err(|error| match error.kind() {
         io::ErrorKind::AddrInUse => anyhow::anyhow!(t!(
             "un autre serveur répond déjà sur {}",
@@ -264,15 +280,17 @@ pub(crate) fn listen(path: &Path) -> Result<(UnixListener, (u64, u64))> {
         _ => anyhow::Error::new(error).context(path.display().to_string()),
     })?;
     let listener = UnixListener::bind(path).with_context(|| path.display().to_string())?;
-    // The folder, 0700, already keeps the others out between the two.
+    // The folder, 0700, already keeps the others out between the two. The change of mode comes before the
+    // identity is taken: it changes the file's ctime.
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| path.display().to_string())?;
     let meta = fs::symlink_metadata(path).with_context(|| path.display().to_string())?;
-    Ok((listener, (meta.dev(), meta.ino())))
+    Ok((listener, FileId::of(&meta)))
 }
 
-/// Removes a server's socket at its end, if the file there is still the one it made.
-pub(crate) fn remove_own(path: &Path, id: (u64, u64)) {
-    if fs::symlink_metadata(path).is_ok_and(|meta| (meta.dev(), meta.ino()) == id) {
+/// Removes a server's socket at its end, if the file there is still the one it made. One whose identity changed
+/// since (someone changed its mode) stays: the next server cleans it, as it would a dead one's.
+pub(crate) fn remove_own(path: &Path, id: FileId) {
+    if fs::symlink_metadata(path).is_ok_and(|meta| FileId::of(&meta) == id) {
         let _ = fs::remove_file(path);
     }
 }
@@ -402,6 +420,11 @@ mod tests {
         assert!(listen(&sock).is_err());
         assert_eq!(remove_stale(&sock).unwrap_err().kind(), io::ErrorKind::AddrInUse);
         assert!(sock.exists());
+        // The old file kept alive by a second name, so that its inode cannot go to the next one: the identities
+        // then always differ, as they must (with the inode freed, Linux often gives it back, and only the ctime
+        // would tell them apart, within the clock's tick).
+        let kept = temp.path().join("kept.sock");
+        fs::hard_link(&sock, &kept).unwrap();
         drop(listener);
         // No one answers any more: removed, and taken again. Not at once in every case: another test that forks
         // (a PTY's program, a pane) gives its child a copy of every descriptor of this process, the listener's

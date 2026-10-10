@@ -954,14 +954,18 @@ const MENU_WAIT: std::time::Duration = std::time::Duration::from_millis(2000);
 /// What a member's next requests use: the model and effort recruit puts on them, else the session's own, with the
 /// effort its last request had on that model; or, before any (or without the mod), those its settings give.
 pub fn model_and_effort(state: &Path, member: &MemberInfo) -> (Option<String>, Option<String>) {
-    let report = report(state, &member.name).unwrap_or_default();
+    model_and_effort_in(&report(state, &member.name).unwrap_or_default(), member)
+}
+
+/// The same, from the member's report already read.
+pub fn model_and_effort_in(report: &Report, member: &MemberInfo) -> (Option<String>, Option<String>) {
     let set = override_of(member);
     // Just after a change of model in the session (`/model`), the last request still had the one before.
     let same = report.own.model.is_none() || report.own.model == report.model;
     let configured = member.effort.clone().filter(|e| EFFORTS.contains(&e.as_str()));
-    let effort = set.effort.or(report.own.effort.filter(|_| same)).or(configured);
+    let effort = set.effort.or(report.own.effort.clone().filter(|_| same)).or(configured);
     // Without the mod (an older Claude Code), the one its settings give.
-    (set.model.or(report.model).or(report.own.model).or(member.model.clone()), effort)
+    (set.model.or(report.model.clone()).or(report.own.model.clone()).or(member.model.clone()), effort)
 }
 
 #[cfg(test)]

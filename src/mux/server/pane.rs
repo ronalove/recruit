@@ -199,6 +199,9 @@ pub(super) struct Pane {
     gate: Arc<Gate>,
     /// What its program last said of its state (OSC 7501).
     pub state: Option<State>,
+    /// Since when it is in that state, as its header shows it (waiting, working, at rest), in seconds since the
+    /// epoch; `None` until its program says it.
+    pub since: Option<u64>,
     /// Bytes its programs wrote since it opened, for `_ctl stats`.
     pub read: Arc<AtomicU64>,
 }
@@ -245,6 +248,7 @@ impl Pane {
             failures: Vec::new(),
             gate: Arc::clone(&wires.gate),
             state: None,
+            since: None,
             read,
         })
     }
@@ -265,6 +269,7 @@ impl Pane {
         self.failure = None;
         self.failures.clear();
         self.state = None;
+        self.since = None;
         Ok(())
     }
 

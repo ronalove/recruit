@@ -125,6 +125,12 @@ pub enum Command {
         /// The client's terminal carries the Nerd Font symbols
         #[arg(long)]
         nerd: bool,
+        /// Open on this member's sheet
+        #[arg(long, value_name = "MEMBER")]
+        member: Option<String>,
+        /// The field of its sheet to focus: name, model or effort
+        #[arg(long, requires = "member")]
+        field: Option<String>,
     },
     /// Internal: changes a running team as its menu does, without the menu: for scripts and tests
     #[command(name = "_edit", hide = true)]
@@ -325,6 +331,8 @@ fn french(command: clap::Command) -> clap::Command {
                 .mut_arg("client", |a| a.help("Le client tmux où s'affiche le menu, pour le détacher"))
                 .mut_arg("popup", |a| a.help("Ouvrir le menu dans une fenêtre sur --client, et rendre la main aussitôt"))
                 .mut_arg("nerd", |a| a.help("Le terminal du client embarque les symboles Nerd Font"))
+                .mut_arg("member", |a| a.help("Ouvrir sur la fiche de ce membre").value_name("MEMBRE"))
+                .mut_arg("field", |a| a.help("Le champ de sa fiche à mettre en avant : name, model ou effort").value_name("CHAMP"))
         })
 }
 
@@ -412,9 +420,13 @@ mod tests {
         assert_eq!(new.members, ["a:b", "c:d"]);
         assert_eq!(new.contacts, ["c"]);
         let cli = Cli::try_parse_from(["recruit", "--lang", "fr", "_menu", "/s", "--client", "/dev/ttys004"]).unwrap();
-        let Some(Command::Menu { state, client, popup, nerd }) = cli.command else { panic!() };
+        let Some(Command::Menu { state, client, popup, nerd, .. }) = cli.command else { panic!() };
         assert_eq!((state.to_str(), client.as_deref(), popup, nerd), (Some("/s"), Some("/dev/ttys004"), false, false));
         assert!(Cli::try_parse_from(["recruit", "_menu", "/s", "--popup"]).is_err());
+        let cli = Cli::try_parse_from(["recruit", "_menu", "/s", "--member", "dev", "--field", "effort"]).unwrap();
+        let Some(Command::Menu { member, field, .. }) = cli.command else { panic!() };
+        assert_eq!((member.as_deref(), field.as_deref()), (Some("dev"), Some("effort")));
+        assert!(Cli::try_parse_from(["recruit", "_menu", "/s", "--field", "model"]).is_err(), "a field needs a member");
     }
 
     #[test]

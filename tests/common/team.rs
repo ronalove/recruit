@@ -30,6 +30,9 @@ pub struct Team {
     run: tempfile::TempDir,
     settings: Option<Vec<u8>>,
     stopped: bool,
+    /// A real Claude Code (the user's profile, and its `~/.claude.json` told the folder): only `settings.json` is
+    /// checked untouched.
+    real: bool,
 }
 
 /// The fake `claude`: answers `--version` (a version that takes the mod) and `agents` (the fakes running, from
@@ -69,7 +72,19 @@ impl Team {
         Team::in_lang(name, tables, "fr")
     }
 
+    /// A team of real Claude Code sessions: no fake, the user's profile. recruit approves the folder in the user's
+    /// `~/.claude.json`, as it does for any team: the folder stays there, to tidy up.
+    pub fn real(name: &str, tables: &str, lang: &'static str) -> Team {
+        let mut team = Team::build(name, tables, lang, true);
+        team.real = true;
+        team
+    }
+
     pub fn in_lang(name: &str, tables: &str, lang: &'static str) -> Team {
+        Team::build(name, tables, lang, false)
+    }
+
+    fn build(name: &str, tables: &str, lang: &'static str, real: bool) -> Team {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonical temp dir");
         let proj = root.join("proj");
@@ -80,13 +95,16 @@ impl Team {
         let claude = root.join("claude");
         std::fs::write(&claude, shim(&root)).expect("shim");
         std::fs::set_permissions(&claude, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("chmod");
-        let settings =
-            format!("[claude]\ncommand = \"{}\"\nconfig_dir = \"{}\"\n\n{tables}", claude.display(), profile.display());
+        let settings = if real {
+            tables.to_string()
+        } else {
+            format!("[claude]\ncommand = \"{}\"\nconfig_dir = \"{}\"\n\n{tables}", claude.display(), profile.display())
+        };
         std::fs::write(proj.join(".recruit/settings.toml"), settings).expect("settings.toml");
         let recruit = super::recruit_copy(&root);
         let run = tempfile::Builder::new().prefix("rt.").tempdir_in("/tmp").expect("short run dir");
         let settings = std::fs::read(user_file(".claude/settings.json")).ok();
-        Team { root, _dir: dir, proj, profile, name: name.into(), lang, recruit, run, settings, stopped: false }
+        Team { root, _dir: dir, proj, profile, name: name.into(), lang, recruit, run, settings, stopped: false, real }
     }
 
     /// The copy of recruit, in the project, with the test's environment.
@@ -105,6 +123,23 @@ impl Team {
             .env("SHELL", "/bin/sh")
             .stdin(Stdio::null());
         command
+    }
+
+    /// `bash -c <script>` in the project with the test's environment (`XDG_*`, `RECRUIT_*`) and `RECRUIT` the copy of
+    /// recruit under test: its output, and whether it succeeded.
+    pub fn bash(&self, script: &str) -> (bool, String) {
+        let mut command = Command::new("bash");
+        command.arg("-c").arg(script).current_dir(&self.proj);
+        for (key, value) in self.command().get_envs() {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+        command.env("RECRUIT", &self.recruit).env("TEAM_STATE", self.state()).env("TEAM_NAME", &self.name);
+        let out = command.output().expect("bash");
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        (out.status.success(), text)
     }
 
     /// `recruit <args…>` in the project, whatever its code.
@@ -207,6 +242,11 @@ impl Team {
 
     /// A real client (`recruit attach <team>`) on a new test terminal.
     pub fn attach(&self, cols: u16, rows: u16, profile: Profile) -> TestTerm {
+        self.in_terminal(&["attach", &self.name], cols, rows, profile)
+    }
+
+    /// `recruit <args…>` on a new test terminal of the team's environment, in the project.
+    pub fn in_terminal(&self, args: &[&str], cols: u16, rows: u16, profile: Profile) -> TestTerm {
         let env = [
             ("XDG_CONFIG_HOME", self.root.join("config").into_os_string()),
             ("XDG_CACHE_HOME", self.root.join("cache").into_os_string()),
@@ -216,7 +256,6 @@ impl Team {
             ("SHELL", "/bin/sh".into()),
         ];
         let env: Vec<(&str, &OsStr)> = env.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
-        let args = [OsStr::new("attach"), OsStr::new(&self.name)];
         TestTerm::spawn_in(Some(&self.proj), self.recruit.as_os_str(), args, &env, cols, rows, profile)
     }
 
@@ -233,11 +272,26 @@ impl Team {
         self.check_user_files();
     }
 
+    /// The team was stopped from inside (the choice's « Quitter »): nothing left running, the user's files untouched.
+    pub fn stopped_by_the_user(&mut self) {
+        self.stopped = true;
+        let gone = wait(Duration::from_secs(5), || leftovers(&self.root).is_empty());
+        assert!(gone, "processes left after the team's quit: {:?}", short(&leftovers(&self.root)));
+        self.check_user_files();
+    }
+
+    /// Whether the team's server answers.
+    pub fn running(&self) -> bool {
+        self.ctl_output(["where"]).status.success()
+    }
+
     /// The user's `~/.claude.json` never names the test's folder, and `~/.claude/settings.json` did not change.
     pub fn check_user_files(&self) {
         let root = self.root.to_string_lossy();
-        let claude_json = std::fs::read_to_string(user_file(".claude.json")).unwrap_or_default();
-        assert!(!claude_json.contains(root.as_ref()), "~/.claude.json names the test's folder");
+        if !self.real {
+            let claude_json = std::fs::read_to_string(user_file(".claude.json")).unwrap_or_default();
+            assert!(!claude_json.contains(root.as_ref()), "~/.claude.json names the test's folder");
+        }
         let settings = std::fs::read(user_file(".claude/settings.json")).ok();
         assert!(settings == self.settings, "~/.claude/settings.json changed during the test");
     }

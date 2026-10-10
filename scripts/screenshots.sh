@@ -8,7 +8,10 @@
 #   scripts/screenshots.sh --lang en       one language (en, fr)
 #   scripts/screenshots.sh --only team     only the team's screenshots; `cli`, the tapes of scripts/demo/tapes (no
 #                                          team); `anim`, the animation
-#   scripts/screenshots.sh --keep          leave the demo team running at the end, to look at it (tmux -L rtest-shots)
+#   scripts/screenshots.sh --keep          leave the demo team running at the end, to look at it (tmux -L rtest-shots,
+#                                          or `recruit attach demo` for the native multiplexer)
+#   scripts/screenshots.sh --backend native   on recruit's own multiplexer (RECRUIT_BACKEND=native) instead of tmux
+#                                          (the default until the switch); the same files, to compare the two sets
 #
 # Writes into site/src/assets/screenshots/: team.png, dashboard.png, journal.png, menu.png, agents.png, those of
 # scripts/demo/tapes/*.tape and demo.gif (for the README); into site/public/media/: demo.mp4 and demo.webm. With a -fr
@@ -20,7 +23,8 @@
 # minutes of sonnet and haiku per language. The profile's settings.json is checked to be the same at the end, and the
 # demo's conversations are removed from it. An image that shows the account's plan or a home folder is not kept.
 #
-# Needs vhs (brew install vhs), ffmpeg, jq, tmux and claude.
+# Needs vhs (brew install vhs), ffmpeg, jq, claude, and tmux for the tmux backend. What each backend answers is in
+# scripts/shots-backend.sh.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -48,21 +52,28 @@ die() {
 langs=(en fr)
 only=all
 keep=false
+backend=tmux
 while (($#)); do
   case $1 in
     --lang) langs=("$2"); shift ;;
     --only) only=$2; shift ;;
     --keep) keep=true ;;
-    -h | --help) sed -n '4,23s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    --backend) backend=$2; shift ;;
+    -h | --help) sed -n '4,26s/^# \{0,1\}//p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
   shift
 done
 for lang in "${langs[@]}"; do [[ $lang == en || $lang == fr ]] || die "unknown language: $lang"; done
 [[ $only =~ ^(all|team|cli|anim)$ ]] || die "--only takes team, cli or anim"
+[[ $backend =~ ^(tmux|native)$ ]] || die "--backend takes tmux or native"
 
-for tool in vhs ffmpeg tmux claude jq; do command -v "$tool" >/dev/null || die "$tool not found"; done
-grep -q "^socket = \"$SOCKET\"" "$DEMO/project/.recruit/settings.toml" || die "the demo team must run in tmux -L $SOCKET"
+tools=(vhs ffmpeg claude jq python3)
+[[ $backend == tmux ]] && tools+=(tmux)
+for tool in "${tools[@]}"; do command -v "$tool" >/dev/null || die "$tool not found"; done
+if [[ $backend == tmux ]]; then
+  grep -q "^socket = \"$SOCKET\"" "$DEMO/project/.recruit/settings.toml" || die "the demo team must run in tmux -L $SOCKET"
+fi
 
 profile=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 settings_sum() { shasum "$profile/settings.json" 2>/dev/null || echo none; }
@@ -80,13 +91,22 @@ mkdir -p "$tmp"
 echo $$ >"$tmp/.recruit-shots"
 export XDG_CONFIG_HOME=$tmp/config XDG_CACHE_HOME=$tmp/cache
 export PATH=$ROOT/target/debug:$PATH
+OWN_RECRUIT=$ROOT/target/debug/recruit
+if [[ $backend == native ]]; then
+  # Short: the server's socket lives there (a path of 100 characters at most).
+  export RECRUIT_BACKEND=native RECRUIT_TMPDIR=$tmp/run
+  mkdir -p "$RECRUIT_TMPDIR"
+fi
+# What is asked of the multiplexer, for tmux and for the native one.
+# shellcheck source=scripts/shots-backend.sh
+source "$ROOT/scripts/shots-backend.sh"
 # The dashboard leaves out the usage of the account, the user's and not the demo's.
 export RECRUIT_NO_USAGE=1
 started=$(date +%s)
 
 cleanup() {
   if ! $keep; then
-    tmux -L "$SOCKET" kill-server 2>/dev/null || true
+    stop_all
     rm -rf "$tmp"
     # The conversations of the demo's sessions, in the profile: those of the folders under $tmp only (Claude Code
     # names a folder's after its real path, each character but letters and digits a dash).
@@ -98,8 +118,6 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
-
-t() { tmux -L "$SOCKET" "$@"; }
 
 # A tape for vhs: the shared settings, the size, then the steps (stdin), and a second at the end: vhs could leave
 # before writing a screenshot that ends a tape. `{{out}}` and `{{sfx}}` are replaced.
@@ -134,9 +152,9 @@ film() { # <name> <size> <sfx>
 # Cuts a pane out of a screenshot of its whole tab, with its title row above it, and frames it with the padding of the
 # terminal. The cells are 17.144 × 33.49 pixels at 28 px, measured on a screenshot (vhs 0.12); a few pixels less at the
 # bottom keep the next row out.
-crop() { # <screenshot> <out> <pane>
+crop() { # <screenshot> <out> <pane> <title>
   local x y w h
-  read -r x y w h < <(t display-message -p -t "$3" '#{pane_left} #{pane_top} #{pane_width} #{pane_height}' |
+  read -r x y w h < <(pane_rect "$3" "$4" |
     awk -v p="$PADDING" -v b="$BAR" '{ printf "%d %d %d %d\n", p + $1 * 17.144, p + b + ($2 - 1) * 33.49, $3 * 17.144, ($4 + 1) * 33.49 - 4 }')
   ffmpeg -loglevel error -y -i "$1" \
     -vf "crop=$w:$h:$x:$y,pad=iw+$((2 * PADDING)):ih+$((2 * PADDING)):$PADDING:$PADDING:black" "$2"
@@ -155,22 +173,13 @@ wait_for() { # <seconds> <what> <command…>
   done
 }
 
-# A pane by its member's name, or a panel's role (dashboard, journal).
-pane_of() {
-  t list-panes -s -t "=$session" -F '#{pane_id} #{?@recruit_role,#{@recruit_role},#{@recruit_member}}' |
-    awk -v m="$1" '$2 == m { print $1 }'
-}
-
-# The members' panes.
-member_panes() { t list-panes -s -t "=$session" -F '#{pane_id} #{@recruit_role}' | awk 'NF == 1 { print $1 }'; }
-
 # Claude Code asks whether to trust a folder it has never been approved in, "No, exit" first: yes.
 trust() {
   local pane
   for pane in $(member_panes); do
-    if t capture-pane -p -t "$pane" | grep -q "trust this folder"; then
-      t send-keys -t "$pane" Down
-      t send-keys -t "$pane" Enter
+    if pane_text "$pane" | grep -q "trust this folder"; then
+      pane_key "$pane" Down
+      pane_key "$pane" Enter
     fi
   done
 }
@@ -180,8 +189,8 @@ trust() {
 PRIVATE="Claude (Max|Pro|Team|Enterprise|API)|% of your [a-z0-9 -]*limit|/Users/|/home/|$HOME"
 private() {
   local pane
-  for pane in $(t list-panes -t "=$session:" -F '#{pane_id}'); do
-    t capture-pane -p -t "$pane" | grep -qE "$PRIVATE" && return 0
+  for pane in $(shown_panes); do
+    pane_text "$pane" | grep -qE "$PRIVATE" && return 0
   done
   return 1
 }
@@ -210,7 +219,7 @@ launch() { # <lang>
   [[ $1 == fr ]] && team=demo-fr
   session=$team
   (cd "$project" && RECRUIT_LANG=$1 recruit --detach "$team")
-  state=$(t show-options -v -t "=$session:" @recruit_state)
+  state=$(state_of_team)
   states=$state/states.json
   members=$(member_panes | wc -l | tr -d ' ')
   up() {
@@ -232,9 +241,32 @@ send() { # <member> <message>
   local pane
   pane=$(pane_of "$1")
   [[ -n $pane ]] || die "no member $1 in the demo team"
-  t send-keys -t "$pane" -l "$2"
-  sleep 0.5
-  t send-keys -t "$pane" Enter
+  pane_type "$pane" "$2"
+}
+
+# What the next film of the team starts on: the first tab or the second, and the menu opened over it when asked. tmux:
+# the window of the session (a new client opens on it), the menu once vhs's terminal is attached (Alt+r typed by vhs
+# reaches tmux as a plain r). native: a client keeps the tab it was on, so the keys go to it once attached, in the
+# background (about two minutes to wait for it at most).
+view() { # <first|second> [menu <lang>]
+  if [[ $backend == tmux ]]; then
+    if [[ $1 == first ]]; then select_first; else select_second; fi
+    [[ ${2:-} == menu ]] || return 0
+  fi
+  (
+    local waited=0
+    until has_client; do
+      sleep 0.5
+      ((++waited < 240)) || exit 0
+    done
+    sleep 1
+    if [[ $backend == native ]]; then
+      if [[ $1 == first ]]; then ctl key alt+1; else ctl key alt+2; fi
+      sleep 0.5
+    fi
+    [[ ${2:-} == menu ]] && open_menu "$3"
+    true
+  ) &
 }
 
 # The tasks of scripts/demo/tasks.<lang>.tsv: `member<TAB>message`, one a line; `#` starts a comment.
@@ -251,14 +283,14 @@ shoot_team() { # <lang> <sfx>
   local given try=1 taken=false
   given=$(date +%s)
   scene() { (($(count working) >= 1 && ($(count waiting) >= 1 || try > 1) && $(date +%s) - given >= 12)); }
-  local attach="tmux -L $SOCKET attach -t =$session"
-  local first
-  first=$(t list-windows -t "=$session" -F '#{window_index}' | head -1)
+  local attach dash_title=Dashboard
+  attach=$(attach_command)
+  [[ $lang == fr ]] && dash_title="Tableau de bord"
 
   # The first tab: the contacts, the dashboard and the reduced journal. Filmed again, three times at most, when the
   # scene changed meanwhile; when it does not come back, the image taken before stays.
-  t select-window -t "=$session:$first"
   for try in 1 2 3; do
+    view first
     if ! wait_for 240 "the scene (try $try)" scene && $taken; then break; fi
     film_clean team "$TEAM_SIZE" "$sfx" "$OUT/team$sfx.png" <<EOF || break
 Hide
@@ -274,19 +306,10 @@ EOF
     echo "screenshots: the scene changed while filming, again ($try)" >&2
   done
   # The dashboard's close-up, out of the same image.
-  [[ -e $OUT/team$sfx.png ]] && crop "$OUT/team$sfx.png" "$OUT/dashboard$sfx.png" "$(pane_of dashboard)"
+  [[ -e $OUT/team$sfx.png ]] && crop "$OUT/team$sfx.png" "$OUT/dashboard$sfx.png" "$(pane_of dashboard)" "$dash_title"
 
-  # The /recruit menu, on the sheet of the second member. Opened as Alt+r does, once vhs's terminal is attached: Alt+r
-  # typed by vhs reaches tmux as a plain r.
-  (
-    client=""
-    until [[ -n $client ]]; do
-      sleep 0.5
-      client=$(t list-clients -t "=$session" -F '#{client_name}' | head -1)
-    done
-    sleep 1
-    recruit --lang "$lang" _menu "$state" --client "$client" --popup >/dev/null 2>&1
-  ) &
+  # The /recruit menu, on the sheet of the second member. Opened as Alt+r does, once vhs's terminal is attached.
+  view first menu "$lang"
   film_clean menu "$TEAM_SIZE" "$sfx" "$OUT/menu$sfx.png" <<EOF || true
 Hide
 Type "$attach"
@@ -302,10 +325,8 @@ EOF
   wait
 
   # A tab of working agents, in a grid.
-  local agents
-  agents=$(t list-windows -t "=$session" -F '#{window_index}' | sed -n 2p)
-  if [[ -n $agents ]]; then
-    t select-window -t "=$session:$agents"
+  if has_second_tab; then
+    view second
     film_clean agents "$TEAM_SIZE" "$sfx" "$OUT/agents$sfx.png" <<EOF || true
 Hide
 Type "$attach"
@@ -315,12 +336,13 @@ Show
 Sleep 500ms
 Screenshot "{{out}}/agents{{sfx}}.png"
 EOF
-    t select-window -t "=$session:$first"
+    wait
   fi
 
   # The journal in full (reduced at launch: hidden, then full), cut out of the first tab.
   recruit _panel toggle "$state" >/dev/null
   recruit _panel toggle "$state" >/dev/null
+  view first
   film_clean full "$TEAM_SIZE" "$sfx" "$tmp/full.png" <<EOF &&
 Hide
 Type "$attach"
@@ -330,9 +352,9 @@ Show
 Sleep 500ms
 Screenshot "$tmp/full.png"
 EOF
-    crop "$tmp/full.png" "$OUT/journal$sfx.png" "$(pane_of journal)"
+    crop "$tmp/full.png" "$OUT/journal$sfx.png" "$(pane_of journal)" Journal
 
-  $keep || t kill-session -t "=$session"
+  $keep || stop_team
 }
 
 # The animation from its recording: the start as it was (the request typed, `typed` characters, and sent), the rest
@@ -374,14 +396,14 @@ shoot_anim() { # <lang> <sfx>
       send "$contact" "$(tasks "$lang" | awk -F '\t' -v m="$contact" '$1 == m { print $2 }' | grep . || echo "$first_task")"
     fi
   done
-  t select-window -t "=$session:$(t list-windows -t "=$session" -F '#{window_index}' | head -1)"
+  select_first
   sleep 5
   rested() { (($(count working) == 0)); }
   wait_for 180 "the contacts at rest" rested || true
   sleep 4
   if private; then
     echo "screenshots: WARNING: no animation in $lang: the account's plan still shows" >&2
-    $keep || t kill-session -t "=$session"
+    $keep || stop_team
     return 0
   fi
 
@@ -390,11 +412,7 @@ shoot_anim() { # <lang> <sfx>
   local done_word="recruit-shots-end-$$"
   (
     deadline=$(($(date +%s) + 240))
-    client=""
-    until [[ -n $client ]]; do
-      sleep 0.5
-      client=$(t list-clients -t "=$session" -F '#{client_name}' | head -1)
-    done
+    until has_client; do sleep 0.5; done
     # The working agents seen at work, one a line, and those of them at rest now.
     worked=$tmp/worked
     : >"$worked"
@@ -409,14 +427,15 @@ shoot_anim() { # <lang> <sfx>
       sleep 1
     done
     sleep 4
-    t display-message -c "$client" -d 10000 "$done_word"
+    say_on_client "$done_word" "$lead"
   ) &
 
-  local attach="tmux -L $SOCKET attach -t =$session"
-  local first
-  first=$(t list-windows -t "=$session" -F '#{window_index}' | head -1)
-  t select-window -t "=$session:$first"
-  t select-pane -t "$(pane_of "$lead")"
+  local attach
+  attach=$(attach_command)
+  view first
+  # The request goes to the focused pane: the lead's (tmux: made so; native: the first contact has the focus when a
+  # client attaches, and the lead is the first of the demo's contacts).
+  [[ $backend == tmux ]] && t select-pane -t "$(pane_of "$lead")"
   film anim "$TEAM_SIZE" "$sfx" <<EOF || die "vhs failed on the animation"
 Output "$tmp/anim.mp4"
 Set Framerate 10
@@ -435,7 +454,7 @@ EOF
 
   montage "$tmp/anim.mp4" "${#request}" "$MEDIA/demo$sfx" "$OUT/demo$sfx.gif"
 
-  $keep || t kill-session -t "=$session"
+  $keep || stop_team
 }
 
 # The command line tapes of scripts/demo/tapes, filmed in the copy of the demo's project (also $DEMO_PROJECT), with

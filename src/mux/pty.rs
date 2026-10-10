@@ -468,6 +468,27 @@ fn slave_name(master: RawFd) -> io::Result<CString> {
     }
 }
 
+/// How many descriptors this process may have: its descriptors are below. Asked before `fork`.
+fn table_size() -> libc::c_int {
+    // macOS: the soft limit, within the kernel's own per-process maximum (an unlimited soft limit included).
+    #[cfg(target_vendor = "apple")]
+    // SAFETY: a plain query.
+    let size = unsafe { libc::getdtablesize() };
+    #[cfg(not(target_vendor = "apple"))]
+    let size = {
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: a plain query into a local.
+        let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+            limit.rlim_cur
+        } else {
+            libc::RLIM_INFINITY
+        };
+        // Unlimited, or more than Linux allows by default (`fs.nr_open`): that default.
+        soft.min(1 << 20) as libc::c_int
+    };
+    size.max(3)
+}
+
 /// Gives the terminal its size, which sends SIGWINCH to the program.
 fn set_size(master: RawFd, cols: u16, rows: u16) -> io::Result<()> {
     let size = libc::winsize { ws_row: rows.max(1), ws_col: cols.max(1), ws_xpixel: 0, ws_ypixel: 0 };
@@ -488,6 +509,8 @@ struct Exec {
     cwd: Option<CString>,
     /// Written to the terminal, before the error number, if the program cannot be started after all.
     failed: Vec<u8>,
+    /// The size of the descriptor table: where the child stops closing them one by one ([`Exec::close_the_rest`]).
+    table: libc::c_int,
 }
 
 impl Exec {
@@ -527,12 +550,13 @@ impl Exec {
             _envp: envp,
             cwd: cwd.map(|cwd| c_string(cwd.as_os_str())).transpose()?,
             failed: failed.into_bytes(),
+            table: table_size(),
         })
     }
 
     /// The child's side, between `fork` and `exec`: default signals, the terminal as its standard descriptors (first,
-    /// so that a failure is told there), a session of its own with the terminal as its controlling one, its
-    /// directory, then the program. Only async-signal-safe calls.
+    /// so that a failure is told there) and no other, a session of its own with the terminal as its controlling one,
+    /// its directory, then the program. Only async-signal-safe calls.
     ///
     /// SAFETY: to be called in the child, right after `fork`.
     unsafe fn run(&self, slave: RawFd) -> ! {
@@ -557,7 +581,7 @@ impl Exec {
                     self.fail();
                 }
             }
-            libc::close(slave);
+            self.close_the_rest();
             if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                 self.fail();
             }
@@ -568,6 +592,27 @@ impl Exec {
             }
             libc::execve(self.path.as_ptr(), self.argv.as_ptr(), self.envp.as_ptr());
             self.fail()
+        }
+    }
+
+    /// Closes every descriptor above the standard ones, the terminal's copy among them. `CLOEXEC` is not enough: this
+    /// process may hold descriptors without it that it did not open, inherited from whatever started it (a CI runner
+    /// leaves some), or being made by another thread (Rust makes a pipe in two steps on macOS, which has no `pipe2`).
+    /// The program would keep them open, a pipe's write end among them, so that its reader never sees its end. As
+    /// tmux does (`closefrom`).
+    ///
+    /// SAFETY: in the child, between `fork` and `exec`: `close_range` and `close` are async-signal-safe.
+    unsafe fn close_the_rest(&self) {
+        // SAFETY: plain system calls on descriptors this process owns.
+        unsafe {
+            // Linux 5.9 and later; otherwise (an older kernel, a sandbox that refuses it), one by one.
+            #[cfg(target_os = "linux")]
+            if libc::syscall(libc::SYS_close_range, 3 as libc::c_uint, libc::c_uint::MAX, 0 as libc::c_uint) == 0 {
+                return;
+            }
+            for fd in 3..self.table {
+                libc::close(fd);
+            }
         }
     }
 
@@ -866,14 +911,37 @@ mod tests {
 
     #[test]
     fn descriptors_are_not_inherited() {
-        // The program has its three standard descriptors and nothing of ours (the master, the pipes). `test -e`
-        // opens nothing, unlike `ls /dev/fd`.
+        // The program has its three standard descriptors and nothing else: none of ours (the master, the pipes), and
+        // none this process holds without CLOEXEC, as one it inherited (a CI runner leaves some open): one is made
+        // here, from 200. `test -e` opens nothing, unlike `ls /dev/fd`; under Linux, what one is gets said.
+        let null = File::open("/dev/null").unwrap();
+        // SAFETY: a copy without CLOEXEC of a descriptor this test owns, closed below.
+        let held = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD, 200) };
+        assert!((200..256).contains(&held), "{held}");
         let run = start(
             "/bin/sh",
-            &["-c", "for fd in $(seq 3 255); do [ -e /dev/fd/$fd ] && echo \"fd $fd\"; done; :"],
+            &[
+                "-c",
+                "for fd in $(seq 3 255); do [ -e /dev/fd/$fd ] && echo \"fd $fd $(readlink /proc/$$/fd/$fd 2>/dev/null)\"; done; :",
+            ],
             None,
         );
-        assert_eq!(run.wait(), Some(0));
+        let status = run.wait();
+        // SAFETY: the copy made above.
+        unsafe { libc::close(held) };
+        assert_eq!(status, Some(0));
         assert!(!run.text().contains("fd "), "{:?}", run.text());
+    }
+
+    #[test]
+    fn our_descriptors_close_on_exec() {
+        // The children close them all anyway (above), but not the programs this process starts otherwise: Rust's
+        // `Command` closes nothing under Linux.
+        let (master, slave) = open(80, 24).unwrap();
+        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+            // SAFETY: a query on a descriptor this test owns.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0, "descriptor {fd}: {flags}");
+        }
     }
 }

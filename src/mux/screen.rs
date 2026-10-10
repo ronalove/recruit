@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
 //! Panes composed into one screen (spec §5.3): each one's cells in its frame (`chrome.rs`, direction B « Cadres »),
-//! the bar on the last row, the cursor of the pane with the focus. The frame is then sent by difference
-//! (`canvas::Painter`).
+//! the bar on the last row, the cursor of the pane with the focus, a notice over it all. The frame is then sent by
+//! difference (`canvas::Painter`).
 //!
 //! Owner: dev-rendu.
 
 use super::Rect;
-use super::chrome::{self, Header, Look, Tab, Target};
+use super::chrome::{self, Header, Look, Notice, Part, Tab, Target};
 use super::engine::Engine;
 use super::select::Point;
 use crate::canvas::{Canvas, Cursor, Style};
@@ -23,12 +23,18 @@ pub(crate) enum Over<'a> {
     Choice(&'a chrome::Choice),
 }
 
-/// Where a frame can be clicked: the bar's parts, and a choice's options by their index. Nothing of the bar while
-/// something shows over the team: what is dimmed takes no click.
+/// Where a frame can be clicked. What is dimmed takes no click: nothing of the bar while something shows over the
+/// team, and only the parts of the headers in what stays clear. The notice is over everything else: it is looked
+/// at first.
 #[derive(Debug, Default)]
 pub(crate) struct Zones {
     pub bar: Vec<(Rect, Target)>,
+    /// A choice's options, by their index.
     pub options: Vec<(Rect, usize)>,
+    /// The parts of the headers, with their view's index in `views`.
+    pub parts: Vec<(Rect, usize, Part)>,
+    /// Where the notice shows.
+    pub notice: Option<Rect>,
 }
 
 /// What is under a layer: as the menu dims what is behind its dialogs.
@@ -54,9 +60,10 @@ pub(crate) fn content(area: Rect) -> Rect {
 }
 
 /// The panes drawn into `canvas`, each in its frame, the focused one's cursor when it shows its live screen, the bar
-/// in `bar` (the screen's last row; nothing when empty) with the team's name and its tabs, and what is `over` them.
-/// Returns where the frame can be clicked. Everything is drawn: [`Screen::compose`] keeps what did not change, and
-/// is what the server calls; this one is the frame drawn whole that its tests compare with.
+/// in `bar` (the screen's last row; nothing when empty) with the team's name, its tabs and the part of it `hover`
+/// is on, what is `over` them, and last the `notice`, never dimmed. Returns where the frame can be clicked.
+/// Everything is drawn: [`Screen::compose`] keeps what did not change, and is what the server calls; this one is the
+/// frame drawn whole that its tests compare with.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compose(
@@ -65,15 +72,26 @@ pub(crate) fn compose(
     team: &str,
     tabs: &[Tab<'_>],
     bar: Rect,
+    hover: Option<Target>,
     look: Look,
     over: Over<'_>,
+    notice: Option<&Notice>,
 ) -> Zones {
+    let (width, height) = (canvas.width(), canvas.height());
     let mut cursor = None;
-    for view in views {
-        cursor = draw(canvas, view, true, look).or(cursor);
+    let mut parts = Vec::new();
+    for (i, view) in views.iter().enumerate() {
+        cursor = draw(canvas, view, i, true, look, &mut parts).or(cursor);
     }
-    let clear = clear(canvas.width(), canvas.height(), views, bar, over);
-    finish(canvas, cursor, team, tabs, bar, look, over, clear)
+    let clear = clear(width, height, views, bar, over);
+    let notice = notice.map(|notice| (notice, chrome::notice_area(team_area(width, height, bar), notice)));
+    let bar = Bar { area: bar, team, tabs, hover };
+    finish(canvas, cursor, parts, &bar, look, over, clear, notice)
+}
+
+/// The team's place on a `width` × `height` screen: all of it but the bar.
+fn team_area(width: usize, height: usize, bar: Rect) -> Rect {
+    Rect { x: 0, y: 0, width, height: if bar.height > 0 { bar.y } else { height } }
 }
 
 /// What stays clear on a `width` × `height` screen when something is `over` the team: the menu's place, or the
@@ -82,16 +100,20 @@ fn clear(width: usize, height: usize, views: &[View<'_>], bar: Rect, over: Over<
     match over {
         Over::Nothing => None,
         Over::LastView => views.last().map(|view| view.area),
-        Over::Choice(choice) => {
-            let team = Rect { x: 0, y: 0, width, height: if bar.height > 0 { bar.y } else { height } };
-            Some(chrome::choice_area(team, choice))
-        }
+        Over::Choice(choice) => Some(chrome::choice_area(team_area(width, height, bar), choice)),
     }
 }
 
-/// One view: its cells when `cells` (else they are on the canvas already), its frame; its cursor on the screen when
-/// it has the focus and shows its live screen.
-fn draw(canvas: &mut Canvas, view: &View<'_>, cells: bool, look: Look) -> Option<Cursor> {
+/// One view, the `index`-th: its cells when `cells` (else they are on the canvas already), its frame, whose parts
+/// go to `parts`; its cursor on the screen when it has the focus and shows its live screen.
+fn draw(
+    canvas: &mut Canvas,
+    view: &View<'_>,
+    index: usize,
+    cells: bool,
+    look: Look,
+    parts: &mut Vec<(Rect, usize, Part)>,
+) -> Option<Cursor> {
     let area = view.area;
     if area.width == 0 || area.height == 0 {
         return None;
@@ -107,7 +129,8 @@ fn draw(canvas: &mut Canvas, view: &View<'_>, cells: bool, look: Look) -> Option
     let scrolled = view.engine.scrolled();
     let header =
         Header { scroll: (scrolled > 0).then(|| (scrolled, view.engine.history().max(scrolled))), ..view.header };
-    chrome::frame(canvas, area, &header, view.focused, look);
+    let drawn = chrome::frame(canvas, area, &header, view.focused, look);
+    parts.extend(drawn.into_iter().map(|(rect, part)| (rect, index, part)));
     if !view.focused || scrolled > 0 {
         return None;
     }
@@ -118,36 +141,56 @@ fn draw(canvas: &mut Canvas, view: &View<'_>, cells: bool, look: Look) -> Option
     })
 }
 
+/// The bar: its row, the team's name, its tabs, and the part of it the pointer is on.
+struct Bar<'a> {
+    area: Rect,
+    team: &'a str,
+    tabs: &'a [Tab<'a>],
+    hover: Option<Target>,
+}
+
 /// The cursor, the bar (its row blanked first, for a canvas kept from the frame before), then what is over the team:
-/// everything outside `clear` dimmed, and the choice drawn. Under a layer, the cursor shows only in it.
+/// everything outside `clear` dimmed, and the choice drawn; last the notice, in its place. Under a layer, the cursor
+/// shows only in it; never under the notice.
 #[allow(clippy::too_many_arguments)]
 fn finish(
     canvas: &mut Canvas,
     cursor: Option<Cursor>,
-    team: &str,
-    tabs: &[Tab<'_>],
-    bar: Rect,
+    mut parts: Vec<(Rect, usize, Part)>,
+    bar: &Bar<'_>,
     look: Look,
     over: Over<'_>,
     clear: Option<Rect>,
+    notice: Option<(&Notice, Rect)>,
 ) -> Zones {
     let cursor = match over {
         Over::Nothing => cursor,
         Over::LastView => cursor.filter(|c| clear.is_some_and(|area| area.contains(c.x, c.y))),
         Over::Choice(_) => None,
     };
-    canvas.set_cursor(cursor);
+    canvas.set_cursor(cursor.filter(|c| !notice.is_some_and(|(_, area)| area.contains(c.x, c.y))));
     let mut zones = Zones::default();
-    if bar.width > 0 && bar.height > 0 {
-        canvas.fill(bar.x, bar.y, bar.width, bar.height, Style::PLAIN);
-        zones.bar = chrome::bar(canvas, bar, team, tabs, look);
+    let row = bar.area;
+    if row.width > 0 && row.height > 0 {
+        canvas.fill(row.x, row.y, row.width, row.height, Style::PLAIN);
+        zones.bar = chrome::bar(canvas, row, bar.team, bar.tabs, look, bar.hover);
     }
     if let Some(area) = clear {
         canvas.fade_outside(area.x, area.y, area.width, area.height, DIMMED);
         zones.bar.clear();
-        if let Over::Choice(choice) = over {
-            zones.options = chrome::choice(canvas, area, choice, look);
+        match over {
+            // The choice's box over whatever stays clear under it.
+            Over::Choice(choice) => {
+                parts.clear();
+                zones.options = chrome::choice(canvas, area, choice, look);
+            }
+            _ => parts.retain(|(rect, _, _)| within(rect, &area)),
         }
+    }
+    zones.parts = parts;
+    if let Some((notice, area)) = notice.filter(|(_, area)| area.width > 0 && area.height > 0) {
+        chrome::notice(canvas, area, notice, look);
+        zones.notice = Some(area);
     }
     zones
 }
@@ -169,8 +212,8 @@ const ROOM: usize = 64 * 1024;
 /// The screen's canvas, kept from one frame to the next, and what each view's cells showed in it: a pane whose
 /// engine drew nothing new since ([`Engine::generation`]), in the same place, with the same selection, and that
 /// overlaps no view drawn before it (a layer is painted at every frame), keeps its cells rather than being painted
-/// again (spec §2). A new
-/// size, other panes, or another order: everything is drawn.
+/// again (spec §2). A new size, other panes, or another order: everything is drawn. A notice that goes or moves:
+/// what it covered is drawn again, the rest kept.
 #[derive(Default)]
 pub(crate) struct Screen {
     canvas: Canvas,
@@ -180,6 +223,8 @@ pub(crate) struct Screen {
     /// What stayed clear under a layer: when it changes, comes or goes, everything is drawn (a cell kept dimmed, or
     /// one kept from under the layer's old place, would stay so).
     clear: Option<Rect>,
+    /// Where the notice was drawn: kept cells there show it.
+    notice: Option<Rect>,
 }
 
 impl Screen {
@@ -193,30 +238,41 @@ impl Screen {
         team: &str,
         tabs: &[Tab<'_>],
         bar: Rect,
+        hover: Option<Target>,
         look: Look,
         over: Over<'_>,
+        notice: Option<&Notice>,
     ) -> Zones {
         let clear = clear(width, height, views, bar, over);
+        let notice = notice.map(|notice| (notice, chrome::notice_area(team_area(width, height, bar), notice)));
         let same = !self.composing
             && (self.canvas.width(), self.canvas.height()) == (width, height)
             && clear == self.clear
             && self.drawn.len() == views.len()
             && self.drawn.iter().zip(views).all(|(drawn, view)| drawn.id == view.id && drawn.area == view.area);
         self.composing = true;
+        // Where the notice was, when it went or moved: blanked, and the views under it painted again.
+        let mut gone = None;
         if same {
             self.canvas.compact(ROOM);
             self.canvas.advance();
+            gone = self.notice.filter(|&old| Some(old) != notice.map(|(_, area)| area));
+            if let Some(old) = gone {
+                self.canvas.fill(old.x, old.y, old.width, old.height, Style::PLAIN);
+            }
         } else {
             self.canvas.reset(width, height);
             self.drawn.clear();
             self.drawn.resize(views.len(), Drawn::default());
         }
         self.clear = clear;
+        self.notice = notice.map(|(_, area)| area);
         // The areas of the views drawn before: their frames are drawn again at every frame, and a view over one of
         // them (a layer) is painted again too, or a frame would show through it.
         let mut before: Vec<Rect> = Vec::new();
         let mut cursor = None;
-        for (view, drawn) in views.iter().zip(&mut self.drawn) {
+        let mut parts = Vec::new();
+        for (i, (view, drawn)) in views.iter().zip(&mut self.drawn).enumerate() {
             let generation = view.engine.generation();
             let top = view.selection.map(|_| view.engine.top());
             let keep = same
@@ -224,6 +280,7 @@ impl Screen {
                 && drawn.generation == generation
                 && drawn.selection == view.selection
                 && drawn.top == top
+                && !gone.is_some_and(|old| overlap(&old, &view.area))
                 && !before.iter().any(|area| overlap(area, &view.area));
             before.push(view.area);
             if !keep {
@@ -233,9 +290,10 @@ impl Screen {
                 (drawn.area, drawn.generation, drawn.selection, drawn.top) =
                     (view.area, generation, view.selection, top);
             }
-            cursor = draw(&mut self.canvas, view, !keep, look).or(cursor);
+            cursor = draw(&mut self.canvas, view, i, !keep, look, &mut parts).or(cursor);
         }
-        let zones = finish(&mut self.canvas, cursor, team, tabs, bar, look, over, clear);
+        let bar = Bar { area: bar, team, tabs, hover };
+        let zones = finish(&mut self.canvas, cursor, parts, &bar, look, over, clear, notice);
         self.composing = false;
         zones
     }
@@ -248,6 +306,14 @@ impl Screen {
 
 fn overlap(a: &Rect, b: &Rect) -> bool {
     a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+}
+
+/// Whether `inner` is all inside `outer`.
+fn within(inner: &Rect, outer: &Rect) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.x + inner.width <= outer.x + outer.width
+        && inner.y + inner.height <= outer.y + outer.height
 }
 
 /// The cells of `range` a pane shows in `cells`, from line `top`, in reverse video.
@@ -356,7 +422,7 @@ mod tests {
     }
 
     fn header(name: &'static str) -> Header<'static> {
-        Header { name, color: None, state: State::Working, note: None, scroll: None, hint: None }
+        Header { name, state: State::Working, ..Header::default() }
     }
 
     /// Two panes side by side on a 20 × 5 screen, the bar on its last row.
@@ -387,8 +453,9 @@ mod tests {
     fn panes_in_their_frames() {
         let (a, b) = (left(), right());
         let mut canvas = Canvas::new(20, 5);
-        let tabs = [Tab { title: "A", active: true, state: State::Working }];
-        let zones = compose(&mut canvas, &two(&a, &b, 0), "team", &tabs, BAR, Look::default(), Over::Nothing);
+        let tabs = [Tab { title: "A", active: true, state: State::Working, zoomed: None }];
+        let zones =
+            compose(&mut canvas, &two(&a, &b, 0), "team", &tabs, BAR, None, Look::default(), Over::Nothing, None);
         // Each engine inside its frame, the frames side by side with no line between them.
         let rows = rows(&canvas);
         let cols = |row: &str, from: usize, to: usize| row.chars().skip(from).take(to - from).collect::<String>();
@@ -403,14 +470,24 @@ mod tests {
         assert!(zones.bar.iter().all(|(rect, _)| rect.y == BAR.y));
 
         let mut canvas = Canvas::new(20, 5);
-        compose(&mut canvas, &two(&a, &b, 1), "team", &tabs, BAR, Look::default(), Over::Nothing);
+        compose(&mut canvas, &two(&a, &b, 1), "team", &tabs, BAR, None, Look::default(), Over::Nothing, None);
         assert_eq!(canvas.cursor(), Some(Cursor { x: 18, y: 1, ..CURSOR }));
         // No bar: nothing drawn on the last row, nothing to click.
         let mut canvas = Canvas::new(20, 5);
         assert!(
-            compose(&mut canvas, &two(&a, &b, 1), "team", &tabs, Rect::default(), Look::default(), Over::Nothing)
-                .bar
-                .is_empty()
+            compose(
+                &mut canvas,
+                &two(&a, &b, 1),
+                "team",
+                &tabs,
+                Rect::default(),
+                None,
+                Look::default(),
+                Over::Nothing,
+                None
+            )
+            .bar
+            .is_empty()
         );
         assert_eq!(canvas.row(4), "");
     }
@@ -422,7 +499,7 @@ mod tests {
         // "ls" on the first row of the live screen (line 2, after two of history), then the next line's start.
         views[0].selection = Some((Point { line: 2, col: 2 }, Point { line: 3, col: 0 }));
         let mut canvas = Canvas::new(20, 5);
-        compose(&mut canvas, &views, "team", &[], BAR, Look::default(), Over::Nothing);
+        compose(&mut canvas, &views, "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         let reversed = |x, y| canvas.style(x, y).reverse;
         // Inside the frame: the pane's cells from column 1, row 1.
         assert!(!reversed(2, 1) && reversed(3, 1) && reversed(8, 1), "to the end of the row");
@@ -433,7 +510,7 @@ mod tests {
         let mut views = two(&a, &b, 0);
         views[0].selection = Some((Point { line: 2, col: 2 }, Point { line: 2, col: 3 }));
         let mut canvas = Canvas::new(20, 5);
-        compose(&mut canvas, &views, "team", &[], BAR, Look::default(), Over::Nothing);
+        compose(&mut canvas, &views, "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         assert_eq!(canvas.row(2).chars().skip(1).take(4).collect::<String>(), "$ ls");
         assert!(canvas.style(3, 2).reverse && canvas.style(4, 2).reverse && !canvas.style(5, 2).reverse);
     }
@@ -447,7 +524,7 @@ mod tests {
         views[0].area.width = 40;
         views[1].area.x = 40;
         let mut canvas = Canvas::new(50, 5);
-        compose(&mut canvas, &views, "team", &[], BAR, Look::default(), Over::Nothing);
+        compose(&mut canvas, &views, "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         let up = t!("↑ {} sur {}", "↑ {} of {}", 1, 2);
         assert!(canvas.row(0).contains(&up), "the scroll in the header: {:?}", canvas.row(0));
         assert_eq!(canvas.row(1).chars().skip(1).take(5).collect::<String>(), "old 2");
@@ -456,13 +533,13 @@ mod tests {
         // After the pane's own note.
         views[0].header.note = Some("exited");
         let mut canvas = Canvas::new(50, 5);
-        compose(&mut canvas, &views, "team", &[], BAR, Look::default(), Over::Nothing);
+        compose(&mut canvas, &views, "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         assert!(canvas.row(0).contains(&format!("exited · {up}")), "{:?}", canvas.row(0));
         // At the bottom of its history, nothing.
         a.scroll(-1);
         let views = two(&a, &b, 0);
         let mut canvas = Canvas::new(50, 5);
-        compose(&mut canvas, &views, "team", &[], BAR, Look::default(), Over::Nothing);
+        compose(&mut canvas, &views, "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         assert!(!canvas.row(0).contains('↑'), "{:?}", canvas.row(0));
     }
 
@@ -527,29 +604,29 @@ mod tests {
         let (mut a, b) = (left(), right());
         a.generation = Some(1);
         let mut screen = Screen::default();
-        screen.compose(20, 5, &two(&a, &b, 0), "team", &[], BAR, Look::default(), Over::Nothing);
+        screen.compose(20, 5, &two(&a, &b, 0), "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         assert_eq!(first(screen.canvas()), "$ ls   ");
         // Its text changed, its generation did not: the cells drawn before stay (this is what tells it was kept).
         a.screen = vec!["changed"];
-        screen.compose(20, 5, &two(&a, &b, 0), "team", &[], BAR, Look::default(), Over::Nothing);
+        screen.compose(20, 5, &two(&a, &b, 0), "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         assert_eq!(first(screen.canvas()), "$ ls   ");
         // The cursor is set at every frame all the same.
         assert_eq!(screen.canvas().cursor(), Some(Cursor { x: 3, y: 2, ..CURSOR }));
         // A new generation: drawn again, the old text gone.
         a.generation = Some(2);
-        screen.compose(20, 5, &two(&a, &b, 0), "team", &[], BAR, Look::default(), Over::Nothing);
+        screen.compose(20, 5, &two(&a, &b, 0), "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         assert_eq!(first(screen.canvas()), "changed");
         assert_eq!(screen.canvas().row(2).chars().skip(1).take(3).collect::<String>(), "   ");
         // Another selection: drawn again.
         let mut views = two(&a, &b, 0);
         views[0].selection = Some((Point { line: 2, col: 0 }, Point { line: 2, col: 1 }));
-        screen.compose(20, 5, &views, "team", &[], BAR, Look::default(), Over::Nothing);
+        screen.compose(20, 5, &views, "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         assert!(screen.canvas().style(1, 1).reverse);
         // An engine that does not tell: drawn every time.
         let mut b = right();
-        screen.compose(20, 5, &two(&a, &b, 0), "team", &[], BAR, Look::default(), Over::Nothing);
+        screen.compose(20, 5, &two(&a, &b, 0), "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         b.screen = vec!["> bye"];
-        screen.compose(20, 5, &two(&a, &b, 0), "team", &[], BAR, Look::default(), Over::Nothing);
+        screen.compose(20, 5, &two(&a, &b, 0), "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         assert_eq!(screen.canvas().row(1).chars().skip(11).take(7).collect::<String>(), "> bye  ");
     }
 
@@ -578,7 +655,7 @@ mod tests {
     /// The same frame as one drawn whole, on a new canvas.
     fn as_whole(screen: &Screen, views: &[View<'_>]) {
         let mut fresh = Canvas::new(20, 5);
-        compose(&mut fresh, views, "team", &[], BAR, Look::default(), Over::Nothing);
+        compose(&mut fresh, views, "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         for y in 0..5 {
             assert_eq!(screen.canvas().row(y), fresh.row(y), "row {y}");
         }
@@ -590,11 +667,11 @@ mod tests {
         layer.screen = vec!["MENU"];
         (pane.generation, layer.generation) = (Some(1), Some(1));
         let mut screen = Screen::default();
-        screen.compose(20, 5, &layered(&pane, &layer), "team", &[], BAR, Look::default(), Over::Nothing);
+        screen.compose(20, 5, &layered(&pane, &layer), "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         assert!(screen.canvas().row(1).contains("MENU"));
         // The pane under the layer draws something new; the layer, unchanged, is drawn over it again.
         (pane.screen, pane.generation) = (vec!["xxxxxxxx"], Some(2));
-        screen.compose(20, 5, &layered(&pane, &layer), "team", &[], BAR, Look::default(), Over::Nothing);
+        screen.compose(20, 5, &layered(&pane, &layer), "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         assert!(screen.canvas().row(1).contains("MENU"), "{:?}", screen.canvas().row(1));
         as_whole(&screen, &layered(&pane, &layer));
     }
@@ -610,20 +687,20 @@ mod tests {
         let (mut a, mut b) = (left(), right());
         (a.generation, b.generation) = (Some(1), Some(1));
         let mut screen = Screen::default();
-        let tabs = [Tab { title: "a long tab title", active: true, state: State::Working }];
-        screen.compose(20, 5, &two(&a, &b, 0), "team", &tabs, BAR, Look::default(), Over::Nothing);
+        let tabs = [Tab { title: "a long tab title", active: true, state: State::Working, zoomed: None }];
+        screen.compose(20, 5, &two(&a, &b, 0), "team", &tabs, BAR, None, Look::default(), Over::Nothing, None);
         // One pane alone, wider: nothing left of the other, nor of the longer tab.
-        let short = [Tab { title: "t", active: true, state: State::Working }];
-        screen.compose(20, 5, &alone(&a), "team", &short, BAR, Look::default(), Over::Nothing);
+        let short = [Tab { title: "t", active: true, state: State::Working, zoomed: None }];
+        screen.compose(20, 5, &alone(&a), "team", &short, BAR, None, Look::default(), Over::Nothing, None);
         let mut fresh = Canvas::new(20, 5);
-        compose(&mut fresh, &alone(&a), "team", &short, BAR, Look::default(), Over::Nothing);
+        compose(&mut fresh, &alone(&a), "team", &short, BAR, None, Look::default(), Over::Nothing, None);
         for y in 0..5 {
             assert_eq!(screen.canvas().row(y), fresh.row(y), "row {y}");
         }
         // A panic in the middle of a frame: the next one is drawn whole.
         screen.composing = true;
         a.screen = vec!["after"];
-        screen.compose(20, 5, &alone(&a), "team", &short, BAR, Look::default(), Over::Nothing);
+        screen.compose(20, 5, &alone(&a), "team", &short, BAR, None, Look::default(), Over::Nothing, None);
         assert_eq!(first(screen.canvas()), "after  ");
     }
 
@@ -672,7 +749,7 @@ mod tests {
             id,
             engine,
             area,
-            header: Header { name: id, color: None, state: State::Idle, note: None, scroll: None, hint: None },
+            header: Header { name: id, state: State::Idle, ..Header::default() },
             focused,
             selection: None,
         };
@@ -688,14 +765,14 @@ mod tests {
         let (a, c, menu) = (Fill('a', Some(1)), Fill('c', Some(1)), Fill('m', Some(1)));
         let bar = Rect { x: 0, y: 10, width: 20, height: 1 };
         let mut screen = Screen::default();
-        screen.compose(20, 11, &under_a_menu(&a, &c, &menu), "t", &[], bar, Look::default(), Over::Nothing);
+        screen.compose(20, 11, &under_a_menu(&a, &c, &menu), "t", &[], bar, None, Look::default(), Over::Nothing, None);
         let first = screen.canvas().row(4);
         // Nothing changed: the frames under the menu drawn again, the menu over them.
-        screen.compose(20, 11, &under_a_menu(&a, &c, &menu), "t", &[], bar, Look::default(), Over::Nothing);
+        screen.compose(20, 11, &under_a_menu(&a, &c, &menu), "t", &[], bar, None, Look::default(), Over::Nothing, None);
         assert_eq!(screen.canvas().row(4), first, "the frames under the menu must not show through it");
         // A pane under it drew something new: the menu over it all the same.
         let a = Fill('a', Some(2));
-        screen.compose(20, 11, &under_a_menu(&a, &c, &menu), "t", &[], bar, Look::default(), Over::Nothing);
+        screen.compose(20, 11, &under_a_menu(&a, &c, &menu), "t", &[], bar, None, Look::default(), Over::Nothing, None);
         assert_eq!(screen.canvas().row(4), first);
     }
 
@@ -709,35 +786,58 @@ mod tests {
             views
         }
         let mut screen = Screen::default();
-        screen.compose(20, 5, &selected(&a, &b), "team", &[], BAR, Look::default(), Over::Nothing);
+        screen.compose(20, 5, &selected(&a, &b), "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         assert!(screen.canvas().style(1, 1).reverse && !screen.canvas().style(1, 2).reverse);
         // The view moved a line up, its generation as it was: the selection a row lower all the same.
         a.scroll = 1;
-        screen.compose(20, 5, &selected(&a, &b), "team", &[], BAR, Look::default(), Over::Nothing);
+        screen.compose(20, 5, &selected(&a, &b), "team", &[], BAR, None, Look::default(), Over::Nothing, None);
         assert!(!screen.canvas().style(1, 1).reverse && screen.canvas().style(1, 2).reverse);
     }
 
     /// The frame as one drawn whole, on a new canvas, with `over`.
     fn same_as_whole(screen: &Screen, views: &[View<'_>], tabs: &[Tab<'_>], bar: Rect, over: Over<'_>) {
+        same_as_whole_with(screen, views, tabs, bar, over, None);
+    }
+
+    /// The same, with a notice.
+    fn same_as_whole_with(
+        screen: &Screen,
+        views: &[View<'_>],
+        tabs: &[Tab<'_>],
+        bar: Rect,
+        over: Over<'_>,
+        notice: Option<&Notice>,
+    ) {
         let (width, height) = (screen.canvas().width(), screen.canvas().height());
         let mut fresh = Canvas::new(width, height);
-        compose(&mut fresh, views, "t", tabs, bar, Look::default(), over);
+        compose(&mut fresh, views, "t", tabs, bar, None, Look::default(), over, notice);
         for y in 0..height {
             assert_eq!(screen.canvas().row(y), fresh.row(y), "row {y}");
             for x in 0..width {
                 assert_eq!(screen.canvas().style(x, y), fresh.style(x, y), "column {x}, row {y}");
             }
         }
+        assert_eq!(screen.canvas().cursor(), fresh.cursor());
     }
 
     #[test]
     fn under_the_menu_dimmed() {
         let (a, c, menu) = (Fill('a', Some(1)), Fill('c', Some(1)), Fill('m', Some(1)));
         let bar = Rect { x: 0, y: 10, width: 20, height: 1 };
-        let tabs = [Tab { title: "t", active: true, state: State::Idle }];
+        let tabs = [Tab { title: "t", active: true, state: State::Idle, zoomed: None }];
         let mut screen = Screen::default();
-        let zones =
-            screen.compose(20, 11, &under_a_menu(&a, &c, &menu), "t", &tabs, bar, Look::default(), Over::LastView);
+        let zones = screen.compose(
+            20,
+            11,
+            &under_a_menu(&a, &c, &menu),
+            "t",
+            &tabs,
+            bar,
+            None,
+            Look::default(),
+            Over::LastView,
+            None,
+        );
         // The panes and the bar dimmed, the menu clear; nothing of the bar to click.
         assert_eq!(screen.canvas().style(1, 1), DIMMED);
         assert_eq!(screen.canvas().style(0, 10), DIMMED);
@@ -748,7 +848,7 @@ mod tests {
         // The menu closed, the panes' generations as they were: nothing stays dimmed.
         let [a_view, c_view, _] = under_a_menu(&a, &c, &menu);
         let views = [a_view, c_view];
-        let zones = screen.compose(20, 11, &views, "t", &tabs, bar, Look::default(), Over::Nothing);
+        let zones = screen.compose(20, 11, &views, "t", &tabs, bar, None, Look::default(), Over::Nothing, None);
         assert_ne!(screen.canvas().style(1, 1), DIMMED);
         assert!(!zones.bar.is_empty());
         same_as_whole(&screen, &views, &tabs, bar, Over::Nothing);
@@ -768,7 +868,7 @@ mod tests {
             selection: None,
         };
         let mut screen = Screen::default();
-        screen.compose(20, 5, &[one, two_, layer], "t", &[], BAR, Look::default(), Over::LastView);
+        screen.compose(20, 5, &[one, two_, layer], "t", &[], BAR, None, Look::default(), Over::LastView, None);
         assert_eq!(screen.canvas().cursor(), None, "the focused pane is under the menu");
     }
 
@@ -780,7 +880,7 @@ mod tests {
         let choice = chrome::quit_choice("mux");
         let bar = Rect { x: 0, y: 10, width: 20, height: 1 };
         let mut screen = Screen::default();
-        let zones = screen.compose(20, 11, &views, "t", &[], bar, Look::default(), Over::Choice(&choice));
+        let zones = screen.compose(20, 11, &views, "t", &[], bar, None, Look::default(), Over::Choice(&choice), None);
         let area = chrome::choice_area(Rect { x: 0, y: 0, width: 20, height: 10 }, &choice);
         // An option to click for each, within the choice; the rest dimmed, the bar too.
         assert_eq!(zones.options.len(), choice.options.len());
@@ -790,7 +890,7 @@ mod tests {
         assert_eq!(screen.canvas().cursor(), None);
         same_as_whole(&screen, &views, &[], bar, Over::Choice(&choice));
         // Gone: the team as it was.
-        screen.compose(20, 11, &views, "t", &[], bar, Look::default(), Over::Nothing);
+        screen.compose(20, 11, &views, "t", &[], bar, None, Look::default(), Over::Nothing, None);
         same_as_whole(&screen, &views, &[], bar, Over::Nothing);
     }
 
@@ -871,7 +971,7 @@ mod tests {
         let (a, b) = (left(), right());
         let draw = |focus: usize| {
             let mut canvas = Canvas::new(20, 5);
-            compose(&mut canvas, &two(&a, &b, focus), "team", &[], BAR, Look::default(), Over::Nothing);
+            compose(&mut canvas, &two(&a, &b, focus), "team", &[], BAR, None, Look::default(), Over::Nothing, None);
             canvas
         };
         let mut painter = Painter::default();
@@ -880,5 +980,247 @@ mod tests {
         // The focus moves: the frames and the cursor, not the panes' text.
         let moved = String::from_utf8(painter.frame(&draw(1))).unwrap();
         assert!(!moved.is_empty() && !moved.contains("ls") && !moved.contains("hello"), "{moved:?}");
+    }
+
+    fn waiting(member: &str) -> Notice {
+        Notice { member: member.into(), color: None, text: chrome::notice_text(member), tab: "Agents (1)".into() }
+    }
+
+    /// Two panes side by side on a 160 × 12 screen, the bar on its last row; the notice over the right one.
+    const WIDE_BAR: Rect = Rect { x: 0, y: 11, width: 160, height: 1 };
+
+    fn wide<'a>(a: &'a dyn Engine, b: &'a dyn Engine, focus: usize) -> [View<'a>; 2] {
+        let view = |id: &'a str, engine: &'a dyn Engine, x: usize, focused: bool| View {
+            id,
+            engine,
+            area: Rect { x, y: 0, width: 80, height: 11 },
+            header: Header { name: id, color: Some(Color::Cyan), state: State::Idle, ..Header::default() },
+            focused,
+            selection: None,
+        };
+        [view("a", a, 0, focus == 0), view("b", b, 80, focus == 1)]
+    }
+
+    /// Where the notice goes on the wide screen.
+    fn notice_at(notice: &Notice) -> Rect {
+        chrome::notice_area(team_area(160, 12, WIDE_BAR), notice)
+    }
+
+    /// The rows a painter's bytes write to (by their cursor positions).
+    fn rows_written(bytes: &[u8]) -> Vec<usize> {
+        let text = String::from_utf8_lossy(bytes);
+        let mut rows = Vec::new();
+        for part in text.split("\x1b[").skip(1) {
+            let Some(end) = part.find(|c: char| !(c.is_ascii_digit() || c == ';')) else { continue };
+            if part[end..].starts_with('H')
+                && let Some((row, _)) = part[..end].split_once(';')
+                && let Ok(row) = row.parse::<usize>()
+            {
+                rows.push(row - 1);
+            }
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    #[test]
+    fn a_notice_over_everything() {
+        let (a, b) = (Fill('a', Some(1)), Fill('b', Some(1)));
+        let notice = waiting("dev-saisie");
+        let area = notice_at(&notice);
+        let tabs = [Tab { title: "t", active: true, state: State::Idle, zoomed: None }];
+        let mut screen = Screen::default();
+        let views = wide(&a, &b, 0);
+        let zones =
+            screen.compose(160, 12, &views, "t", &tabs, WIDE_BAR, None, Look::default(), Over::Nothing, Some(&notice));
+        assert_eq!(zones.notice, Some(area));
+        assert!(area.y + area.height <= WIDE_BAR.y, "over the team, not the bar: {area:?}");
+        assert!(screen.canvas().row(area.y + 1).contains("dev-saisie"), "{:?}", screen.canvas().row(area.y + 1));
+        same_as_whole_with(&screen, &views, &tabs, WIDE_BAR, Over::Nothing, Some(&notice));
+        // Over a choice, and the menu, as clear: never dimmed.
+        let choice = chrome::quit_choice("t");
+        for over in [Over::Choice(&choice), Over::LastView] {
+            let zones =
+                screen.compose(160, 12, &views, "t", &tabs, WIDE_BAR, None, Look::default(), over, Some(&notice));
+            assert_eq!(zones.notice, Some(area));
+            let dimmed = (area.x..area.x + area.width)
+                .flat_map(|x| (area.y..area.y + area.height).map(move |y| (x, y)))
+                .filter(|&(x, y)| screen.canvas().style(x, y) == DIMMED)
+                .count();
+            assert!(dimmed < area.width * area.height / 2, "{dimmed} dimmed cells in the notice under {over:?}");
+            same_as_whole_with(&screen, &views, &tabs, WIDE_BAR, over, Some(&notice));
+        }
+    }
+
+    #[test]
+    fn a_notice_that_goes_draws_again_only_what_it_covered() {
+        let (a, b) = (Fill('a', Some(1)), Fill('b', Some(1)));
+        let notice = waiting("dev-saisie");
+        let area = notice_at(&notice);
+        assert!(!overlap(&area, &wide(&a, &b, 0)[0].area), "the notice over the right pane only: {area:?}");
+        let mut screen = Screen::default();
+        let mut painter = Painter::new(Features { sync: true, ..Features::default() });
+        screen.compose(
+            160,
+            12,
+            &wide(&a, &b, 0),
+            "t",
+            &[],
+            WIDE_BAR,
+            None,
+            Look::default(),
+            Over::Nothing,
+            Some(&notice),
+        );
+        painter.frame(screen.canvas());
+        // Nothing changed: nothing sent, the notice kept as it was.
+        screen.compose(
+            160,
+            12,
+            &wide(&a, &b, 0),
+            "t",
+            &[],
+            WIDE_BAR,
+            None,
+            Look::default(),
+            Over::Nothing,
+            Some(&notice),
+        );
+        assert!(painter.frame(screen.canvas()).is_empty());
+        // Gone: the team as it is, and only the notice's rows sent.
+        let zones =
+            screen.compose(160, 12, &wide(&a, &b, 0), "t", &[], WIDE_BAR, None, Look::default(), Over::Nothing, None);
+        assert_eq!(zones.notice, None);
+        same_as_whole_with(&screen, &wide(&a, &b, 0), &[], WIDE_BAR, Over::Nothing, None);
+        let rows = rows_written(&painter.frame(screen.canvas()));
+        assert!(!rows.is_empty() && rows.iter().all(|row| (area.y..area.y + area.height).contains(row)), "{rows:?}");
+        // The pane it did not cover kept its cells (they say what its engine drew before), the other drawn again.
+        screen.compose(
+            160,
+            12,
+            &wide(&a, &b, 0),
+            "t",
+            &[],
+            WIDE_BAR,
+            None,
+            Look::default(),
+            Over::Nothing,
+            Some(&notice),
+        );
+        let (a, b) = (Fill('A', Some(1)), Fill('B', Some(1)));
+        screen.compose(160, 12, &wide(&a, &b, 0), "t", &[], WIDE_BAR, None, Look::default(), Over::Nothing, None);
+        assert_eq!(screen.canvas().row(5).chars().nth(1), Some('a'));
+        assert_eq!(screen.canvas().row(5).chars().nth(81), Some('B'));
+        // Over no view (an empty tab): blank again.
+        let mut screen = Screen::default();
+        screen.compose(160, 12, &[], "t", &[], WIDE_BAR, None, Look::default(), Over::Nothing, Some(&notice));
+        screen.compose(160, 12, &[], "t", &[], WIDE_BAR, None, Look::default(), Over::Nothing, None);
+        same_as_whole_with(&screen, &[], &[], WIDE_BAR, Over::Nothing, None);
+    }
+
+    #[test]
+    fn a_notice_that_moves() {
+        let (a, b) = (Fill('a', Some(1)), Fill('b', Some(1)));
+        let (long, short) = (waiting("a-very-long-member-name"), waiting("x"));
+        assert_ne!(notice_at(&long), notice_at(&short));
+        let mut screen = Screen::default();
+        let views = wide(&a, &b, 0);
+        screen.compose(160, 12, &views, "t", &[], WIDE_BAR, None, Look::default(), Over::Nothing, Some(&long));
+        let zones =
+            screen.compose(160, 12, &views, "t", &[], WIDE_BAR, None, Look::default(), Over::Nothing, Some(&short));
+        assert_eq!(zones.notice, Some(notice_at(&short)));
+        same_as_whole_with(&screen, &views, &[], WIDE_BAR, Over::Nothing, Some(&short));
+        // Under a menu too, dimmed but for it and the notice.
+        screen.compose(160, 12, &views, "t", &[], WIDE_BAR, None, Look::default(), Over::LastView, Some(&long));
+        screen.compose(160, 12, &views, "t", &[], WIDE_BAR, None, Look::default(), Over::LastView, Some(&short));
+        same_as_whole_with(&screen, &views, &[], WIDE_BAR, Over::LastView, Some(&short));
+        screen.compose(160, 12, &views, "t", &[], WIDE_BAR, None, Look::default(), Over::LastView, None);
+        same_as_whole_with(&screen, &views, &[], WIDE_BAR, Over::LastView, None);
+    }
+
+    #[test]
+    fn no_cursor_under_the_notice() {
+        let notice = waiting("dev-saisie");
+        let area = notice_at(&notice);
+        let a = Fill('a', Some(1));
+        // The right pane's cells start at column 81, row 1: its cursor in the notice's first cell.
+        let mut b = right();
+        b.cursor = Some(Cursor { x: area.x - 81, y: area.y - 1, ..CURSOR });
+        let mut screen = Screen::default();
+        screen.compose(160, 12, &wide(&a, &b, 1), "t", &[], WIDE_BAR, None, Look::default(), Over::Nothing, None);
+        assert_eq!(screen.canvas().cursor().map(|c| (c.x, c.y)), Some((area.x, area.y)));
+        screen.compose(
+            160,
+            12,
+            &wide(&a, &b, 1),
+            "t",
+            &[],
+            WIDE_BAR,
+            None,
+            Look::default(),
+            Over::Nothing,
+            Some(&notice),
+        );
+        assert_eq!(screen.canvas().cursor(), None);
+    }
+
+    #[test]
+    fn a_hover_sends_its_rows_only() {
+        let (a, b) = (Fill('a', Some(1)), Fill('b', Some(1)));
+        let tabs = [
+            Tab { title: "one", active: true, state: State::Idle, zoomed: None },
+            Tab { title: "two", active: false, state: State::Idle, zoomed: None },
+        ];
+        let frame = |screen: &mut Screen, painter: &mut Painter, part: Option<Part>, target: Option<Target>| {
+            let mut views = wide(&a, &b, 0);
+            views[1].header.hover = part;
+            screen.compose(160, 12, &views, "t", &tabs, WIDE_BAR, target, Look::default(), Over::Nothing, None);
+            painter.frame(screen.canvas())
+        };
+        let mut screen = Screen::default();
+        let mut painter = Painter::new(Features { sync: true, ..Features::default() });
+        frame(&mut screen, &mut painter, None, None);
+        // The pointer moved over nothing new: nothing sent.
+        assert!(frame(&mut screen, &mut painter, None, None).is_empty());
+        // Over a name: its header's row; over a tab: the bar's.
+        let name = rows_written(&frame(&mut screen, &mut painter, Some(Part::Name), None));
+        assert_eq!(name, [0]);
+        assert!(frame(&mut screen, &mut painter, Some(Part::Name), None).is_empty());
+        // Off the name, onto a tab: the header as it was, the bar.
+        let bar = rows_written(&frame(&mut screen, &mut painter, None, Some(Target::Tab(1))));
+        assert_eq!(bar, [0, WIDE_BAR.y]);
+        assert!(frame(&mut screen, &mut painter, None, Some(Target::Tab(1))).is_empty());
+    }
+
+    #[test]
+    fn the_parts_of_the_headers_by_their_view() {
+        let (a, b) = (Fill('a', Some(1)), Fill('b', Some(1)));
+        let mut views = wide(&a, &b, 0);
+        for view in &mut views {
+            view.header = Header {
+                model: Some("Opus"),
+                effort: Some("high"),
+                context: Some(40),
+                compactable: true,
+                zoom: Some(chrome::Zoom::In),
+                ..view.header
+            };
+        }
+        let mut screen = Screen::default();
+        let zones = screen.compose(160, 12, &views, "t", &[], WIDE_BAR, None, Look::default(), Over::Nothing, None);
+        // Each view's, in its top border.
+        for (i, view) in views.iter().enumerate() {
+            let parts: Vec<_> = zones.parts.iter().filter(|(_, index, _)| *index == i).collect();
+            assert!(parts.iter().any(|(_, _, part)| *part == Part::Name), "{:?}", zones.parts);
+            assert!(parts.iter().all(|(rect, _, _)| rect.y == view.area.y && within(rect, &view.area)));
+        }
+        // Dimmed under a choice: none to click; under the menu, only the menu's own.
+        let choice = chrome::quit_choice("t");
+        let zones =
+            screen.compose(160, 12, &views, "t", &[], WIDE_BAR, None, Look::default(), Over::Choice(&choice), None);
+        assert!(zones.parts.is_empty());
+        let zones = screen.compose(160, 12, &views, "t", &[], WIDE_BAR, None, Look::default(), Over::LastView, None);
+        assert!(!zones.parts.is_empty() && zones.parts.iter().all(|(_, index, _)| *index == 1), "{:?}", zones.parts);
     }
 }

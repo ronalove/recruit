@@ -943,6 +943,79 @@ mod tests {
         s
     }
 
+    /// No size, however small, makes the menu panic, in any of its states: the list, the sheet, a dropdown, a
+    /// confirmation, the new agent's form, a name being typed, a team whose files cannot be read (reviewer's sweep,
+    /// kept, with the typing and the unreadable team it had not drawn).
+    #[test]
+    fn no_size_too_small() {
+        use super::super::sheet::{Action as A, Fid};
+        let env = Fake::quiet();
+        let typed = |fid: Fid, text: &str| {
+            let mut s = sheet();
+            s.key(Key::Down, &env);
+            s.key(Key::Enter, &env);
+            s.row = s.focusable().iter().position(|f| *f == fid).expect("the row");
+            s.key(Key::Enter, &env);
+            for c in text.chars() {
+                s.key(Key::Char(c), &env);
+            }
+            s
+        };
+        let after = |keys: &[Key]| {
+            let mut s = sheet();
+            for key in keys {
+                s.key(key.clone(), &env);
+            }
+            s
+        };
+        let mut unreadable = Sheet::new(team(&[("coordinateur", true), ("dev-cli", false)]));
+        unreadable.team.unreadable = Some(format!("{}: {}", "settings.toml", "valeur inattendue ".repeat(12)));
+        unreadable.reload(unreadable.team.clone(), None);
+        let states = [
+            sheet(),
+            after(&[Key::Down]),
+            after(&[Key::Enter]),
+            after(&[Key::Enter, Key::Enter]),
+            after(&[Key::Char(A::Stop.key())]),
+            after(&[Key::Char(A::New.key())]),
+            after(&[Key::Down, Key::Down, Key::Down, Key::Down, Key::Down, Key::Down, Key::Enter]),
+            typed(Fid::Name, "un-nom-de-membre-vraiment-très-long-日本語"),
+            typed(Fid::Role, &"Un rôle écrit à la main, long ".repeat(4)),
+            unreadable,
+        ];
+        // The states drawn are those meant.
+        use super::super::sheet::{Overlay, Said};
+        assert!(matches!(states[3].overlay, Overlay::List(_)), "{:?}", states[3].overlay);
+        assert!(matches!(states[4].overlay, Overlay::Confirm(_)), "{:?}", states[4].overlay);
+        assert!(states[7..9].iter().all(|s| matches!(s.overlay, Overlay::Typing(_))));
+        assert!(matches!(states[9].said, Some(Said::Failed(_))));
+        let failed = std::sync::Mutex::new(Vec::new());
+        // Every small size, which carry nearly all the overflows, then a step.
+        let widths: Vec<usize> = (0..=60).chain((66..=120).step_by(6)).collect();
+        let heights: Vec<usize> = (0..=20).chain((25..=40).step_by(5)).collect();
+        std::thread::scope(|scope| {
+            for chunk in widths.chunks(widths.len().div_ceil(8)) {
+                let (states, heights, failed) = (&states, &heights, &failed);
+                scope.spawn(move || {
+                    for &width in chunk {
+                        for &height in heights {
+                            for (i, s) in states.iter().enumerate() {
+                                for option in [true, false] {
+                                    let look = Look { option, ..look() };
+                                    if std::panic::catch_unwind(|| draw(s, &look, width, height)).is_err() {
+                                        failed.lock().unwrap().push(format!("state {i} at {width} × {height}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let failed = failed.into_inner().unwrap();
+        assert!(failed.is_empty(), "{} failed: {}", failed.len(), failed.join(", "));
+    }
+
     #[test]
     fn wide() {
         let mut s = sheet();

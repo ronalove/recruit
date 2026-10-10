@@ -357,6 +357,55 @@ impl TestTerm {
         (point.column.0, point.line.0 as usize, shown, shape)
     }
 
+    /// The whole screen with its styles, as JSON for `tests/gallery.py`: `rows` of cells `[text, fg, bg, flags]`, a
+    /// color written `rgb:r,g,b`, `idx:n` or `named:Name`, the flags a string of `b`old, `d`im, `i`talic, `u`nderline,
+    /// `r`everse, `s`trike.
+    pub fn styled(&self) -> String {
+        use alacritty_terminal::vte::ansi::Color;
+        let paint = |color: Color| match color {
+            Color::Spec(Rgb { r, g, b }) => format!("rgb:{r},{g},{b}"),
+            Color::Indexed(n) => format!("idx:{n}"),
+            Color::Named(name) => format!("named:{name:?}"),
+        };
+        let (mutex, _) = &*self.shared;
+        let shared = lock(mutex);
+        let grid = shared.term.grid();
+        let rows: Vec<Vec<(String, String, String, String)>> = (0..self.rows)
+            .map(|row| {
+                (0..self.cols)
+                    .map(|col| {
+                        let cell = &grid[Line(row as i32)][Column(col)];
+                        let mut text = cell.c.to_string();
+                        text.extend(cell.zerowidth().into_iter().flatten());
+                        let mut flags = String::new();
+                        for (flag, letter) in [
+                            (Flags::BOLD, 'b'),
+                            (Flags::DIM, 'd'),
+                            (Flags::ITALIC, 'i'),
+                            (Flags::UNDERLINE, 'u'),
+                            (Flags::INVERSE, 'r'),
+                            (Flags::STRIKEOUT, 's'),
+                            (Flags::WIDE_CHAR_SPACER, 'w'),
+                        ] {
+                            if cell.flags.contains(flag) {
+                                flags.push(letter);
+                            }
+                        }
+                        (text, paint(cell.fg), paint(cell.bg), flags)
+                    })
+                    .collect()
+            })
+            .collect();
+        serde_json::json!({ "cols": self.cols, "rows": rows }).to_string()
+    }
+
+    /// Whether the cell at `col`, `row` is drawn in reverse video.
+    pub fn inverse(&self, col: usize, row: usize) -> bool {
+        let (mutex, _) = &*self.shared;
+        let shared = lock(mutex);
+        shared.term.grid()[Line(row as i32)][Column(col)].flags.contains(alacritty_terminal::term::cell::Flags::INVERSE)
+    }
+
     /// The cell at `col`, `row` (from 0): its text (with what combines into it), foreground and background, as
     /// alacritty keeps them (`Spec(Rgb { … })` for 24 bits, `Indexed(n)` for the 256-color palette…).
     pub fn cell(&self, col: usize, row: usize) -> (String, String, String) {

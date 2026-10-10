@@ -23,6 +23,10 @@ pub(crate) enum Action {
     Menu,
     /// ⌥q: detach, quit or cancel (the menu itself at step 1).
     Quit,
+    /// ⌥z: the focused pane over the whole tab, or the grid back.
+    Zoom,
+    /// ⌥g: to the member who has waited the longest.
+    Waiting,
 }
 
 /// A key the multiplexer keeps.
@@ -43,6 +47,8 @@ pub(crate) fn shortcut(key: &Key) -> Option<Shortcut> {
         (Mods::ALT, KeyCode::Char('j')) => Action::Journal,
         (Mods::ALT, KeyCode::Char('r')) => Action::Menu,
         (Mods::ALT, KeyCode::Char('q')) => Action::Quit,
+        (Mods::ALT, KeyCode::Char('z')) => Action::Zoom,
+        (Mods::ALT, KeyCode::Char('g')) => Action::Waiting,
         (mods, KeyCode::Left) if mods == Mods::ALT | Mods::SHIFT => Action::PreviousTab,
         (mods, KeyCode::Right) if mods == Mods::ALT | Mods::SHIFT => Action::NextTab,
         _ => return None,
@@ -83,9 +89,16 @@ mod tests {
             (key(Char('j'), A), Some(Journal)),
             (key(Char('r'), A), Some(Menu)),
             (key(Char('q'), A), Some(Quit)),
+            (key(Char('z'), A), Some(Zoom)),
+            (key(Char('g'), A), Some(Waiting)),
             // The pane's.
             (key(Char('0'), A), None),
-            (key(Char('z'), A), None),
+            (key(Char('Z'), A), None),
+            (key(Char('G'), A), None),
+            (key(Char('z'), C), None),
+            (key(Char('g'), C), None),
+            (key(Char('z'), A | C), None),
+            (key(Char('x'), A), None),
             (key(Char('o'), A), None),
             (key(Char('j'), N), None),
             (key(Char('J'), A), None),
@@ -104,7 +117,8 @@ mod tests {
 
     #[test]
     fn claude_code_keeps_its_keys() {
-        // Spec §6: Ctrl+B, Ctrl+R, Ctrl+O, Ctrl+C, Ctrl+D, Tab, Shift+Tab, Esc, Shift+Enter, Alt+Enter, arrows.
+        // Spec §6: Ctrl+B, Ctrl+R, Ctrl+O, Ctrl+C, Ctrl+D, Tab, Shift+Tab, Esc, Shift+Enter, Alt+Enter, arrows; and
+        // what Claude Code 2.1.296 binds with ⌥ (⌥p, ⌥o, ⌥t, ⌥w; ⌥b, ⌥f, ⌥d, ⌥y in its prompt), Ctrl+G, Ctrl+Z.
         let keys = [
             key(KeyCode::Char('b'), C),
             key(KeyCode::Char('r'), C),
@@ -120,6 +134,17 @@ mod tests {
             key(KeyCode::Left, A),
             key(KeyCode::Char('b'), A),
             key(KeyCode::Char('f'), A),
+            key(KeyCode::Char('d'), A),
+            key(KeyCode::Char('y'), A),
+            key(KeyCode::Char('p'), A),
+            key(KeyCode::Char('o'), A),
+            key(KeyCode::Char('t'), A),
+            key(KeyCode::Char('w'), A),
+            key(KeyCode::Char('v'), A),
+            key(KeyCode::Up, A),
+            key(KeyCode::Down, A),
+            key(KeyCode::Char('g'), C),
+            key(KeyCode::Char('z'), C),
         ];
         for key in keys {
             assert_eq!(shortcut(&key), None, "{key:?}");
@@ -138,6 +163,8 @@ mod tests {
             (key(KeyCode::Char('q'), A), Quit, false),
             (key(KeyCode::Char('1'), A), Tab(0), false),
             (key(KeyCode::Char('9'), A), Tab(8), false),
+            (key(KeyCode::Char('z'), A), Zoom, false),
+            (key(KeyCode::Char('g'), A), Waiting, false),
         ];
         for (pressed, action, repeats) in table {
             let held = Key { kind: KeyKind::Repeat, ..pressed };
@@ -160,15 +187,20 @@ mod tests {
             [crate::mux::input::Event::Key(key)] => *key,
             other => panic!("{bytes:?}: {other:?}"),
         };
-        let table: [(&[u8], Option<Action>); 8] = [
+        let table: [(&[u8], Option<Action>); 13] = [
             (b"\x1b1", Some(Action::Tab(0))),
             (b"\x1b[49;3u", Some(Action::Tab(0))),
             (b"\x1bj", Some(Action::Journal)),
             (b"\x1b[106;3u", Some(Action::Journal)),
             (b"\x1b[1;4D", Some(Action::PreviousTab)),
             (b"\x1b[1;4C", Some(Action::NextTab)),
+            (b"\x1bz", Some(Action::Zoom)),
+            (b"\x1b[122;3u", Some(Action::Zoom)),
+            (b"\x1bg", Some(Action::Waiting)),
+            (b"\x1b[103;3u", Some(Action::Waiting)),
             (b"\x1bJ", None),
             (b"\x1b[1;3C", None),
+            (b"\x1a", None),
         ];
         for (bytes, action) in table {
             assert_eq!(shortcut(&read(bytes)), action.map(Shortcut::Run), "{bytes:?}");

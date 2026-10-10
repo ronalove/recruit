@@ -359,7 +359,9 @@ mod tests {
             let _: Option<Hello> = proto::recv(&mut stream).unwrap();
             let welcome = Welcome { proto: 9, version: "9.9.9".into(), team: "mux".into(), ..Welcome::default() };
             proto::send(&mut stream, &welcome).unwrap();
-            proto::send(&mut stream, &ServerMsg::Refused(Refusal::Proto)).unwrap();
+            // The client may have gone already: it compares the protocols at the welcome, and leaves without reading
+            // on (EPIPE here, under Linux, now and then).
+            let _ = proto::send(&mut stream, &ServerMsg::Refused(Refusal::Proto));
         });
         (lock, server)
     }

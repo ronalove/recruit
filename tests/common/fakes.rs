@@ -347,24 +347,95 @@ fn claude() -> ! {
         std::fs::OpenOptions::new().create(true).append(true).open(conversation.join(format!("{session}.jsonl")))
     {
         let _ = writeln!(file, "{{\"type\":\"fake\",\"pid\":{pid}}}");
+        // The title Claude Code gives a conversation started with `-n <name>`: `claude::last_conversations` reads it.
+        let _ = writeln!(file, "{{\"type\":\"custom-title\",\"customTitle\":\"{name}\",\"sessionId\":\"{session}\"}}");
     }
     let mut out = std::io::stdout().lock();
     let _ = write!(out, "\x1b[2J\x1b[HFAKE CLAUDE {name} {session}\r\n\u{276f} ");
     let _ = out.flush();
     drop(out);
+    no_echo();
+    let mut asked = false;
     let code = loop {
         let mut line = String::new();
         match std::io::stdin().read_line(&mut line) {
             Ok(0) | Err(_) => break 0,
-            Ok(_) => match line.trim() {
+            Ok(_) => match line.rsplit("\x1b\\").next().unwrap_or_default().trim() {
                 "Q" => break 0,
                 "X" => break 1,
+                // `osc working`, `osc blocked:kind=permission`…: what Claude Code says of its state (OSC 7501).
+                command if command.starts_with("osc ") => {
+                    let mut out = std::io::stdout().lock();
+                    // The terminal must have said it takes statuses first (`OSC 7501 ; ?`, answered at once): the
+                    // engine ignores them before. Its answer reaches the program's input; `line` drops it.
+                    if !asked {
+                        asked = true;
+                        let _ = out.write_all(b"\x1b]7501;?\x1b\\");
+                        let _ = out.flush();
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    let _ = write!(out, "\x1b]7501;state={}\x07", &command[4..]);
+                    let _ = out.flush();
+                }
+                // `msg <to> <text>`: the conversation records a message to a teammate (a `SendMessage` of the model), for
+                // the journal.
+                command if command.starts_with("msg ") => {
+                    let (to, text) = command[4..].split_once(' ').unwrap_or((&command[4..], "hello"));
+                    let stamp =
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                    let line = serde_json::json!({
+                        "type": "assistant", "timestamp": iso(stamp),
+                        "message": {"content": [{"type": "tool_use", "name": "SendMessage",
+                            "input": {"to": to, "summary": text, "message": text}}]},
+                    });
+                    if let Ok(mut file) =
+                        std::fs::OpenOptions::new().append(true).open(conversation.join(format!("{session}.jsonl")))
+                    {
+                        let _ = writeln!(file, "{line}");
+                    }
+                }
+                // `agent busy`, `agent idle`, `agent waiting`: what `claude agents` says of it.
+                command if command.starts_with("agent ") => {
+                    let running = serde_json::json!({
+                        "name": name, "cwd": cwd, "status": &command[6..], "sessionId": session, "pid": pid,
+                    });
+                    let _ = std::fs::write(&run, running.to_string());
+                }
                 _ => {}
             },
         }
     };
     let _ = std::fs::remove_file(&run);
     std::process::exit(code)
+}
+
+/// `2026-10-07T10:28:51.000Z` for seconds since the epoch.
+fn iso(secs: u64) -> String {
+    let (days, rest) = (secs / 86400, secs % 86400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days as i64 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000Z", rest / 3600, rest % 3600 / 60, rest % 60)
+}
+
+/// Nothing written back for what is typed or answered: the answer to `OSC 7501 ; ?` would show as `^[]7501;?^[\`.
+fn no_echo() {
+    // SAFETY: plain termios calls on the program's own terminal; a failure (no terminal) leaves it as it is.
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(0, &mut termios) == 0 {
+            termios.c_lflag &= !(libc::ECHO | libc::ECHOCTL);
+            libc::tcsetattr(0, libc::TCSANOW, &termios);
+        }
+    }
 }
 
 fn idle() -> ! {
