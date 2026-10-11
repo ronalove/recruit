@@ -275,8 +275,9 @@ fn osc_7501(rest: &str) -> Option<Sniffed> {
                     "idle" => Some(State::Idle),
                     "working" => Some(State::Working),
                     "blocked" => Some(State::Blocked),
-                    // A turn that failed (an API error; Claude Code 2.1.296, its message the failure): over too.
-                    "done" | "error" => Some(State::Done),
+                    "done" => Some(State::Done),
+                    // A turn that failed on an API error (Claude Code 2.1.296), the failure in `msg`.
+                    "error" => Some(State::Error),
                     "clear" => Some(State::Clear),
                     _ => None,
                 }
@@ -451,11 +452,14 @@ mod tests {
                 Sniffed::Status(Status { app: Some("recruit".into()), ..status(State::Clear) }),
             ]
         );
-        // A turn that failed: over.
+        // A turn that failed, its failure told; then the next turn.
         let failed = format!("\x1b]7501;state=error:app=claude-code:msg={}\x1b\\", base64_encode(b"API Error: 529"));
         assert_eq!(
-            sniff(&[failed.as_bytes()]),
-            [Sniffed::Status(Status { message: Some("API Error: 529".into()), ..claude(State::Done) })]
+            sniff(&[failed.as_bytes(), b"\x1b]7501;state=working:app=claude-code\x1b\\"]),
+            [
+                Sniffed::Status(Status { message: Some("API Error: 529".into()), ..claude(State::Error) }),
+                Sniffed::Status(claude(State::Working)),
+            ]
         );
     }
 

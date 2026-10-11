@@ -43,6 +43,9 @@ pub(crate) struct Header<'a> {
     pub state: State,
     /// What went wrong with the pane, after the name, in red, its frame red too: ended, engine failed.
     pub note: Option<&'a str>,
+    /// Why its member's turn failed, short (`look::error_label`): after the whole name, in orange, while its state is
+    /// `State::Error` (mock-up C); « erreur d'API » short of room, then nothing.
+    pub error: Option<&'a str>,
     /// How far up its history it shows, and how long that is (`screen::compose` fills it), after the note, dimmed.
     pub scroll: Option<(usize, usize)>,
     /// A key that acts on the pane, at the right of the top border, dimmed (mock-up B1), when the rest leaves room.
@@ -100,8 +103,9 @@ pub(crate) enum Zoom {
 pub(crate) enum Hint {
     /// The journal: ⌥j takes it to its next size.
     JournalSize,
-    /// The dashboard: how many members work, wait for the user and rest (« ⠹ 5  ⚑ 1  ◷ 3 », mock-up B1).
-    Counts { working: usize, waiting: usize, idle: usize },
+    /// The dashboard: how many members work, wait for the user, failed their turn and rest (« ⠹ 5  ⚑ 1  ✗ 1  ◷ 3 »,
+    /// mock-ups B1 and C).
+    Counts { working: usize, waiting: usize, error: usize, idle: usize },
 }
 
 impl Hint {
@@ -110,9 +114,11 @@ impl Hint {
     fn pieces(self, look: Look) -> Vec<(String, Style)> {
         match self {
             Hint::JournalSize => vec![(t!("{}j taille", "{}j size", ALT), Style::PLAIN.dim())],
-            Hint::Counts { working, waiting, idle } => {
+            Hint::Counts { working, waiting, error, idle } => {
                 let mut pieces = Vec::new();
-                for (state, count) in [(State::Working, working), (State::Waiting, waiting), (State::Idle, idle)] {
+                let counts =
+                    [(State::Working, working), (State::Waiting, waiting), (State::Error, error), (State::Idle, idle)];
+                for (state, count) in counts {
                     if count == 0 {
                         continue;
                     }
@@ -180,13 +186,15 @@ const THICK: Lines =
 /// corner): the header never runs into them, so that it stays put when the zoom comes (step 3).
 const CORNER: usize = 5;
 
-/// A frame's style: red for a pane gone wrong and for a member waiting, with the focus or without (they ask for an
-/// action: the focus shows by the thickness); else the terminal's text color for the focus; grey for the rest, the
-/// dashboard and the journal included. Bold with the focus.
+/// A frame's style: red for a pane gone wrong and for a member waiting, orange for a member whose turn failed, with
+/// the focus or without (they ask for an action: the focus shows by the thickness); else the terminal's text color for
+/// the focus; grey for the rest, the dashboard and the journal included. Bold with the focus.
 fn frame_style(header: &Header<'_>, focused: bool) -> Style {
-    let waiting = header.color.is_some() && header.state == State::Waiting;
-    let style = if header.note.is_some() || waiting {
+    let member = |state: State| header.color.is_some() && header.state == state;
+    let style = if header.note.is_some() || member(State::Waiting) {
         Style::fg(Color::Red)
+    } else if member(State::Error) {
+        Style::fg(crate::look::ORANGE)
     } else if focused && header.color.is_some() {
         Style::PLAIN
     } else {
@@ -195,11 +203,12 @@ fn frame_style(header: &Header<'_>, focused: bool) -> Style {
     if focused { style.bold() } else { style }
 }
 
-/// The sign of a state, as on the dashboard: the spinner in yellow, ⚑ in bold red, the clock in grey.
+/// The sign of a state, as on the dashboard: the spinner in yellow, ⚑ in bold red, ✗ in bold orange, the clock in grey.
 fn sign_style(state: State) -> Style {
     match state {
         State::Working => Style::fg(Color::Yellow),
         State::Waiting => Style::fg(Color::Red).bold(),
+        State::Error => Style::fg(crate::look::ORANGE).bold(),
         State::Idle | State::Other => Style::fg(Color::DarkGrey),
     }
 }
@@ -273,7 +282,7 @@ fn title(canvas: &mut Canvas, area: Rect, header: &Header<'_>, look: Look) -> Ve
             x = canvas.put(x, y, " ", Style::PLAIN);
             match header.state {
                 State::Idle | State::Other => Style::fg(color).dim(),
-                State::Working | State::Waiting => Style::fg(color).bold(),
+                State::Working | State::Waiting | State::Error => Style::fg(color).bold(),
             }
         }
         None => Style::PLAIN,
@@ -288,6 +297,9 @@ fn title(canvas: &mut Canvas, area: Rect, header: &Header<'_>, look: Look) -> Ve
     }
     if header.color.is_some() && name_end > name_at {
         parts.push((Rect { x: name_at, y, width: name_end - name_at, height: 1 }, Part::Name));
+    }
+    if let Some(text) = &plan.reason {
+        x = put_part(canvas, x, y, text, Style::fg(crate::look::ORANGE));
     }
     if let Some(text) = &plan.alert {
         x = put_part(canvas, x, y, text, Style::fg(Color::Red));
@@ -344,6 +356,8 @@ struct Plan {
     name: Option<String>,
     /// « réglages › » after it.
     settings: bool,
+    /// Why its member's turn failed, whole or short.
+    reason: Option<String>,
     alert: Option<String>,
     scroll: Option<String>,
     /// The form of the right part shown, by its place in `metas`.
@@ -382,7 +396,12 @@ fn plan(width: usize, header: &Header<'_>, metas: &[Vec<Piece>; 5]) -> Plan {
     let limit = if corner && header.zoom.is_some() && alert.is_none() { end + 1 } else { end - alert_room };
     let name = fit(header.name, limit.saturating_sub(x + 1));
     x += columns(&name) + 1;
+    let whole_name = name == header.name;
     plan.name = Some(name);
+    // A failed turn's reason after the whole name: whole, else short, else none (mock-up C). The right part makes
+    // room for it.
+    plan.reason =
+        reasons(header).into_iter().find(|text| whole_name && x + part(text) <= end).inspect(|text| x += part(text));
     // Hovered, « réglages › » after the name, while it leaves the rest some room (mock-up B2).
     if header.hover == Some(Part::Name) && header.note.is_none() && x + columns(&settings()) + 1 + SETTINGS_ROOM <= stop
     {
@@ -405,8 +424,12 @@ fn plan(width: usize, header: &Header<'_>, metas: &[Vec<Piece>; 5]) -> Plan {
 
 /// The form the right part of `header` takes on its own in a pane `width` columns wide, from 0 (all of it) to 5
 /// (none), neither hovered nor scrolled. 0 for a header with nothing to show there: it holds whole. The panes as wide
-/// share their [`common_form`].
+/// share their [`common_form`]. 5 for a member whose turn failed: its reason takes room from its own pane only, and
+/// holds no one back (mock-up C).
 pub(crate) fn form(header: &Header<'_>, width: usize) -> usize {
+    if !reasons(header).is_empty() {
+        return 5;
+    }
     let alone = Header { hover: None, scroll: None, form: 0, ..*header };
     let metas = metas(&alone, Look::default());
     if metas.iter().all(Vec::is_empty) {
@@ -426,6 +449,22 @@ pub(crate) fn common_form(forms: impl IntoIterator<Item = usize>) -> usize {
 /// it): while it does under a minute, its seconds change, and the screen must be drawn again each second.
 pub(crate) fn shows_since(header: &Header<'_>, width: usize) -> bool {
     header.since.is_some() && plan(width, header, &metas(header, Look::default())).meta.is_some_and(|form| form < 3)
+}
+
+/// The forms of a failed turn's reason in a member's header, from the richest: as given (« API surchargée (529) »),
+/// without its code as the notice says it (« API surchargée »), then « erreur d'API » (designer, 2026-10-10); none
+/// out of `State::Error`, or for a pane gone wrong, whose note says more.
+fn reasons(header: &Header<'_>) -> Vec<String> {
+    let Some(label) = header.error.filter(|_| header.state == State::Error && header.note.is_none()) else {
+        return Vec::new();
+    };
+    let mut forms = vec![label.to_string()];
+    for form in [crate::look::without_code(label).to_string(), crate::look::error_short()] {
+        if !forms.contains(&form) {
+            forms.push(form);
+        }
+    }
+    forms
 }
 
 /// Columns « réglages › » leaves at least for the rest of the header, in the mock-up.
@@ -777,6 +816,8 @@ pub(crate) fn bar(
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Notice {
     pub member: String,
+    /// Why it is shown: `Waiting` (⚑, red) or `Error` (✗, orange; mock-up C).
+    pub state: State,
     /// The member's color, for its name.
     pub color: Option<Color>,
     /// What it says, from [`notice_text`].
@@ -790,14 +831,27 @@ pub(crate) fn notice_text(member: &str) -> String {
     t!("{} attend ta réponse", "{} needs your answer", member)
 }
 
+/// What a notice says of `members` whose turns failed within a few seconds, the last one's reason `label`
+/// (`look::error_label`) without its code: « dev-saisie a raté son tour : API surchargée », « 3 membres ont raté leur
+/// tour : API surchargée » (mock-up C).
+pub(crate) fn error_notice_text(members: &[&str], label: &str) -> String {
+    let reason = crate::look::without_code(label);
+    match members {
+        [member] => t!("{} a raté son tour : {}", "{}'s turn failed: {}", member, reason),
+        _ => t!("{} membres ont raté leur tour : {}", "{} members' turns failed: {}", members.len(), reason),
+    }
+}
+
 /// Columns between a notice and the screen's right edge (mock-up B1).
 const NOTICE_MARGIN: usize = 2;
 
 /// What a notice says inside its frame, in `room` columns: « ⚑ dev-saisie attend ta réponse · Agents (1)   ⌥g y
-/// aller », its name in its color; short of room, ⌥g goes, then the tab, then the text is cut.
+/// aller », its name in its color; « ✗ … » in orange for a failed turn. Short of room, ⌥g goes, then the tab, then the
+/// text is cut.
 fn notice_pieces(notice: &Notice, glyphs: Glyphs, room: usize) -> Vec<(String, Style)> {
-    let sign = format!(" {} ", State::Waiting.icon(glyphs, 0));
-    let mut said = vec![(sign, Style::fg(Color::Red).bold())];
+    let state = notice_state(notice);
+    let sign = format!(" {} ", state.icon(glyphs, 0));
+    let mut said = vec![(sign, Style::fg(state.color()).bold())];
     match notice.text.strip_prefix(notice.member.as_str()).filter(|_| !notice.member.is_empty()) {
         Some(rest) => {
             let name = notice.color.map_or(Style::PLAIN, Style::fg).bold();
@@ -836,6 +890,11 @@ fn notice_pieces(notice: &Notice, glyphs: Glyphs, room: usize) -> Vec<(String, S
     out
 }
 
+/// What a notice is for: a failed turn (orange, ✗), else a member waiting (red, ⚑).
+fn notice_state(notice: &Notice) -> State {
+    if notice.state == State::Error { State::Error } else { State::Waiting }
+}
+
 /// Where `notice` goes on a screen whose team shows in `screen` (the bar left out): three rows at the top right, on
 /// the panes' first row, two columns from the edge (mock-up B1, B4); no wider than the screen allows, empty on a
 /// screen too small for it.
@@ -851,13 +910,13 @@ pub(crate) fn notice_area(screen: Rect, notice: &Notice) -> Rect {
 }
 
 /// Draws `notice` in `area` (from [`notice_area`]), over what the screen drew, which stays as it is around it: a red
-/// frame, the text inside. A click anywhere in `area` goes to the member.
+/// frame (orange for a failed turn), the text inside. A click anywhere in `area` goes to the member.
 pub(crate) fn notice(canvas: &mut Canvas, area: Rect, notice: &Notice, look: Look) {
     let Rect { x, y, width, height } = area;
     if width < 3 || height < 3 {
         return;
     }
-    canvas.frame(x, y, width, height, Style::fg(Color::Red));
+    canvas.frame(x, y, width, height, Style::fg(notice_state(notice).color()));
     let end = x + width - 1;
     let mut at = x + 1;
     for (text, style) in notice_pieces(notice, look.glyphs, width - 2) {
@@ -1249,6 +1308,82 @@ mod tests {
         assert_eq!(canvas.row(1).chars().next(), Some('┃'));
     }
 
+    /// A member whose turn failed (mock-up C): an orange frame, thin without the focus and thick with it; ✗ and the
+    /// name bold, then the reason in orange after the whole name: whole, else « erreur d'API », else nothing, the
+    /// right part giving its room first. Its form holds no one back. A pane gone wrong keeps its red note instead.
+    #[test]
+    fn a_failed_turn_in_orange() {
+        let orange = crate::look::ORANGE;
+        let label = crate::look::error_label(Some("API Error: 529 overloaded"));
+        let header = Header { error: Some(&label), ..rich("dev-saisie", State::Error) };
+        let mut canvas = Canvas::new(100, 3);
+        let area = |width| Rect { x: 0, y: 0, width, height: 3 };
+        frame(&mut canvas, area(100), &header, false, UNICODE);
+        assert_eq!((canvas.style(0, 1), canvas.row(1).chars().next()), (Style::fg(orange), Some('│')));
+        frame(&mut canvas, area(100), &header, true, UNICODE);
+        assert_eq!((canvas.style(0, 1), canvas.row(1).chars().next()), (Style::fg(orange).bold(), Some('┃')));
+        let row = canvas.row(0);
+        let at = |text: &str| row[..row.find(text).unwrap()].chars().count();
+        assert!(row.starts_with(&format!("┏━ ✗ dev-saisie · {label} ")), "{row}");
+        assert_eq!(canvas.style(at("✗"), 0), Style::fg(orange).bold());
+        assert_eq!(canvas.style(at(&label), 0), Style::fg(orange));
+        assert!(row.contains("Opus ▆ high"), "{row}");
+        // Narrower: the right part goes before the reason, then the short reason, then none; the name stays whole.
+        let short = t!("erreur d'API", "API error");
+        let widths: Vec<(usize, String)> = (20..100)
+            .map(|width| {
+                let mut canvas = Canvas::new(width, 3);
+                frame(&mut canvas, area(width), &header, false, UNICODE);
+                (width, canvas.row(0))
+            })
+            .collect();
+        let whole = widths.iter().find(|(_, row)| row.contains(&label)).map(|(w, _)| *w).unwrap();
+        let bare_reason = t!("API surchargée", "API overloaded");
+        let coded = widths.iter().find(|(_, row)| row.contains(&format!("· {bare_reason} "))).map(|(w, _)| *w).unwrap();
+        let reduced = widths.iter().find(|(_, row)| row.contains(&format!("· {short} "))).map(|(w, _)| *w).unwrap();
+        assert!(reduced < coded && coded < whole, "{reduced} {coded} {whole}");
+        let (_, at_whole) = &widths[whole - 20];
+        assert!(!at_whole.contains("Opus") && !at_whole.contains('▆'), "the right part first: {at_whole}");
+        let (_, bare) = &widths[0];
+        assert!(bare.contains("✗ dev-saisie") && !bare.contains('·'), "{bare}");
+        // Its form holds no one back; a pane gone wrong says its note, not the reason.
+        assert_eq!(form(&header, 40), 5);
+        let ended = Header { note: Some("terminé"), ..header };
+        frame(&mut canvas, area(100), &ended, false, UNICODE);
+        assert!(!canvas.row(0).contains(&label) && canvas.style(0, 1) == Style::fg(Color::Red));
+    }
+
+    /// A failed turn's notice (mock-up C): ✗ and its frame in orange; one member by name, several counted, the reason
+    /// without its code.
+    #[test]
+    fn a_failed_turn_s_notice() {
+        let label = crate::look::error_label(Some("API Error: 529 overloaded"));
+        let reason = t!("API surchargée", "API overloaded");
+        assert_eq!(
+            error_notice_text(&["dev-saisie"], &label),
+            t!("dev-saisie a raté son tour : {}", "dev-saisie's turn failed: {}", reason)
+        );
+        assert_eq!(
+            error_notice_text(&["dev-saisie", "testeur", "reviewer"], &label),
+            t!("3 membres ont raté leur tour : {}", "3 members' turns failed: {}", reason)
+        );
+        assert_eq!(crate::look::without_code("erreur d'API"), "erreur d'API");
+        assert_eq!(crate::look::without_code("a (b)"), "a (b)");
+        let notice = Notice { state: State::Error, text: error_notice_text(&["dev-saisie"], &label), ..saisie() };
+        let screen = Rect { x: 0, y: 0, width: 140, height: 39 };
+        let area = notice_area(screen, &notice);
+        let mut canvas = Canvas::new(140, 40);
+        super::notice(&mut canvas, area, &notice, UNICODE);
+        let row = canvas.row(2);
+        let x = row[..row.find('✗').unwrap()].chars().count();
+        assert_eq!(canvas.style(x, 2), Style::fg(crate::look::ORANGE).bold());
+        assert_eq!(canvas.style(area.x, 2), Style::fg(crate::look::ORANGE));
+        assert_eq!(
+            canvas.style(row[..row.find("dev-saisie").unwrap()].chars().count(), 2),
+            Style::fg(Color::Blue).bold()
+        );
+    }
+
     /// No name, no header in the border: the menu's layer, whose first line says « recruit ».
     #[test]
     fn no_name_no_header() {
@@ -1293,24 +1428,28 @@ mod tests {
     #[test]
     fn the_dashboard_s_counts_in_its_border() {
         let title = t!("Tableau de bord", "Dashboard");
-        let header =
-            Header { name: &title, hint: Some(Hint::Counts { working: 5, waiting: 1, idle: 3 }), ..Header::default() };
+        let header = Header {
+            name: &title,
+            hint: Some(Hint::Counts { working: 5, waiting: 1, error: 1, idle: 3 }),
+            ..Header::default()
+        };
         let mut canvas = Canvas::new(60, 3);
         frame(&mut canvas, Rect { x: 0, y: 0, width: 60, height: 3 }, &header, false, UNICODE);
         let head = format!("╭─ {title} ");
-        let counts = " ⠹ 5  ⚑ 1  ◷ 3 ─╮";
+        let counts = " ⠹ 5  ⚑ 1  ✗ 1  ◷ 3 ─╮";
         assert_eq!(canvas.row(0), format!("{head}{}{counts}", "─".repeat(60 - columns(&head) - columns(counts))));
         let at = |sign: char| canvas.row(0).chars().position(|c| c == sign).unwrap();
         assert_eq!(canvas.style(at('⠹'), 0), Style::fg(Color::Yellow));
         assert_eq!(canvas.style(at('⚑') + 2, 0), Style::fg(Color::Red));
+        assert_eq!(canvas.style(at('✗'), 0), Style::fg(crate::look::ORANGE));
         assert_eq!(canvas.style(at('◷'), 0), Style::fg(Color::DarkGrey));
         // No one waiting: no ⚑; no one at all: nothing.
-        let header = Header { hint: Some(Hint::Counts { working: 2, waiting: 0, idle: 0 }), ..header };
+        let header = Header { hint: Some(Hint::Counts { working: 2, waiting: 0, error: 0, idle: 0 }), ..header };
         assert!(framed(&header, 60, false)[0].ends_with("─ ⠹ 2 ─╮"));
-        let header = Header { hint: Some(Hint::Counts { working: 0, waiting: 0, idle: 0 }), ..header };
+        let header = Header { hint: Some(Hint::Counts { working: 0, waiting: 0, error: 0, idle: 0 }), ..header };
         assert_eq!(framed(&header, 30, false)[0], format!("{head}{}╮", "─".repeat(30 - columns(&head) - 1)));
         // Nerd Font: the robot at work, as on the dashboard.
-        let header = Header { hint: Some(Hint::Counts { working: 2, waiting: 0, idle: 0 }), ..header };
+        let header = Header { hint: Some(Hint::Counts { working: 2, waiting: 0, error: 0, idle: 0 }), ..header };
         frame(
             &mut canvas,
             Rect { x: 0, y: 0, width: 60, height: 3 },
@@ -1687,6 +1826,7 @@ mod tests {
     fn saisie() -> Notice {
         Notice {
             member: "dev-saisie".into(),
+            state: State::Waiting,
             color: Some(Color::Blue),
             text: notice_text("dev-saisie"),
             tab: "Agents (1)".into(),
@@ -1780,7 +1920,7 @@ mod tests {
                 },
             ]);
         }
-        let counts = Hint::Counts { working: 3, waiting: 12, idle: 140 };
+        let counts = Hint::Counts { working: 3, waiting: 12, error: 4, idle: 140 };
         headers.extend([
             Header { name: "Journal", hint: Some(Hint::JournalSize), ..Header::default() },
             Header { name: "Tableau de bord", hint: Some(counts), ..Header::default() },

@@ -10,7 +10,8 @@
 //!   holds the model and effort the team's settings give the member now, which the mod puts on each of its
 //!   requests, whether it keeps its prompt alone (the main contact may change), and what recruit asks of the
 //!   session: a line on what the member does (a completion it asks the model for), a compaction the dashboard
-//!   asked, the context's breakdown now and then. The mod hands the answers over at the next tick.
+//!   asked, « continue » the menu asked after a failed turn, the context's breakdown now and then. The mod hands the
+//!   answers over at the next tick.
 //! - `submit`, for each prompt: a note joined to it when the member's place in the team changed since its
 //!   conversation last heard of it (see [`submit`]).
 //! - `command`: what one of these commands does and prints.
@@ -28,7 +29,7 @@ use serde_json::{Value, json};
 use crate::config::{cache_dir, write_atomic};
 use crate::i18n::Lang;
 use crate::state::{MemberInfo, Snapshot};
-use crate::{board, claude, live, t};
+use crate::{board, claude, live, look, t};
 
 /// Claude Code loads mods from 2.1.287 on.
 pub const MIN_CLAUDE: (u32, u32, u32) = (2, 1, 287);
@@ -357,18 +358,28 @@ fn compactions(state: &Path) -> PathBuf {
     state.join("compact")
 }
 
+/// « Reprendre » for each member: the request (`<member>`), the one taken (`<member>.taken`), the mod's answer
+/// (`<member>.json`).
+fn resumes(state: &Path) -> PathBuf {
+    state.join("resume")
+}
+
 /// What each conversation heard of its member's place in the team, by session: kept from one launch to the next, a
 /// conversation may be resumed.
 fn prompted(state: &Path) -> PathBuf {
     state.join("prompted")
 }
 
-/// A member's own files, by name: its report, the line on what it does, the compaction asked for it.
-fn member_files(state: &Path, member: &str) -> [PathBuf; 3] {
+/// A member's own files, by name: its report, the line on what it does, the compaction and « Reprendre » asked for
+/// it.
+fn member_files(state: &Path, member: &str) -> [PathBuf; 6] {
     [
         reports(state).join(format!("{member}.json")),
         doings(state).join(format!("{member}.json")),
         compactions(state).join(member),
+        resumes(state).join(member),
+        resumes(state).join(format!("{member}.taken")),
+        resumes(state).join(format!("{member}.json")),
     ]
 }
 
@@ -398,9 +409,9 @@ pub fn forget(state: &Path, member: &str) -> Result<()> {
 }
 
 /// A new launch starts from the settings: no report, no session noted, no line on what a member does, no compaction
-/// asked, no zone of the dashboard, left from the last one.
+/// nor « Reprendre » asked, no zone of the dashboard, left from the last one.
 pub fn reset(state: &Path) -> Result<()> {
-    for dir in [reports(state), state.join("sessions"), doings(state), compactions(state)] {
+    for dir in [reports(state), state.join("sessions"), doings(state), compactions(state), resumes(state)] {
         if dir.exists() {
             fs::remove_dir_all(&dir).with_context(|| dir.display().to_string())?;
         }
@@ -576,6 +587,12 @@ fn tick(snapshot: &Snapshot, state: &Path, member: &str, input: &Value) -> Resul
     if let Some(id) = take_compaction(state, member, now) {
         reply["compact"] = json!(id);
     }
+    if let Some(answer) = input.get("resumption").and_then(|r| serde_json::from_value::<Resumption>(r.clone()).ok()) {
+        resumed(state, member, &Resumption { at: now, ..answer })?;
+    }
+    if let Some(id) = take_resume(state, member, now)? {
+        reply["resume"] = json!(id);
+    }
     if let Some(ask) = follow(snapshot, state, member, input)? {
         reply["summarize"] = ask;
     }
@@ -585,11 +602,130 @@ fn tick(snapshot: &Snapshot, state: &Path, member: &str, input: &Value) -> Resul
 /// Asks a member's session to compact, from the dashboard: its mod takes the request at its next tick, within
 /// ten seconds, or the request lapses. Tried once: a session at work refuses it.
 pub fn request_compaction(state: &Path, member: &str) -> Result<()> {
-    let millis = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
-    let request = json!({ "id": millis.to_string(), "until": board::now() + COMPACTION_LAPSE });
+    let request = json!({ "id": request_id(), "until": board::now() + COMPACTION_LAPSE });
     fs::create_dir_all(compactions(state))?;
     let file = compactions(state).join(member);
     fs::write(&file, request.to_string()).with_context(|| file.display().to_string())
+}
+
+/// Asks a member's session to take up its work after a failed turn (« Reprendre », decision of 2026-10-10): its mod
+/// sends « continue » at its next tick, unless the prompt box holds a draft or the member works; the request lapses as
+/// a compaction's. How it went: [`resumption`].
+pub fn request_resume(state: &Path, member: &str) -> Result<()> {
+    let request = json!({ "id": request_id(), "until": board::now() + COMPACTION_LAPSE });
+    fs::create_dir_all(resumes(state))?;
+    write_atomic(&resumes(state).join(member), &request.to_string())
+}
+
+/// How the last « Reprendre » asked for a member went, once its mod answered, or once it lapsed without an answer;
+/// none before, nor before any.
+pub fn resumption(state: &Path, member: &str) -> Option<Resumption> {
+    resumption_at(state, member, board::now())
+}
+
+/// What a member's mod did with « Reprendre ».
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Resumption {
+    pub id: String,
+    /// « continue » sent.
+    #[serde(default)]
+    pub sent: bool,
+    /// Not sent: the prompt box held a draft.
+    #[serde(default)]
+    pub draft: bool,
+    /// Not sent, why, as a sentence to show ([`resumption`] says the known reasons in the user's language): the member
+    /// busy (at work, or waiting for an answer), a Claude Code without the calls, no answer in time, or what the session said.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// When the mod answered, in seconds since the epoch; for a request that lapsed, when it lapsed.
+    #[serde(default)]
+    pub at: i64,
+}
+
+/// The reasons the mod and the tick give for a « continue » not sent, by code: said in the user's language when read.
+const RESUME_BUSY: &str = "busy";
+const RESUME_UNSUPPORTED: &str = "unsupported";
+
+/// How long « Reprendre », once handed to the mod, waits for its answer past the request's lapse, in seconds: the
+/// mod answers at the tick after the prompt entered, a few seconds at most.
+const RESUME_ANSWER: i64 = 20;
+
+/// A request to a member's mod: a compaction, « Reprendre ».
+#[derive(Deserialize)]
+struct Request {
+    id: String,
+    until: i64,
+}
+
+fn read_request(file: &Path) -> Option<Request> {
+    serde_json::from_str(&fs::read_to_string(file).ok()?).ok()
+}
+
+/// A request's id: unique enough for one member's requests, made a second apart at least by a person.
+fn request_id() -> String {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis()).to_string()
+}
+
+/// « Reprendre » asked for a member, taken: its id, unless the dashboard sees the member at work or waiting for an
+/// answer, where « continue » would land in the middle of a turn, or wait for its end: the request is then answered as
+/// refused. Not seen (no dashboard looking: `dashboard = false`, or stopped), handed over all the same: the mod's own
+/// guard refuses it while a turn runs, a question to answer included. Lapsed, it is left for [`resumption`] to tell.
+fn take_resume(state: &Path, member: &str, now: i64) -> Result<Option<String>> {
+    let file = resumes(state).join(member);
+    if read_request(&file).is_none_or(|r| r.until < now) {
+        return Ok(None);
+    }
+    let seen = board::fresh_states(state).and_then(|s| s.members.get(member).map(|m| m.state));
+    // Moved before it is read: one asked meanwhile is the one taken, never lost nor taken twice.
+    let taken = resumes(state).join(format!("{member}.taken"));
+    if fs::rename(&file, &taken).is_err() {
+        return Ok(None);
+    }
+    let Some(request) = read_request(&taken) else { return Ok(None) };
+    if !matches!(seen, Some(look::State::Working | look::State::Waiting)) {
+        return Ok(Some(request.id));
+    }
+    let refused = Resumption { id: request.id, error: Some(RESUME_BUSY.into()), at: now, ..Default::default() };
+    resumed(state, member, &refused)?;
+    Ok(None)
+}
+
+/// What the mod did with « Reprendre », or why the tick did not hand it over: kept until the next one.
+fn resumed(state: &Path, member: &str, resumption: &Resumption) -> Result<()> {
+    fs::create_dir_all(resumes(state))?;
+    write_atomic(&resumes(state).join(format!("{member}.json")), &serde_json::to_string(resumption)?)
+}
+
+fn resumption_at(state: &Path, member: &str, now: i64) -> Option<Resumption> {
+    let lapsed = |request: Request, at: i64| Resumption {
+        id: request.id,
+        error: Some(t!("pas de réponse de sa session", "no answer from its session")),
+        at,
+        ..Default::default()
+    };
+    let dir = resumes(state);
+    // Asked and not taken yet: under way, or lapsed.
+    if let Some(request) = read_request(&dir.join(member)) {
+        let until = request.until;
+        return (until < now).then(|| lapsed(request, until));
+    }
+    // Taken: the answer to that request, not to one before.
+    let taken = read_request(&dir.join(format!("{member}.taken")))?;
+    let answer = fs::read_to_string(dir.join(format!("{member}.json"))).ok();
+    let answer = answer.and_then(|text| serde_json::from_str::<Resumption>(&text).ok()).filter(|a| a.id == taken.id);
+    let Some(mut answer) = answer else {
+        let until = taken.until + RESUME_ANSWER;
+        return (until < now).then(|| lapsed(taken, until));
+    };
+    answer.error = answer.error.map(|error| match error.as_str() {
+        RESUME_BUSY => t!("le membre est occupé", "the member is busy"),
+        RESUME_UNSUPPORTED => t!(
+            "cette version de Claude Code ne permet pas d'envoyer « continue »",
+            "this version of Claude Code does not let recruit send \"continue\""
+        ),
+        _ => error,
+    });
+    Some(answer)
 }
 
 /// How long a compaction request waits for the member's mod, in seconds.
@@ -1178,12 +1314,15 @@ mod tests {
         let s = snapshot(Lang::Fr);
         tick(&s, state, "dev", &json!({"model": "claude-opus-5-5"})).unwrap();
         request_compaction(state, "dev").unwrap();
+        request_resume(state, "dev").unwrap();
         rename(state, "dev", "dev-rust").unwrap();
         assert!(report(state, "dev").is_none());
         assert_eq!(report(state, "dev-rust").unwrap().model.as_deref(), Some("claude-opus-5-5"));
         assert!(compactions(state).join("dev-rust").exists());
+        assert!(!resumes(state).join("dev").exists() && resumes(state).join("dev-rust").exists());
         forget(state, "dev-rust").unwrap();
         assert!(report(state, "dev-rust").is_none() && !compactions(state).join("dev-rust").exists());
+        assert!(!resumes(state).join("dev-rust").exists());
         // Nothing to move or remove: nothing done.
         rename(state, "qa", "test").unwrap();
         forget(state, "qa").unwrap();
@@ -1191,8 +1330,9 @@ mod tests {
         fs::write(state.join(board::ZONES), "[]").unwrap();
         tick(&s, state, "dev", &json!({})).unwrap();
         fs::create_dir_all(prompted(state)).unwrap();
+        request_resume(state, "dev").unwrap();
         reset(state).unwrap();
-        assert!(report(state, "dev").is_none());
+        assert!(report(state, "dev").is_none() && !resumes(state).exists());
         assert!(!state.join(board::ZONES).exists());
         // What conversations heard stays: one may be resumed.
         assert!(prompted(state).exists());
@@ -1390,6 +1530,108 @@ mod tests {
         request_compaction(state, "lead").unwrap();
         assert!(tick("dev", json!({})).get("compact").is_none());
         assert!(tick("lead", json!({})).get("compact").is_some());
+    }
+
+    /// The dashboard sees `member` in `state`, now.
+    fn seen(state: &Path, member: &str, seen: look::State) {
+        let at = board::now();
+        let member_state = board::MemberState { state: seen, since: at, shell: false };
+        let states = board::States { at, members: [(member.to_string(), member_state)].into(), ..Default::default() };
+        fs::write(state.join(board::STATES), serde_json::to_string(&states).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn resume_asked_from_the_menu() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let s = snapshot(Lang::Fr);
+        let tick = |member: &str, input: Value| tick(&s, state, member, &input).unwrap();
+        // None asked: nothing to tell.
+        assert!(resumption(state, "dev").is_none());
+
+        // Not seen by the dashboard (none looking): handed over, the mod's guard is enough.
+        request_resume(state, "dev").unwrap();
+        let unseen = tick("dev", json!({}))["resume"].as_str().unwrap().to_string();
+        tick("dev", json!({"resumption": {"id": unseen, "sent": true}}));
+        assert!(resumption(state, "dev").unwrap().sent);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        request_resume(state, "dev").unwrap();
+        seen(state, "dev", look::State::Error);
+        let id = tick("dev", json!({}))["resume"].as_str().unwrap().to_string();
+        // Taken once; no answer yet.
+        assert!(tick("dev", json!({})).get("resume").is_none());
+        assert!(resumption(state, "dev").is_none());
+        tick("dev", json!({"resumption": {"id": id, "sent": true}}));
+        let done = resumption(state, "dev").unwrap();
+        assert!(done.sent && !done.draft && done.error.is_none() && done.id == id);
+        assert!(done.at >= board::now() - 1);
+        // Kept until the next one, never told as the next one's answer.
+        tick("dev", json!({}));
+        assert!(resumption(state, "dev").unwrap().sent);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        request_resume(state, "dev").unwrap();
+        assert!(resumption(state, "dev").is_none());
+        // At rest is fine too; a draft in the prompt box, nothing sent.
+        seen(state, "dev", look::State::Idle);
+        let next = tick("dev", json!({}))["resume"].as_str().unwrap().to_string();
+        assert_ne!(next, id);
+        assert!(resumption(state, "dev").is_none());
+        tick("dev", json!({"resumption": {"id": next, "draft": true}}));
+        assert!(resumption(state, "dev").unwrap().draft);
+
+        // The reasons known, said in the user's language; the session's own, as it said them.
+        let failed = |code: &str| {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            request_resume(state, "dev").unwrap();
+            let id = tick("dev", json!({}))["resume"].as_str().unwrap().to_string();
+            tick("dev", json!({"resumption": {"id": id, "error": code}}));
+            resumption(state, "dev").unwrap().error.unwrap()
+        };
+        assert_eq!(failed("busy"), t!("le membre est occupé", "the member is busy"));
+        assert!(failed("unsupported").contains("Claude Code"));
+        assert_eq!(failed("Error: refused"), "Error: refused");
+
+        // At work, or waiting for an answer: refused at once, not handed over.
+        for busy in [look::State::Working, look::State::Waiting] {
+            seen(state, "dev", busy);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            request_resume(state, "dev").unwrap();
+            assert!(tick("dev", json!({})).get("resume").is_none());
+            let refused = resumption(state, "dev").unwrap();
+            assert_eq!(refused.error.unwrap(), t!("le membre est occupé", "the member is busy"));
+            assert!(!refused.sent);
+        }
+
+        // Another member's request stays for it.
+        seen(state, "lead", look::State::Error);
+        request_resume(state, "lead").unwrap();
+        assert!(tick("dev", json!({})).get("resume").is_none());
+        assert!(tick("lead", json!({})).get("resume").is_some());
+    }
+
+    #[test]
+    fn resume_lapses_without_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let s = snapshot(Lang::Fr);
+        let now = board::now();
+        let lapsed = t!("pas de réponse de sa session", "no answer from its session");
+        // Never taken (no mod): lapsed once its time is up, and no longer handed over.
+        fs::create_dir_all(resumes(state)).unwrap();
+        fs::write(resumes(state).join("dev"), json!({"id": "1", "until": now + 5}).to_string()).unwrap();
+        assert!(resumption_at(state, "dev", now).is_none());
+        let told = resumption_at(state, "dev", now + 6).unwrap();
+        assert_eq!((told.id.as_str(), told.error.as_deref(), told.at), ("1", Some(lapsed.as_str()), now + 5));
+        fs::write(resumes(state).join("dev"), json!({"id": "1", "until": now - 1}).to_string()).unwrap();
+        assert!(tick(&s, state, "dev", &json!({})).unwrap().get("resume").is_none());
+        assert!(resumption(state, "dev").unwrap().error.is_some());
+        // Taken, and the mod never answered (its session gone): lapsed a while later.
+        request_resume(state, "dev").unwrap();
+        let id = tick(&s, state, "dev", &json!({})).unwrap()["resume"].as_str().unwrap().to_string();
+        let until = now + COMPACTION_LAPSE;
+        assert!(resumption_at(state, "dev", until + RESUME_ANSWER).is_none());
+        let told = resumption_at(state, "dev", until + RESUME_ANSWER + 2).unwrap();
+        assert_eq!((told.id, told.error), (id, Some(lapsed)));
     }
 
     #[test]

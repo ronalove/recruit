@@ -983,7 +983,13 @@ mod tests {
     }
 
     fn waiting(member: &str) -> Notice {
-        Notice { member: member.into(), color: None, text: chrome::notice_text(member), tab: "Agents (1)".into() }
+        Notice {
+            member: member.into(),
+            state: crate::look::State::Waiting,
+            color: None,
+            text: chrome::notice_text(member),
+            tab: "Agents (1)".into(),
+        }
     }
 
     /// Two panes side by side on a 160 × 12 screen, the bar on its last row; the notice over the right one.

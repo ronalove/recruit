@@ -285,3 +285,76 @@ fn gallery_narrow() {
     std::fs::write(gallery.dir.join("INDEX-narrow.txt"), gallery.shots.join("\n") + "\n").expect("index");
     team.stop();
 }
+
+/// Standard base64, for the `msg` of an error state.
+fn base64(text: &str) -> String {
+    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in text.as_bytes().chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { DIGITS[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+/// The member's turn failed, as Claude Code 2.1.296 says it (`state=error:app=claude-code:msg=<base64>`).
+fn fails(team: &Team, member: &str) {
+    let message =
+        "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}";
+    says(team, member, &format!("error:app=claude-code:msg={}", base64(message)));
+}
+
+/// A failed turn (« tour raté ») for the design review, at 140 × 40 and at 64 × 19 (the mock-up's): the first tab with
+/// the dashboard, the member's card and the notice; the member's tab with its frame and header; the member's sheet
+/// in the menu (⌥r on its pane).
+#[test]
+#[ignore = "by hand: the design review's gallery of the failed turn"]
+fn gallery_failed_turn() {
+    let mut team = gallery_team();
+    let mut gallery = Gallery { dir: out_dir(), shots: Vec::new() };
+    for (size, (cols, rows)) in [("140x40", (140u16, 40u16)), ("64x19", (64, 19))] {
+        let mut term = team.attach(cols, rows, Profile::default());
+        // The server kept the tab the last client was on: back to the first.
+        let keys = alt(&term, '1');
+        term.send(&keys);
+        assert!(term.wait_for("lead", Duration::from_secs(5)), "{}", term.screen().join("\n"));
+        // `work` was at work; its turn fails (out of view: on tab 2).
+        fails(&team, "work");
+        std::thread::sleep(Duration::from_millis(1500));
+        gallery.shot(
+            &team,
+            &term,
+            &format!("30-failed-tab1-notice-{size}"),
+            "tab 1: the dashboard with the card of `work` (failed), the notice at the top right, the badge on tab 2",
+        );
+        let keys = alt(&term, '2');
+        term.send(&keys);
+        wait(Duration::from_secs(3), || find_in_header(&term, "work").is_some());
+        gallery.shot(
+            &team,
+            &term,
+            &format!("31-failed-tab-work-{size}"),
+            "tab 2: `work`'s pane with the failed turn's frame and header (✗, reason after the name)",
+        );
+        let keys = alt(&term, 'r');
+        term.send(&keys);
+        wait(Duration::from_secs(5), || team.panes().iter().any(|p| p["role"] == "menu"));
+        std::thread::sleep(Duration::from_millis(1200));
+        gallery.shot(
+            &team,
+            &term,
+            &format!("32-failed-sheet-{size}"),
+            "the menu on `work`'s sheet (the whole text of the error)",
+        );
+        term.send(b"\x1b");
+        std::thread::sleep(Duration::from_millis(800));
+        drop(term);
+        // The next size starts from a member at work again, and past the ten seconds that merge two notices.
+        says(&team, "work", "working");
+        std::thread::sleep(Duration::from_secs(11));
+    }
+    std::fs::write(gallery.dir.join("INDEX-failed.txt"), gallery.shots.join("\n") + "\n").expect("index");
+    team.stop();
+}

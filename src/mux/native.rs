@@ -237,6 +237,7 @@ impl Backend for Native {
                 // A name this recruit does not know (a later server's): none, as said.
                 status: pane.status.as_deref().map(look::State::named).filter(|s| *s != look::State::Other),
                 since: pane.since,
+                error: pane.error,
             })
             .collect())
     }

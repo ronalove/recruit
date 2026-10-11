@@ -31,9 +31,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 
 use self::choice::{Open, Outcome, Purpose};
-use self::pane::{Broken, Command, Gate, Pane, Wires};
+use self::pane::{Broken, Command, Gate, Pane, TurnError, Wires};
 use super::chrome::{self, Target};
-use super::engine::{MouseTracking, Relay, State};
+use super::engine::{self, MouseTracking, Relay, State};
 use super::input::{self, Button, Event, Mods, Mouse, MouseKind};
 use super::keys::{self, Action, Shortcut};
 use super::proto::{
@@ -358,8 +358,12 @@ struct Server {
     looks: BTreeMap<String, board::MemberLook>,
     /// When a time in a header shown next changes (12s, 13s; 22m, 23m); `None` when none shows.
     clock: Option<Instant>,
-    /// A member gone waiting out of sight (F5): its notice, until when it shows.
+    /// A member gone waiting out of sight (F5), or whose turn failed: its notice, until when it shows.
     notice: Option<(chrome::Notice, Instant)>,
+    /// The failed turns told by one notice: since when, and whose. Others within [`BURST`] join it, none other shows.
+    burst: Option<(Instant, Vec<String>)>,
+    /// A failed turn's reason when its text is not known (as the dashboard saw it): « erreur d'API ».
+    unknown_error: String,
     /// Where the notice can be clicked, as last drawn.
     notice_zone: Option<Rect>,
     /// Where the headers' parts can be clicked, by pane, as last drawn.
@@ -382,6 +386,9 @@ const LOOKS: Duration = Duration::from_secs(2);
 
 /// How long a notice shows (F5).
 const NOTICE: Duration = Duration::from_secs(6);
+
+/// Failed turns this close to the first one noticed share its notice (an API outage often hits the whole team).
+const BURST: Duration = Duration::from_secs(10);
 
 /// `recruit _server <state>`: starts the team's server, detached, and returns once it is ready.
 pub(crate) fn run(state: &Path) -> Result<()> {
@@ -623,6 +630,8 @@ impl Server {
             looks: BTreeMap::new(),
             clock: None,
             notice: None,
+            burst: None,
+            unknown_error: look::error_label(None),
             notice_zone: None,
             parts: Vec::new(),
             hover: None,
@@ -966,23 +975,19 @@ impl Server {
             }
             Msg::Broken => self.dirty = true,
             Msg::Looks(looks) => {
-                // A member whose program says nothing, gone waiting out of sight by the dashboard: a notice, as by its
-                // program (`relay`).
+                // A member whose program says nothing, gone waiting or failed out of sight by the dashboard: a notice,
+                // as by its program (`take_relays`).
                 let shown = self.shown_ids();
-                let waiting = self
-                    .panes
-                    .iter()
-                    .filter(|pane| pane.role.is_empty() && !shown.contains(&pane.id))
-                    .find(|pane| {
-                        pane_state(pane, &looks) == look::State::Waiting
-                            && pane_state(pane, &self.looks) != look::State::Waiting
-                    })
-                    .map(|pane| pane.id.clone());
+                let mut called = Vec::new();
+                for pane in self.panes.iter().filter(|pane| pane.role.is_empty() && !shown.contains(&pane.id)) {
+                    let state = pane_state(pane, &looks);
+                    if calls(state) && pane_state(pane, &self.looks) != state {
+                        called.push((pane.id.clone(), state));
+                    }
+                }
                 self.looks = looks;
                 self.dirty = true;
-                if let Some(id) = waiting {
-                    self.notify(&id);
-                }
+                self.call(called);
             }
             Msg::Attach(attaching) => self.attach(*attaching),
             Msg::Client(id, message) => {
@@ -1311,12 +1316,17 @@ impl Server {
         self.layout();
     }
 
-    /// To the member who has waited the longest (⌥g, F6); nothing when none waits.
+    /// To the member who has waited the longest (⌥g, F6), else to the one whose turn failed the longest ago (mock-up
+    /// C); nothing when none waits nor failed.
     fn go_waiting(&mut self) {
         let looks = &self.looks;
-        let waiting =
-            self.panes.iter().filter(|pane| pane.role.is_empty() && pane_state(pane, looks) == look::State::Waiting);
-        let first = waiting.min_by_key(|pane| pane_since(pane, looks).unwrap_or(u64::MAX));
+        let rank = |pane: &&Pane| match pane_state(pane, looks) {
+            look::State::Waiting => Some(0),
+            look::State::Error => Some(1),
+            _ => None,
+        };
+        let calling = self.panes.iter().filter(|pane| pane.role.is_empty()).filter(|pane| rank(pane).is_some());
+        let first = calling.min_by_key(|pane| (rank(pane), pane_since(pane, looks).unwrap_or(u64::MAX)));
         if let Some(id) = first.map(|pane| pane.id.clone()) {
             self.focus_on(&id);
         }
@@ -1706,7 +1716,7 @@ impl Server {
         let focus = self.focus.clone();
         let shown = self.shown_ids();
         let mut relays = Vec::new();
-        let mut waiting = None;
+        let mut called = Vec::new();
         let held = self.gate.hold();
         let looks = &self.looks;
         for pane in &mut self.panes {
@@ -1718,18 +1728,15 @@ impl Server {
             for relay in relays.drain(..) {
                 if let Relay::Status(status) = &relay {
                     let state = look_state(Some(status.state));
-                    // Waiting already, by its program or by the dashboard: no second notice.
-                    if state == look::State::Waiting
-                        && pane_state(pane, looks) != look::State::Waiting
+                    // So already, by its program or by the dashboard: no second notice.
+                    if calls(state)
+                        && pane_state(pane, looks) != state
                         && pane.role.is_empty()
                         && !shown.contains(&pane.id)
                     {
-                        waiting = Some(pane.id.clone());
+                        called.push((pane.id.clone(), state));
                     }
-                    if pane.since.is_none() || look_state(pane.state) != state {
-                        pane.since = Some(now());
-                    }
-                    pane.state = Some(status.state);
+                    note_status(pane, status);
                 }
                 if matches!(relay, Relay::Title(_)) && focus.as_deref() != Some(pane.id.as_str()) {
                     continue;
@@ -1740,8 +1747,17 @@ impl Server {
             }
         }
         drop(held);
-        if let Some(id) = waiting {
-            self.notify(&id);
+        self.call(called);
+    }
+
+    /// The notices of members gone waiting or failed out of sight, in turn: a wait last, which wins.
+    fn call(&mut self, mut called: Vec<(String, look::State)>) {
+        called.sort_by_key(|(_, state)| *state == look::State::Waiting);
+        for (id, state) in called {
+            match state {
+                look::State::Waiting => self.notify(&id),
+                _ => self.notify_error(&id),
+            }
         }
     }
 
@@ -1757,6 +1773,7 @@ impl Server {
         let Some(tab) = self.tabs.iter().find(|tab| tab.has(id)) else { return };
         let notice = chrome::Notice {
             member: pane.member.clone(),
+            state: look::State::Waiting,
             color: Some(member_color(&self.order, &pane.member)),
             text: chrome::notice_text(&pane.member),
             tab: tab.title.clone(),
@@ -1765,16 +1782,69 @@ impl Server {
         self.dirty = true;
     }
 
-    /// The notice gone once its time is up, once its member is in sight or no longer waits, or once a layer opens.
+    /// The notice of a member whose turn failed out of sight (mock-up C), orange: one for the failures within
+    /// [`BURST`] of the first, which the later ones join while it shows (« 3 membres ont raté leur tour »), and none
+    /// else. Never over a wait's notice, nor under a layer, as a wait's (`notify`).
+    fn notify_error(&mut self, id: &str) {
+        if self.client.is_none() || self.menu.is_some() || self.choice.is_some() {
+            return;
+        }
+        if self.notice.as_ref().is_some_and(|(notice, _)| notice.state == look::State::Waiting) {
+            return;
+        }
+        let Some(pane) = self.pane(id) else { return };
+        let Some(tab) = self.tabs.iter().find(|tab| tab.has(id)) else { return };
+        let label = pane.error.as_ref().map_or(self.unknown_error.clone(), |error| error.label.clone());
+        let (member, tab) = (pane.member.clone(), tab.title.clone());
+        let now = Instant::now();
+        let members = match &mut self.burst {
+            Some((since, members)) if now.duration_since(*since) < BURST => {
+                if !members.contains(&member) {
+                    members.push(member.clone());
+                }
+                // Its notice gone already (its time, a layer): no other.
+                if !self.notice.as_ref().is_some_and(|(notice, _)| notice.state == look::State::Error) {
+                    return;
+                }
+                members.clone()
+            }
+            _ => {
+                self.burst = Some((now, vec![member.clone()]));
+                vec![member.clone()]
+            }
+        };
+        let names: Vec<&str> = members.iter().map(String::as_str).collect();
+        let notice = chrome::Notice {
+            state: look::State::Error,
+            color: Some(member_color(&self.order, &member)),
+            text: chrome::error_notice_text(&names, &label),
+            member,
+            tab,
+        };
+        // Joined, it keeps its time.
+        let until = match &self.notice {
+            Some((shown, until)) if shown.state == look::State::Error => *until,
+            _ => now + NOTICE,
+        };
+        self.notice = Some((notice, until));
+        self.dirty = true;
+    }
+
+    /// The notice gone once its time is up, once a layer opens, or once its members are all in sight or no longer
+    /// in the state it tells.
     fn check_notice(&mut self) {
         let Some((notice, until)) = &self.notice else { return };
-        let pane = self.panes.iter().find(|pane| pane.role.is_empty() && pane.member == notice.member);
-        let over = *until <= Instant::now()
-            || self.menu.is_some()
-            || self.choice.is_some()
-            || pane.is_none_or(|pane| {
-                pane_state(pane, &self.looks) != look::State::Waiting || self.shown_ids().contains(&pane.id)
-            });
+        let members = match &self.burst {
+            Some((_, members)) if notice.state == look::State::Error => members.clone(),
+            _ => vec![notice.member.clone()],
+        };
+        let shown = self.shown_ids();
+        let calling = self
+            .panes
+            .iter()
+            .filter(|pane| pane.role.is_empty() && members.contains(&pane.member))
+            .any(|pane| pane_state(pane, &self.looks) == notice.state && !shown.contains(&pane.id));
+        let over = *until <= Instant::now() || self.menu.is_some() || self.choice.is_some() || !calling;
         if over {
             self.notice = None;
             self.dirty = true;
@@ -1874,8 +1944,9 @@ impl Server {
         let context = looks.and_then(|looks| looks.context);
         // Its program says its state: at rest by it. Else (none said, or `Clear`) as the dashboard last saw it.
         let told = look_state(pane.state) != look::State::Other;
+        // At rest, or its turn failed (architect's decision): a click on its context compacts it.
         let compactable = if told {
-            base.state == look::State::Idle && context.is_some()
+            matches!(base.state, look::State::Idle | look::State::Error) && context.is_some()
         } else {
             looks.is_some_and(|looks| looks.compactable)
         };
@@ -1883,7 +1954,10 @@ impl Server {
         // not tell): the command's sign, and since when it runs, as its card (architect's decision). At work, or
         // waiting, its program wins.
         let shell = looks.is_some_and(|looks| looks.shell)
-            && !matches!(base.state, look::State::Working | look::State::Waiting);
+            && !matches!(base.state, look::State::Working | look::State::Waiting | look::State::Error);
+        // Why its turn failed, short: as its program said it, else unknown (as the dashboard saw it).
+        let error = (base.state == look::State::Error)
+            .then(|| pane.error.as_ref().map_or(self.unknown_error.as_str(), |error| error.label.as_str()));
         let seen = || looks?.since.and_then(|since| u64::try_from(since).ok());
         let own = pane.since.filter(|_| told);
         let since = if shell { seen().or(own) } else { own.or_else(seen) };
@@ -1900,6 +1974,7 @@ impl Server {
             pressure: looks.map(|looks| looks.pressure).unwrap_or_default(),
             compactable,
             shell,
+            error,
             since: since.map(|since| epoch.saturating_sub(since)),
             zoom: Some(if zoomed == Some(pane.id.as_str()) { chrome::Zoom::Out } else { chrome::Zoom::In }),
             hover,
@@ -1907,19 +1982,21 @@ impl Server {
         }
     }
 
-    /// How many members work, wait for the user and rest, for the dashboard's border (mock-up B1), as their programs
-    /// say it; for one whose program says nothing (no OSC 7501, or `Clear`), as the dashboard last saw it (`looks`).
+    /// How many members work, wait for the user, failed their turn and rest, for the dashboard's border (mock-ups B1
+    /// and C), as their programs say it; for one whose program says nothing (no OSC 7501, or `Clear`), as the
+    /// dashboard last saw it (`looks`).
     fn counts(&self) -> chrome::Hint {
-        let (mut working, mut waiting, mut idle) = (0, 0, 0);
+        let (mut working, mut waiting, mut error, mut idle) = (0, 0, 0, 0);
         for pane in self.panes.iter().filter(|pane| pane.role.is_empty()) {
             match pane_state(pane, &self.looks) {
                 look::State::Working => working += 1,
                 look::State::Waiting => waiting += 1,
+                look::State::Error => error += 1,
                 look::State::Idle => idle += 1,
                 look::State::Other => {}
             }
         }
-        chrome::Hint::Counts { working, waiting, idle }
+        chrome::Hint::Counts { working, waiting, error, idle }
     }
 
     /// The screen as it is, in `self.screen`: the shown tab's panes in their frames, the bar. False while an engine
@@ -2192,6 +2269,7 @@ impl Server {
                             .filter(|state| *state != look::State::Other)
                             .map(|state| state.name().to_string()),
                         since: pane.since.filter(|_| look_state(pane.state) != look::State::Other),
+                        error: pane.error.as_ref().and_then(|error| error.message.clone()),
                     })
                     .collect();
                 ok(serde_json::to_value(list).unwrap_or_default())
@@ -2675,8 +2753,32 @@ fn look_state(state: Option<State>) -> look::State {
         Some(State::Working) => look::State::Working,
         Some(State::Blocked) => look::State::Waiting,
         Some(State::Idle | State::Done) => look::State::Idle,
+        Some(State::Error) => look::State::Error,
         Some(State::Clear) | None => look::State::Other,
     }
+}
+
+/// What its program says of its state, noted in a pane: since when (from its first state, then at each change), and
+/// why its turn failed, kept until another state.
+fn note_status(pane: &mut Pane, status: &engine::Status) {
+    if pane.since.is_none() || look_state(pane.state) != look_state(Some(status.state)) {
+        pane.since = Some(now());
+    }
+    pane.state = Some(status.state);
+    pane.error = (status.state == State::Error).then(|| TurnError {
+        message: status.message.clone(),
+        label: one_line(&look::error_label(status.message.as_deref())),
+    });
+}
+
+/// A text from a pane's program on one line, for a header or a notice: its line breaks and tabs as spaces.
+fn one_line(text: &str) -> String {
+    text.chars().map(|c| if matches!(c, '\n' | '\r' | '\t') { ' ' } else { c }).collect()
+}
+
+/// Whether a member gone into `state` out of sight gets a notice: waiting for the user, or its turn failed.
+fn calls(state: look::State) -> bool {
+    matches!(state, look::State::Waiting | look::State::Error)
 }
 
 /// A pane's state, as its program says it (OSC 7501); for a member whose program says none, or `Clear`, as the
@@ -2770,10 +2872,10 @@ fn member_color(order: &[String], member: &str) -> crossterm::style::Color {
     look::member_color(order.iter().position(|name| name == member).unwrap_or(order.len()))
 }
 
-/// The most urgent of states: waiting, else working, else at rest.
+/// The most urgent of states: waiting, else failed, else working, else at rest (mock-up C).
 fn urgent(states: impl Iterator<Item = look::State>) -> look::State {
     let states: Vec<look::State> = states.collect();
-    [look::State::Waiting, look::State::Working, look::State::Idle]
+    [look::State::Waiting, look::State::Error, look::State::Working, look::State::Idle]
         .into_iter()
         .find(|state| states.contains(state))
         .unwrap_or(look::State::Other)
@@ -3016,14 +3118,22 @@ mod tests {
         // The dashboard's border counts the members by their programs' states.
         server.panes[0].state = Some(State::Working);
         server.panes[1].state = Some(State::Blocked);
-        assert_eq!(server.counts(), chrome::Hint::Counts { working: 1, waiting: 1, idle: 0 });
+        assert_eq!(server.counts(), chrome::Hint::Counts { working: 1, waiting: 1, error: 0, idle: 0 });
         // A program that says nothing: as the dashboard saw it; the program, once it says, first.
         server.panes[1].state = None;
-        assert_eq!(server.counts(), chrome::Hint::Counts { working: 1, waiting: 0, idle: 0 }, "seen nowhere yet");
+        assert_eq!(
+            server.counts(),
+            chrome::Hint::Counts { working: 1, waiting: 0, error: 0, idle: 0 },
+            "seen nowhere yet"
+        );
         server.looks.get_mut("dev-b").unwrap().state = Some(look::State::Idle);
-        assert_eq!(server.counts(), chrome::Hint::Counts { working: 1, waiting: 0, idle: 1 });
+        assert_eq!(server.counts(), chrome::Hint::Counts { working: 1, waiting: 0, error: 0, idle: 1 });
         server.looks.get_mut("dev-a").unwrap().state = Some(look::State::Idle);
-        assert_eq!(server.counts(), chrome::Hint::Counts { working: 1, waiting: 0, idle: 1 }, "its program says");
+        assert_eq!(
+            server.counts(),
+            chrome::Hint::Counts { working: 1, waiting: 0, error: 0, idle: 1 },
+            "its program says"
+        );
     }
 
     #[test]
@@ -3059,7 +3169,7 @@ mod tests {
         assert_eq!(header(&server), (look::State::Waiting, false, Some(5)));
         // The dashboard's border counts it at rest, as its cards do.
         server.panes[0].state = Some(State::Idle);
-        assert_eq!(server.counts(), chrome::Hint::Counts { working: 0, waiting: 0, idle: 1 });
+        assert_eq!(server.counts(), chrome::Hint::Counts { working: 0, waiting: 0, error: 0, idle: 1 });
     }
 
     #[test]
@@ -3156,6 +3266,186 @@ mod tests {
         assert!(server.notice.is_none());
     }
 
+    fn status(state: State, message: Option<&str>) -> engine::Status {
+        engine::Status {
+            state,
+            kind: None,
+            progress: None,
+            title: None,
+            message: message.map(String::from),
+            id: None,
+            app: None,
+        }
+    }
+
+    /// One member a tab, out of sight but `dev-a`'s, a client attached: the notices are for a client only.
+    fn four_tabs() -> (tempfile::TempDir, Server, UnixStream) {
+        let state = tempfile::tempdir().unwrap();
+        let names = ["dev-a", "dev-b", "dev-c", "dev-d"];
+        let tabs = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| TabSpec { title: (i + 1).to_string(), panes: vec![sleeper(name)], side: None })
+            .collect();
+        let mut server = built(state.path(), &names, tabs);
+        let client = attached(&mut server);
+        (state, server, client)
+    }
+
+    #[test]
+    fn a_failed_turn_is_kept_until_another_state() {
+        let (_state, mut server, _client) = four_tabs();
+        let overloaded = r#"API Error: 529 {"type":"error","error":{"type":"overloaded_error"}}"#;
+        note_status(&mut server.panes[1], &status(State::Working, None));
+        note_status(&mut server.panes[1], &status(State::Error, Some(overloaded)));
+        let error = server.panes[1].error.clone().expect("kept");
+        assert_eq!(error, TurnError { message: Some(overloaded.into()), label: look::error_label(Some(overloaded)) });
+        // Its header: the state, its reason short; `Panes`: the text whole.
+        let header = server.header(&server.panes[1], None, None, now());
+        assert_eq!((header.state, header.error), (look::State::Error, Some(error.label.as_str())));
+        let Reply::Ok(list) = server.answer(Request::Panes) else { panic!("panes") };
+        let list: Vec<PaneInfo> = serde_json::from_value(list).unwrap();
+        let info = list.iter().find(|info| info.member == "dev-b").unwrap();
+        assert_eq!(
+            (info.status.as_deref(), info.error.as_deref()),
+            (Some(look::State::Error.name()), Some(overloaded))
+        );
+        // Its next turn: gone, everywhere.
+        note_status(&mut server.panes[1], &status(State::Working, None));
+        assert_eq!(server.panes[1].error, None);
+        assert_eq!(server.header(&server.panes[1], None, None, now()).error, None);
+        // Any other state too, `Clear` included.
+        note_status(&mut server.panes[1], &status(State::Error, None));
+        assert_eq!(
+            server.panes[1].error.as_ref().map(|error| error.label.as_str()),
+            Some(server.unknown_error.as_str())
+        );
+        note_status(&mut server.panes[1], &status(State::Clear, None));
+        assert_eq!(server.panes[1].error, None);
+        // Failed as the dashboard saw it (no state of its own): its reason unknown, said short.
+        server
+            .looks
+            .insert("dev-b".into(), board::MemberLook { state: Some(look::State::Error), ..Default::default() });
+        let header = server.header(&server.panes[1], None, None, now());
+        assert_eq!((header.state, header.error), (look::State::Error, Some(server.unknown_error.as_str())));
+        // Never for a member at work.
+        assert_eq!(server.header(&server.panes[0], None, None, now()).error, None);
+        // Failed: still compactable (its context known), and its failure wins over a command running.
+        server.looks.insert(
+            "dev-b".into(),
+            board::MemberLook { context: Some(40), shell: true, since: Some(1), ..Default::default() },
+        );
+        note_status(&mut server.panes[1], &status(State::Error, Some("API Error:\n\t500")));
+        let header = server.header(&server.panes[1], None, None, now());
+        assert_eq!((header.state, header.compactable, header.shell), (look::State::Error, true, false));
+        // On one line, whatever its program wrote.
+        assert!(!header.error.unwrap().contains(['\n', '\t', '\r']), "{:?}", header.error);
+        assert_eq!(one_line("a\nb\tc\r"), "a b c ");
+    }
+
+    #[test]
+    fn a_failed_turn_ranks_after_a_wait_on_tabs_counts_and_go() {
+        let (_state, mut server, _client) = four_tabs();
+        let now = now();
+        let set = |server: &mut Server, i: usize, state: State, ago: u64| {
+            server.panes[i].state = Some(state);
+            server.panes[i].since = Some(now - ago);
+        };
+        // The tabs: waiting, else failed, else working, else at rest.
+        use look::State::{Error, Idle, Waiting, Working};
+        assert_eq!(urgent([Working, Error, Idle].into_iter()), Error);
+        assert_eq!(urgent([Error, Waiting].into_iter()), Waiting);
+        assert_eq!(urgent([Idle, Working].into_iter()), Working);
+        set(&mut server, 0, State::Working, 5);
+        set(&mut server, 1, State::Error, 600);
+        set(&mut server, 2, State::Error, 60);
+        set(&mut server, 3, State::Idle, 5);
+        assert_eq!(server.counts(), chrome::Hint::Counts { working: 1, waiting: 0, error: 2, idle: 1 });
+        // ⌥g: the turn that failed the longest ago, while none waits.
+        server.go_waiting();
+        assert_eq!(server.focus.as_deref(), Some(server.panes[1].id.as_str()));
+        // One waiting, even since less long: it first.
+        set(&mut server, 3, State::Blocked, 1);
+        server.go_waiting();
+        assert_eq!(server.focus.as_deref(), Some(server.panes[3].id.as_str()));
+        assert_eq!(server.counts(), chrome::Hint::Counts { working: 1, waiting: 1, error: 2, idle: 0 });
+    }
+
+    #[test]
+    fn failed_turns_within_ten_seconds_share_one_orange_notice() {
+        let (_state, mut server, _client) = four_tabs();
+        let fail = |server: &mut Server, i: usize| {
+            note_status(&mut server.panes[i], &status(State::Error, Some("API Error: 529 overloaded")));
+        };
+        let label = look::error_label(Some("API Error: 529 overloaded"));
+        let (b, c, d) = (id_of(&server, "dev-b"), id_of(&server, "dev-c"), id_of(&server, "dev-d"));
+        fail(&mut server, 1);
+        server.call(vec![(b.clone(), look::State::Error)]);
+        let (notice, until) = server.notice.clone().expect("noticed");
+        assert_eq!((notice.state, notice.member.as_str(), notice.tab.as_str()), (look::State::Error, "dev-b", "2"));
+        assert_eq!(notice.text, chrome::error_notice_text(&["dev-b"], &label));
+        // Another within ten seconds: the same notice, both told, its time kept.
+        fail(&mut server, 2);
+        server.call(vec![(c.clone(), look::State::Error)]);
+        let (notice, kept) = server.notice.clone().expect("still");
+        assert_eq!(notice.text, chrome::error_notice_text(&["dev-b", "dev-c"], &label));
+        assert_eq!((notice.member.as_str(), kept), ("dev-c", until));
+        // Its time up within the ten seconds: none other.
+        server.notice = None;
+        fail(&mut server, 3);
+        server.call(vec![(d.clone(), look::State::Error)]);
+        assert!(server.notice.is_none(), "one for the burst");
+        // Ten seconds on: a new one.
+        server.burst.as_mut().unwrap().0 -= BURST;
+        server.call(vec![(d.clone(), look::State::Error)]);
+        assert_eq!(server.notice.as_ref().map(|(notice, _)| notice.member.as_str()), Some("dev-d"));
+        // A wait wins over it, and keeps its place.
+        server.panes[1].state = Some(State::Blocked);
+        server.call(vec![(c.clone(), look::State::Error), (b.clone(), look::State::Waiting)]);
+        let (notice, _) = server.notice.clone().expect("waiting");
+        assert_eq!((notice.state, notice.member.as_str()), (look::State::Waiting, "dev-b"));
+        server.burst = None;
+        server.call(vec![(c.clone(), look::State::Error)]);
+        assert_eq!(server.notice.as_ref().map(|(notice, _)| notice.state), Some(look::State::Waiting));
+        // None under a layer, nor without a client.
+        server.notice = None;
+        server.choice = Some(Open::new(chrome::quit_choice("t"), Purpose::Quit { client: "c1".into() }));
+        server.call(vec![(c.clone(), look::State::Error)]);
+        assert!(server.notice.is_none(), "under a layer");
+        server.choice = None;
+        let client = server.client.take();
+        server.call(vec![(c.clone(), look::State::Error)]);
+        assert!(server.notice.is_none(), "no one to tell");
+        server.client = client;
+        // Gone once none of its members is failed out of sight any more.
+        server.burst = None;
+        server.call(vec![(c.clone(), look::State::Error)]);
+        fail(&mut server, 3);
+        server.call(vec![(d.clone(), look::State::Error)]);
+        note_status(&mut server.panes[3], &status(State::Working, None));
+        server.check_notice();
+        assert!(server.notice.is_some(), "dev-c still failed");
+        server.focus_on(&c);
+        server.check_notice();
+        assert!(server.notice.is_none(), "dev-c in sight");
+    }
+
+    #[test]
+    fn a_member_failed_by_the_dashboard_is_noticed_too() {
+        let (_state, mut server, _client) = four_tabs();
+        // Its program says nothing; the dashboard saw its turn fail.
+        let failed = board::MemberLook { state: Some(look::State::Error), ..Default::default() };
+        server.message(Msg::Looks(BTreeMap::from([("dev-c".into(), failed.clone())])));
+        let (notice, _) = server.notice.clone().expect("noticed");
+        assert_eq!((notice.state, notice.member.as_str()), (look::State::Error, "dev-c"));
+        assert_eq!(notice.text, chrome::error_notice_text(&["dev-c"], &server.unknown_error));
+        // The same again: no second one.
+        server.notice = None;
+        server.burst = None;
+        server.message(Msg::Looks(BTreeMap::from([("dev-c".into(), failed)])));
+        assert!(server.notice.is_none());
+    }
+
     #[test]
     fn a_member_whose_program_says_nothing_or_clear_is_as_the_dashboard_saw_it() {
         let state = tempfile::tempdir().unwrap();
@@ -3184,7 +3474,7 @@ mod tests {
         assert_eq!((header.state, header.since), (look::State::Waiting, Some(300)));
         // dev-a's program says it rests: it, not the dashboard.
         assert_eq!(server.header(&server.panes[0], None, None, now).state, look::State::Idle);
-        assert_eq!(server.counts(), chrome::Hint::Counts { working: 0, waiting: 1, idle: 1 });
+        assert_eq!(server.counts(), chrome::Hint::Counts { working: 0, waiting: 1, error: 0, idle: 1 });
         let tab = |server: &Server, i: usize| {
             urgent(
                 server.tabs[i]

@@ -40,12 +40,14 @@ use sheet::{Done, Effect, Env, Key, Person, Said, Sheet, Team};
 pub fn run(state: &Path, client: Option<&str>, nerd: bool, member: Option<&str>, field: Option<&str>) -> Result<()> {
     let mut running = Running::open(state)?;
     let mut sheet = Sheet::new(load(&running, client.is_some()));
+    // What the dashboard saw, if it still looks: a small file, read before the first frame (and before choosing the
+    // member's row: one whose turn failed opens on « Reprendre »).
+    if let Some((states, errors)) = fresh_states(state, board::now()) {
+        sheet.seen(Some(states));
+        sheet.failed(errors);
+    }
     if let Some(member) = member {
         sheet.open_on(member, field.and_then(field_of));
-    }
-    // What the dashboard saw, if it still looks: a small file, read before the first frame.
-    if let Some(states) = fresh_states(state, board::now()) {
-        sheet.seen(Some(states));
     }
     let (send_states, states) = mpsc::channel();
     let (watched, snapshot) = (state.to_path_buf(), running.snapshot.clone());
@@ -77,23 +79,31 @@ fn field_of(name: &str) -> Option<sheet::Fid> {
     }
 }
 
+/// Past this, the menu stops waiting for what a member's mod did with « Reprendre »: `bridge::resumption` always
+/// answers, on its own lapse; this is only a bound, should it not.
+const RESUME_BOUND: Duration = Duration::from_secs(30);
+
 /// How often the menu asks `claude agents --json` itself, the dashboard off.
 const ASK_EVERY: Duration = Duration::from_secs(2);
 
 /// Each member's state and since when.
 type States = HashMap<String, (State, i64)>;
 
-/// What the dashboard last saw, if it saw it lately.
-fn fresh_states(state: &Path, now: i64) -> Option<States> {
+/// The text of the error each member whose turn failed stopped on.
+type Errors = HashMap<String, String>;
+
+/// What the dashboard last saw, if it saw it lately: the states, and the errors of the turns that failed.
+fn fresh_states(state: &Path, now: i64) -> Option<(States, Errors)> {
     let states = board::read_states(state).filter(|states| states.fresh(now))?;
-    Some(states.members.into_iter().map(|(name, m)| (name, (m.state, m.since))).collect())
+    let errors = states.errors.into_iter().collect();
+    Some((states.members.into_iter().map(|(name, m)| (name, (m.state, m.since))).collect(), errors))
 }
 
 /// Keeps the members' states up to date for the menu, on the side: what the dashboard writes, read every half second,
 /// or else `claude agents --json` every two seconds, with since when as this menu has seen them. None when they
 /// cannot be seen: not shown as they were.
-fn watch(state: PathBuf, mut snapshot: Snapshot, send: Sender<Option<States>>) {
-    let mut sent: Option<Option<States>> = None;
+fn watch(state: PathBuf, mut snapshot: Snapshot, send: Sender<Option<(States, Errors)>>) {
+    let mut sent: Option<Option<(States, Errors)>> = None;
     let mut seen: States = HashMap::new();
     let mut asked: Option<Instant> = None;
     loop {
@@ -122,7 +132,7 @@ fn watch(state: PathBuf, mut snapshot: Snapshot, send: Sender<Option<States>>) {
                         states.insert(member.name.clone(), (st, since));
                     }
                     seen = states.clone();
-                    states
+                    (states, Errors::new())
                 }))
             }
             None => None,
@@ -230,6 +240,8 @@ impl Env for Live<'_> {
 
 /// What Claude composing a new agent tells: its process, then what it composed, for request `id`.
 enum News {
+    /// What a member's mod did with « Reprendre ».
+    Resumed(String, sheet::Resuming),
     Started(u64, u32),
     Composed(u64, Result<(String, Member), String>),
 }
@@ -240,7 +252,7 @@ struct Menu<'a> {
     client: Option<&'a str>,
     session: Session,
     painter: Painter,
-    states: Receiver<Option<States>>,
+    states: Receiver<Option<(States, Errors)>>,
     news: (Sender<News>, Receiver<News>),
     composers: Composers,
     start: Instant,
@@ -267,7 +279,9 @@ impl Menu<'_> {
                 }
             }
             while let Ok(states) = self.states.try_recv() {
+                let (states, errors) = states.map_or((None, Errors::new()), |(states, errors)| (Some(states), errors));
                 sheet.seen(states);
+                sheet.failed(errors);
             }
             while let Ok(news) = self.news.1.try_recv() {
                 self.heard(news, Some(sheet));
@@ -387,8 +401,45 @@ impl Menu<'_> {
                 Err(error) => sheet.said = Some(failed(error)),
             },
             Effect::Quit => return Ok(true),
+            Effect::Resume(member) => self.resume(member),
         }
         Ok(false)
+    }
+
+    /// Asks `member`'s mod to send « continue », then waits on the side for what it did (its tick comes every 2 s).
+    fn resume(&mut self, member: String) {
+        let state = self.running.state.clone();
+        let send = self.news.0.clone();
+        std::thread::spawn(move || {
+            let asked = board::now();
+            let how = match bridge::request_resume(&state, &member) {
+                Err(error) => sheet::Resuming::Failed(format!("{error:#}")),
+                Ok(()) => {
+                    let until = Instant::now() + RESUME_BOUND;
+                    loop {
+                        if let Some(done) = bridge::resumption(&state, &member).filter(|done| done.at >= asked) {
+                            break match done {
+                                bridge::Resumption { error: Some(error), .. } => sheet::Resuming::Failed(error),
+                                bridge::Resumption { sent: true, .. } => sheet::Resuming::Sent,
+                                bridge::Resumption { draft: true, .. } => sheet::Resuming::Draft,
+                                _ => sheet::Resuming::Failed(t!(
+                                    "sa session n'a pas dit pourquoi",
+                                    "its session did not say why"
+                                )),
+                            };
+                        }
+                        if Instant::now() >= until {
+                            break sheet::Resuming::Failed(t!(
+                                "pas de réponse de sa session",
+                                "no answer from its session"
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
+            };
+            let _ = send.send(News::Resumed(member, how));
+        });
     }
 
     /// The team read again after a change, the same member chosen (or `select`).
@@ -429,6 +480,11 @@ impl Menu<'_> {
                 self.composers.done(id);
                 if let Some(sheet) = sheet {
                     sheet.composed(id, result);
+                }
+            }
+            News::Resumed(member, how) => {
+                if let Some(sheet) = sheet {
+                    sheet.resumed(&member, how);
                 }
             }
         }
@@ -587,7 +643,7 @@ mod tests {
             r#"{"at": 100, "members": {"dev": {"state": "working", "since": 90}}, "absent": []}"#,
         )
         .unwrap();
-        assert_eq!(fresh_states(dir.path(), 102).unwrap()["dev"], (State::Working, 90));
+        assert_eq!(fresh_states(dir.path(), 102).unwrap().0["dev"], (State::Working, 90));
         assert!(fresh_states(dir.path(), 104).is_none(), "older than 3 s");
         assert!(fresh_states(dir.path(), 97).is_some(), "a little ahead: the clocks of two processes");
         assert!(fresh_states(dir.path(), 96).is_none(), "further ahead than 3 s");

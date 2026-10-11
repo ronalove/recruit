@@ -93,6 +93,8 @@ pub struct PaneState {
     pub status: Option<look::State>,
     /// Since when, in seconds since the epoch.
     pub since: Option<u64>,
+    /// The text of the error its member's turn ended on, while `status` is `Error`.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]

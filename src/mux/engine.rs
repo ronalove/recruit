@@ -193,8 +193,8 @@ pub(crate) enum Relay {
     /// OSC 9;4: progress.
     Progress(Progress),
     /// OSC 7501: what the program says it is doing. Claude Code writes it once its terminal answered
-    /// `OSC 7501 ; ?`, which the engine does: idle, working, blocked (and why), done. The program's own status only:
-    /// those of its tasks (an `id`) are not relayed.
+    /// `OSC 7501 ; ?`, which the engine does: idle, working, blocked (and why), done, failed. The program's own
+    /// status only: those of its tasks (an `id`) are not relayed.
     Status(Status),
 }
 
@@ -226,8 +226,10 @@ pub(crate) enum State {
     Working,
     /// Waiting on the user: a permission, a question.
     Blocked,
-    /// Its turn is over, done or failed.
+    /// Its turn is over, and went well (one that failed is [`State::Error`]).
     Done,
+    /// Its turn ended on an API error (`state=error`, authentication aside): its text in [`Status::message`].
+    Error,
     /// No status any more: the program is leaving, or the component that writes its status went away for a moment.
     Clear,
 }

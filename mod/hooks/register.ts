@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-import type { EngineInterface, Register, RenderElement } from 'claude-code'
+import type { EngineInterface, PromptBox, Register, RenderElement } from 'claude-code'
 
 // recruit's bridge in each member of a team. It decides nothing: it tells recruit what the session knows, serves
 // the commands recruit names, asks the model for the model and effort recruit gives, joins to a prompt the note
-// recruit gives, and does what recruit asks of the session (a completion, a compaction, the context's breakdown),
-// handing the answers over at the next tick. recruit puts it in the members it launches, with RECRUIT_EXE,
+// recruit gives, and does what recruit asks of the session (a completion, a compaction, « continue » after a failed
+// turn, the context's breakdown), handing the answers over at the next tick. recruit puts it in the members it launches, with RECRUIT_EXE,
 // RECRUIT_STATE and RECRUIT_MEMBER; anywhere else it does nothing.
 
 type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
@@ -20,6 +20,8 @@ type Reply = {
   override?: Override
   summarize?: Ask
   compact?: string
+  // « continue » to send, unless the prompt box holds a draft or a turn runs.
+  resume?: string
   // How to count the context's breakdown: estimated by the session, or with the token-count API.
   breakdown?: 'summary' | 'full'
   // What the model reads beside a prompt, the user never sees.
@@ -28,7 +30,9 @@ type Reply = {
 // The answers to what recruit asked, for the next tick.
 type Summary = { id: string; text?: string; error?: string }
 type Compaction = { id: string; done?: boolean; skip?: string; error?: string }
-type Handover = { summary?: Summary; compaction?: Compaction }
+// 'busy' and 'unsupported' are codes recruit says in the user's language.
+type Resumption = { id: string; sent?: boolean; draft?: boolean; error?: string }
+type Handover = { summary?: Summary; compaction?: Compaction; resumption?: Resumption }
 type Bridge = { exe: string; state: string; member: string }
 
 const nothing: RenderElement = { type: 'Box', props: { display: 'none' } }
@@ -124,6 +128,29 @@ async function compact($: EngineInterface, id: string): Promise<Compaction> {
   }
 }
 
+// « continue », as the person would type it to take up a turn that failed, into an empty prompt box only: the box
+// read, then the prompt submitted with no wait in between. A plugin's prompt goes through the engine's queue, never
+// through the box, and would wait for a running turn to end: refused while one runs, before and after the read.
+async function resume($: EngineInterface, id: string, running: () => boolean): Promise<Resumption> {
+  if (running()) return { id, error: 'busy' }
+  let box: PromptBox
+  try {
+    box = await $.prompt.read()
+  } catch (error) {
+    // A Claude Code without the call, said rather than nothing; read never rejects otherwise.
+    return { id, error: error instanceof TypeError ? 'unsupported' : String(error) }
+  }
+  if (box.text.trim()) return { id, draft: true }
+  // A turn the person started while the box was read: « continue » would wait for its end.
+  if (running()) return { id, error: 'busy' }
+  try {
+    const r = await $.prompt.submit({ text: 'continue', asUser: true })
+    return r.drop !== undefined ? { id, error: r.drop } : { id, sent: true }
+  } catch (error) {
+    return { id, error: String(error) }
+  }
+}
+
 // What recruit joins to a prompt, if anything; nothing when it does not answer in time.
 async function submitted($: EngineInterface, bridge: Bridge, text: string, compacted: boolean): Promise<Reply | undefined> {
   try {
@@ -144,6 +171,8 @@ export const register: Register = on => {
   // The conversation's compactions, and how many recruit heard of, with a tick or a prompt.
   let compactions = 0
   let told = 0
+  // The main conversation's turn running, if any.
+  let turn: string | undefined
 
   on('session.start', async ($, e, next) => {
     bridge = await bridgeOf($)
@@ -180,6 +209,10 @@ export const register: Register = on => {
         }
         if (reply.summarize) void summarize($, reply.summarize).then(summary => (handover = { ...handover, summary }))
         if (reply.compact) void compact($, reply.compact).then(compaction => (handover = { ...handover, compaction }))
+        if (reply.resume) {
+          const running = () => turn !== undefined
+          void resume($, reply.resume, running).then(resumption => (handover = { ...handover, resumption }))
+        }
         // The error shown, if any, is over.
         if (failed > 1) $.ui.status(undefined)
         failed = 0
@@ -220,6 +253,16 @@ export const register: Register = on => {
     const r = await next(e)
     if (bridge && !e.agentId && e.trigger !== 'precompute' && r.skip === undefined) compactions += 1
     return r
+  })
+
+  // The main loop's alone: a subagent's run raises no `turn.start`. Every end comes, an API error's too.
+  on('turn.start', async ($, e, next) => {
+    turn = e.turnId
+    return next(e)
+  })
+  on('turn.complete', async ($, e, next) => {
+    if (!e.agentId && e.turnId === turn) turn = undefined
+    return next(e)
   })
 
   on('ui.render', { component: 'PromptHint' }, ($, e, next) => (quiet ? noHint : next(e)))

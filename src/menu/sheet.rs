@@ -94,6 +94,9 @@ pub(crate) enum Pane {
 /// A row of the sheet on the right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fid {
+    /// A member whose turn failed: « continue » sent to it, its prompt left as it is; nothing sent if the prompt holds
+    /// a draft (mock-up C; architect, 2026-10-10).
+    Resume,
     Model,
     Effort,
     Mode,
@@ -371,6 +374,18 @@ pub(crate) enum Effect {
     Detach,
     Stop,
     Quit,
+    /// A member whose turn failed takes up its work: its mod sends « continue », unless its prompt holds a draft.
+    Resume(String),
+}
+
+/// Where « Reprendre » stands for a member: asked, then what its mod did.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Resuming {
+    Asked,
+    Sent,
+    /// Not sent: its prompt holds a draft.
+    Draft,
+    Failed(String),
 }
 
 /// What the sheet asks of the running team, without changing it.
@@ -471,6 +486,10 @@ pub(crate) struct Sheet {
     /// Whether `states` says how things are: a member missing from it then runs no session. Unknown, any member may
     /// be at work.
     pub states_known: bool,
+    /// The text of the error each member whose turn failed stopped on, whole, as its pane gave it.
+    pub errors: HashMap<String, String>,
+    /// « Reprendre » asked for a member, and how it went.
+    pub resuming: Option<(String, Resuming)>,
     pub entry: Entry,
     pub pane: Pane,
     /// The focused row, among those that take the focus.
@@ -496,6 +515,8 @@ impl Sheet {
             team,
             states: HashMap::new(),
             states_known: false,
+            errors: HashMap::new(),
+            resuming: None,
             entry,
             pane: Pane::List,
             row: 0,
@@ -534,16 +555,36 @@ impl Sheet {
     /// Opens on `member`'s sheet, its `field` focused when it has one; the first member as before when it is not in
     /// the team (`recruit _menu --member m --field f`: ⌥r on a member's pane, a click on a header's name, model or
     /// effort in recruit's own multiplexer).
+    /// A member whose turn failed opens on « Reprendre », unless a field is asked for (mock-up C).
     pub(crate) fn open_on(&mut self, member: &str, field: Option<Fid>) {
         let Some(name) = self.team.person(member).map(|p| p.name.clone()) else { return };
         self.entry = Entry::Member(name);
         self.pane = Pane::List;
         self.row = 0;
-        if let Some(row) = field.and_then(|field| self.focusable().iter().position(|f| *f == field)) {
+        if let Some(row) =
+            field.or(Some(Fid::Resume)).and_then(|field| self.focusable().iter().position(|f| *f == field))
+        {
             self.pane = Pane::Sheet;
             self.row = row;
         }
         self.clamp();
+    }
+
+    /// The errors the members whose turn failed stopped on, as last seen.
+    pub(crate) fn failed(&mut self, errors: HashMap<String, String>) {
+        self.errors = errors;
+    }
+
+    /// What `member`'s mod did with « Reprendre ».
+    pub(crate) fn resumed(&mut self, member: &str, how: Resuming) {
+        if self.resuming.as_ref().is_some_and(|(name, _)| name == member) {
+            self.resuming = Some((member.to_string(), how));
+        }
+    }
+
+    /// Whether `name`'s turn failed, as last seen.
+    pub(crate) fn in_error(&self, name: &str) -> bool {
+        self.state(name).is_some_and(|(state, _)| state == State::Error)
     }
 
     /// The states as last seen: None when they cannot be seen (`claude agents` fails, nothing written lately).
@@ -591,7 +632,12 @@ impl Sheet {
         match self.person() {
             Some(p) if p.gone => vec![Some(Fid::Close)],
             Some(p) => {
-                let mut rows = vec![Some(Fid::Model), Some(Fid::Effort), Some(Fid::Mode), None, Some(Fid::Contact)];
+                let mut rows = Vec::new();
+                // Its turn failed: taking up its work first (mock-up C).
+                if self.in_error(&p.name) && p.layers.is_some() {
+                    rows.extend([Some(Fid::Resume), None]);
+                }
+                rows.extend([Some(Fid::Model), Some(Fid::Effort), Some(Fid::Mode), None, Some(Fid::Contact)]);
                 // A contact is in the first tab, whatever its own.
                 if !p.contact {
                     rows.push(Some(Fid::Tab));
@@ -747,6 +793,17 @@ impl Sheet {
         if let Some((setting, layered)) = self.setting(fid) {
             return layered.value.as_deref().map_or_else(|| setting.nobody(p), |v| setting.label(v));
         }
+        if fid == Fid::Resume {
+            return match self.resuming.as_ref().filter(|(name, _)| *name == p.name).map(|(_, how)| how) {
+                None => t!("lui envoyer « continue »", "send it “continue”"),
+                Some(Resuming::Asked) => t!("envoi de « continue »…", "sending “continue”…"),
+                Some(Resuming::Sent) => t!("« continue » envoyé", "“continue” sent"),
+                Some(Resuming::Draft) => {
+                    t!("pas envoyé : sa saisie contient du texte", "not sent: its prompt holds a draft")
+                }
+                Some(Resuming::Failed(error)) => t!("pas envoyé : {}", "not sent: {}", error),
+            };
+        }
         let Some(layers) = &p.layers else { return String::new() };
         match fid {
             Fid::Contact if p.contact => t!("oui", "yes"),
@@ -815,6 +872,10 @@ impl Sheet {
             return Some(format!("{default} · {when}"));
         }
         Some(match fid {
+            Fid::Resume => t!(
+                "Lui envoie « continue » ; il reprend où il s'est arrêté. Rien n'est envoyé si sa saisie contient du texte.",
+                "Sends it “continue”; it picks up where it stopped. Nothing is sent if its prompt holds a draft."
+            ),
             Fid::Contact => {
                 let default = p
                     .and_then(|p| p.layers.as_ref())
@@ -1124,6 +1185,15 @@ impl Sheet {
             return self.apply_choice(fid, &choice, env);
         }
         match fid {
+            Fid::Resume => {
+                let name = self.name();
+                // Once asked, not again while its mod has not answered.
+                if self.resuming.as_ref().is_some_and(|(asked, how)| *asked == name && *how == Resuming::Asked) {
+                    return Vec::new();
+                }
+                self.resuming = Some((name.clone(), Resuming::Asked));
+                return vec![Effect::Resume(name)];
+            }
             Fid::Model | Fid::Effort | Fid::Mode | Fid::Tab | Fid::Contact | Fid::Builtin => {
                 let items = self.choices(fid, true);
                 if items.is_empty() {
@@ -2080,6 +2150,42 @@ mod tests {
         let mut s = sheet();
         s.open_on("nobody", Some(Fid::Model));
         assert_eq!((s.entry.clone(), s.pane), (Entry::Member("coordinateur".into()), Pane::List));
+    }
+
+    /// A member whose turn failed (mock-up C): « Reprendre » first on its sheet, chosen when the menu opens on it;
+    /// ⏎ asks its mod once, then says what it did.
+    #[test]
+    fn resuming_a_failed_turn() {
+        let mut sheet = sheet();
+        sheet.states.insert("dev".into(), (State::Error, 100));
+        sheet.open_on("dev", None);
+        assert_eq!((sheet.pane, sheet.field()), (Pane::Sheet, Some(Fid::Resume)));
+        assert_eq!(sheet.value(Fid::Resume), t!("lui envoyer « continue »", "send it “continue”"));
+        assert!(sheet.hint().is_some_and(|hint| hint.contains("continue")));
+        assert_eq!(sheet.key(Key::Enter, &quiet()), [Effect::Resume("dev".into())]);
+        // Asked: not again until its mod answers.
+        assert!(sheet.key(Key::Enter, &quiet()).is_empty());
+        assert_eq!(sheet.value(Fid::Resume), t!("envoi de « continue »…", "sending “continue”…"));
+        sheet.resumed("dev", Resuming::Draft);
+        assert_eq!(
+            sheet.value(Fid::Resume),
+            t!("pas envoyé : sa saisie contient du texte", "not sent: its prompt holds a draft")
+        );
+        sheet.resumed("ops", Resuming::Sent);
+        assert_eq!(sheet.resuming, Some(("dev".into(), Resuming::Draft)));
+        assert_eq!(sheet.key(Key::Enter, &quiet()), [Effect::Resume("dev".into())]);
+        sheet.resumed("dev", Resuming::Sent);
+        assert_eq!(sheet.value(Fid::Resume), t!("« continue » envoyé", "“continue” sent"));
+        // A field asked for comes first; another member has no such row.
+        sheet.open_on("dev", Some(Fid::Model));
+        assert_eq!(sheet.field(), Some(Fid::Model));
+        sheet.open_on("ops", None);
+        assert_eq!(sheet.pane, Pane::List);
+        assert!(!sheet.focusable().contains(&Fid::Resume));
+        // Back at work: the row goes.
+        sheet.states.insert("dev".into(), (State::Working, 200));
+        sheet.choose(Entry::Member("dev".into()));
+        assert!(!sheet.focusable().contains(&Fid::Resume));
     }
 
     #[test]

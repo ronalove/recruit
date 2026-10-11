@@ -372,6 +372,9 @@ pub(crate) struct PaneInfo {
     /// Since when it is in that state, in seconds since the epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<u64>,
+    /// What its program said of a failed turn (`status` `error`): the error's text, whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// What [`Request::Stats`] gives.
@@ -691,11 +694,17 @@ mod tests {
             rows: 24,
             status: Some("working".into()),
             since: Some(7),
+            error: None,
         };
         let older = r#"{"id":"p1","member":"dev","role":"","tab":"Agents","pid":42,"cols":80,"rows":24}"#;
         assert_eq!(json(&pane), older.replace('}', r#","status":"working","since":7}"#));
         assert_eq!(json(&PaneInfo { status: None, since: None, ..pane.clone() }), older);
-        assert_eq!(read::<PaneInfo>(older), PaneInfo { status: None, since: None, ..pane });
+        assert_eq!(read::<PaneInfo>(older), PaneInfo { status: None, since: None, ..pane.clone() });
+        // A failed turn: its text whole, absent otherwise (above).
+        let failed = PaneInfo { status: Some("error".into()), error: Some("API Error: 529".into()), ..pane };
+        let said = older.replace('}', r#","status":"error","since":7,"error":"API Error: 529"}"#);
+        assert_eq!(json(&failed), said);
+        assert_eq!(read::<PaneInfo>(&said), failed);
         // A field a later version adds: the sheet, on its first field.
         assert_eq!(
             read::<Request>(r#"{"open_menu":{"member":"dev","field":"color"}}"#),

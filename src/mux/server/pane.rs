@@ -203,8 +203,19 @@ pub(super) struct Pane {
     /// Since when it is in that state, as its header shows it (waiting, working, at rest), in seconds since the
     /// epoch; `None` until its program says it.
     pub since: Option<u64>,
+    /// Its member's turn failed (`state` `Error`): why, until its program says another state.
+    pub error: Option<TurnError>,
     /// Bytes its programs wrote since it opened, for `_ctl stats`.
     pub read: Arc<AtomicU64>,
+}
+
+/// Why a member's turn failed, as its program said it (OSC 7501 `state=error`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TurnError {
+    /// The error's text, whole, as its program sent it.
+    pub message: Option<String>,
+    /// Short, for its header (`look::error_label`).
+    pub label: String,
 }
 
 /// What a pane's threads share with the loop.
@@ -250,6 +261,7 @@ impl Pane {
             gate: Arc::clone(&wires.gate),
             state: None,
             since: None,
+            error: None,
             read,
         })
     }
@@ -271,6 +283,7 @@ impl Pane {
         self.failures.clear();
         self.state = None;
         self.since = None;
+        self.error = None;
         Ok(())
     }
 

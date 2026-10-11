@@ -159,6 +159,8 @@ struct Sessions {
     /// The states the members' panes tell (OSC 7501), and since when in seconds since the epoch: they come before
     /// `claude agents`, which says them only once asked.
     told: HashMap<String, (State, Option<u64>)>,
+    /// The text of the error each member's turn failed on, as its pane last said it (OSC 7501 `state=error`).
+    failed: HashMap<String, String>,
     /// Until `claude agents` first answers: the states file as it was, whose exact addresses, sessions and processes
     /// are written again rather than emptied (a dashboard started again would change the team's note for a second).
     kept: Option<Box<States>>,
@@ -179,6 +181,15 @@ const AGENTS_EVERY: Duration = Duration::from_secs(5);
 fn told(panes: Option<&[backend::PaneState]>) -> HashMap<String, (State, Option<u64>)> {
     let members = panes.unwrap_or_default().iter().filter(|pane| pane.role.is_empty());
     members.filter_map(|pane| Some((pane.member.clone(), (pane.status?, pane.since)))).collect()
+}
+
+/// The text of the error each member's pane says its turn failed on, by name.
+fn failed(panes: Option<&[backend::PaneState]>) -> HashMap<String, String> {
+    let members = panes.unwrap_or_default().iter().filter(|pane| pane.role.is_empty());
+    members
+        .filter(|pane| pane.status == Some(State::Error))
+        .filter_map(|p| Some((p.member.clone(), p.error.clone()?)))
+        .collect()
 }
 
 /// A member whose pane says it is at rest may have a command still running (its pane says `idle` then, its session's
@@ -348,6 +359,8 @@ struct Card {
     helpers: Vec<Helper>,
     /// At rest while a command it started still runs.
     shell: bool,
+    /// Its turn failed (`State::Error`): why, short (`look::error_label`), and the error's text as its pane gave it.
+    failed: Option<(String, Option<String>)>,
 }
 
 /// What the dashboard draws.
@@ -422,7 +435,8 @@ fn dashboard(first: &Snapshot, state: &Path) -> Result<()> {
                     last = found;
                 }
                 let panes = backend.panes(&s.session).ok();
-                let mut sessions = Sessions { told: told(panes.as_deref()), ..last.clone() };
+                let (told, failed) = (told(panes.as_deref()), failed(panes.as_deref()));
+                let mut sessions = Sessions { told, failed, ..last.clone() };
                 eager.store(s.members.iter().any(|m| !sessions.told.contains_key(&m.name)), Ordering::Relaxed);
                 with_a_command(&mut sessions, |pid| claude::session_status(s.config_dir.as_deref(), pid));
                 if sender.send((s.clone(), (sessions, Glyphs::of(&clients())))).is_err() {
@@ -530,6 +544,11 @@ impl Memory {
             refs: BTreeMap::new(),
             sessions: BTreeMap::new(),
             pids: BTreeMap::new(),
+            errors: board
+                .cards
+                .iter()
+                .filter_map(|card| Some((card.name.clone(), card.failed.as_ref()?.1.clone()?)))
+                .collect(),
         }
     }
 
@@ -608,6 +627,10 @@ impl Memory {
                 samples: samples.iter().copied().collect(),
                 helpers,
                 shell: sessions.shell.contains_key(&member.name),
+                failed: (st == State::Error).then(|| {
+                    let text = sessions.failed.get(&member.name);
+                    (look::error_label(text.map(String::as_str)), text.cloned())
+                }),
             });
         }
         // Those no longer in the team, forgotten; but for a while those whose session may come back under another name.
@@ -867,6 +890,10 @@ pub struct States {
     /// Every session open on this machine by its process, members or not: the names messages go to, for the journal.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pids: BTreeMap<u32, String>,
+    /// The text of the error each member in `State::Error` failed on, whole: for the menu, which shows it on top of
+    /// the member's sheet.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub errors: BTreeMap<String, String>,
 }
 
 /// A member's session in [`States::sessions`].
@@ -1218,7 +1245,15 @@ fn section(c: &Card) -> usize {
 fn ordered(cards: &[Card]) -> Vec<&Card> {
     let mut list: Vec<&Card> = cards.iter().collect();
     list.sort_by_key(|c| match section(c) {
-        1 => (1, u64::from(c.state != State::Waiting)),
+        // Waiting for the user, then failed, then at work (mock-up C).
+        1 => (
+            1,
+            match c.state {
+                State::Waiting => 0,
+                State::Error => 1,
+                _ => 2,
+            },
+        ),
         2 => (2, c.since),
         s => (s, 0),
     });
@@ -1383,7 +1418,7 @@ fn arrange<'a>(list: &[&'a Card], width: usize, room: usize) -> Layout<'a> {
     // What the members do first, without the agents their sessions started: those of a card would take the room of
     // what the next ones do. Across the pane, a card that says nothing more than beside another: it waits for the
     // names.
-    let plain = |i: usize| list[i].doing.is_none();
+    let plain = |i: usize| list[i].doing.is_none() && list[i].failed.is_none();
     let beside = |i: usize| ladders[i].iter().position(|f| matches!(f, Form::Card { half: true, .. }));
     let bare =
         |i: usize| ladders[i].iter().position(|f| matches!(f, Form::Card { helpers: Helpers::Left, .. })).unwrap_or(0);
@@ -1493,15 +1528,15 @@ fn name_in(c: &Card, room: usize, time: usize) -> String {
 
 /// At rest, or in a state the dashboard does not know: the card fades.
 fn resting(c: &Card) -> bool {
-    !matches!(c.state, State::Working | State::Waiting)
+    !matches!(c.state, State::Working | State::Waiting | State::Error)
 }
 
 /// The context's field, at the right of the curve: `⟳ 88 %` for a member at rest, which a click compacts.
 const CONTEXT: usize = 7;
 
-/// How many columns of a card's context a click compacts the member on: at rest, its context known.
+/// How many columns of a card's context a click compacts the member on: at rest or its turn failed, its context known.
 fn compaction_cells(c: &Card) -> Option<usize> {
-    let percent = c.context.filter(|_| c.state == State::Idle)?;
+    let percent = c.context.filter(|_| matches!(c.state, State::Idle | State::Error))?;
     Some(2 + format!("{percent:.0} %").chars().count())
 }
 
@@ -1520,13 +1555,13 @@ fn card(c: &Card, width: usize, lines: usize, helpers: Helpers, right: &Right, b
     let helpers = helpers_drawn(c, helpers, width.saturating_sub(4), b);
     let height = 2 + doing.len() + helpers.len();
     let color = c.state.color();
-    let line = if c.state == State::Waiting { Paint::Bold(color) } else { Paint::Color(color) };
+    let line = if matches!(c.state, State::Waiting | State::Error) { Paint::Bold(color) } else { Paint::Color(color) };
     // From halfway down the first line to halfway down the last: two cards never touch.
     let bar = |row: usize| (look::stroke(row, height).to_string(), line);
-    let faded = resting(c);
     let (sign, name, time) = match c.state {
         State::Working => (Paint::Color(color), Paint::Bold(c.color), Paint::Plain),
         State::Waiting => (Paint::Color(color), Paint::Bold(c.color), Paint::Color(color)),
+        State::Error => (Paint::Bold(color), Paint::Bold(c.color), Paint::Color(color)),
         _ => (Paint::Dim, Paint::Faint(c.color), Paint::Dim),
     };
 
@@ -1537,7 +1572,12 @@ fn card(c: &Card, width: usize, lines: usize, helpers: Helpers, right: &Right, b
     let mut title = vec![
         bar(0),
         (" ".into(), Paint::Plain),
-        (if c.shell { b.glyphs.console() } else { c.state.icon(b.glyphs, b.frame) }.to_string(), sign),
+        // A failed turn says more than a command running.
+        (
+            if c.shell && c.state != State::Error { b.glyphs.console() } else { c.state.icon(b.glyphs, b.frame) }
+                .to_string(),
+            sign,
+        ),
         (" ".into(), Paint::Plain),
         (shown, name),
         (" ".repeat(gap), Paint::Plain),
@@ -1550,8 +1590,7 @@ fn card(c: &Card, width: usize, lines: usize, helpers: Helpers, right: &Right, b
     title.push((" ".into(), Paint::Plain));
 
     let mut out = vec![painted(&title, width)];
-    let paint = if faded { Paint::Dim } else { Paint::Plain };
-    for (i, text) in doing.into_iter().enumerate() {
+    for (i, (text, paint)) in doing.into_iter().enumerate() {
         // As wide as the card, for the one on its right.
         let pad = " ".repeat(width.saturating_sub(4 + text.chars().count()));
         out.push(painted(&[bar(1 + i), ("   ".into(), Paint::Plain), (text, paint), (pad, Paint::Plain)], width));
@@ -1668,11 +1707,22 @@ fn plural(n: usize) -> &'static str {
     if n > 1 { "s" } else { "" }
 }
 
-/// What the member does, over at most `lines` lines of a card `width` wide: the task in progress; at rest, the task
-/// done after ✓, the lines after the first under its text; in a state the dashboard does not know, the task as it
-/// was. Nothing before the model has said.
-fn doing_lines(c: &Card, width: usize, lines: usize) -> Vec<String> {
+/// What the member does, over at most `lines` lines of a card `width` wide, each in its paint: the task in progress;
+/// at rest, the task done after ✓, faded, the lines after the first under its text; in a state the dashboard does not
+/// know, the task as it was. Nothing before the model has said. Its turn failed: « Tour raté : API surchargée (529) »
+/// in orange, then the task it stopped in, after ↳, faded (mock-up C).
+fn doing_lines(c: &Card, width: usize, lines: usize) -> Vec<(String, Paint)> {
+    if let Some((label, _)) = &c.failed {
+        let room = width.saturating_sub(5);
+        let mut out =
+            vec![(fit(&t!("Tour raté : {}", "Turn failed: {}", label), room), Paint::Color(State::Error.color()))];
+        if let Some(task) = c.doing.as_ref().filter(|task| lines > 1 && !task.now.trim().is_empty()) {
+            out.push((fit(&format!("↳ {}", task.now), room), Paint::Dim));
+        }
+        return out;
+    }
     let Some(task) = &c.doing else { return Vec::new() };
+    let paint = if resting(c) { Paint::Dim } else { Paint::Plain };
     let (mark, text) = match &task.done {
         Some(done) if c.state == State::Idle => ("✓ ", done),
         _ if c.state == State::Idle => ("✓ ", &task.now),
@@ -1683,6 +1733,7 @@ fn doing_lines(c: &Card, width: usize, lines: usize) -> Vec<String> {
         .into_iter()
         .enumerate()
         .map(|(i, line)| if i == 0 { format!("{mark}{line}") } else { format!("{}{line}", " ".repeat(indent)) })
+        .map(|line| (line, paint))
         .collect()
 }
 
@@ -2045,10 +2096,12 @@ pub(crate) fn looks(state: &Path) -> BTreeMap<String, MemberLook> {
                 effort: effort.filter(|e| bridge::EFFORTS.contains(&e.as_str())),
                 context: percent,
                 pressure: Pressure::of(context.and_then(|c| c.tokens), report.compacts_at()),
-                compactable: percent.is_some() && state_seen.is_some_and(|s| s.state == State::Idle),
+                compactable: percent.is_some()
+                    && state_seen.is_some_and(|s| matches!(s.state, State::Idle | State::Error)),
                 since: seen.map(|s| s.since),
                 state: state_seen.map(|s| s.state),
-                shell: state_seen.is_some_and(|s| s.shell),
+                // A failed turn says more than a command running.
+                shell: state_seen.is_some_and(|s| s.shell && s.state != State::Error),
             };
             (member.name.clone(), look)
         })
@@ -2265,6 +2318,7 @@ mod tests {
             samples: (0..600).map(|i| (1000 - i, i % 3 == 0)).collect(),
             helpers: Vec::new(),
             shell: false,
+            failed: None,
         }
     }
 
@@ -3197,6 +3251,7 @@ mod tests {
             window: "Agents".into(),
             status,
             since,
+            error: None,
         };
         let at = now() as u64;
         let panes = [
@@ -3260,6 +3315,77 @@ mod tests {
         save_states(state.path(), &states(now() - 60)).unwrap();
         let look = &looks(state.path())["dev"];
         assert_eq!((look.state, look.shell, look.compactable, look.since), (None, false, false, Some(90)));
+    }
+
+    /// A member whose turn failed (mock-up C): its card after those waiting and before those at work, an orange
+    /// capsule, ✗, « Tour raté : <raison> » then the task it stopped in after ↳, faded; its context compactable; the
+    /// error's text written for the menu, the reason read from its pane's error.
+    #[test]
+    fn a_failed_turn_on_its_card() {
+        let label = look::error_label(Some("API Error: 529 overloaded"));
+        let failed = Card {
+            doing: Some(Task { now: "Encodeur des touches kitty".into(), done: None }),
+            failed: Some((label.clone(), Some("API Error: 529 overloaded".into()))),
+            ..sample_card("dev-saisie", false, State::Error)
+        };
+        let cards = vec![
+            sample_card("dev-terminal", false, State::Working),
+            failed.clone(),
+            sample_card("testeur", false, State::Waiting),
+        ];
+        assert_eq!(
+            ordered(&cards).iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["testeur", "dev-saisie", "dev-terminal"]
+        );
+        let b = board(vec![failed.clone()]);
+        let right = Right::of([(&failed, 60)]);
+        let lines = card(&failed, 60, 2, Helpers::Left, &right, &b);
+        let text: Vec<String> = lines.iter().map(Line::text).collect();
+        assert!(text[0].starts_with("╻ ✗ dev-saisie"), "{text:#?}");
+        assert_eq!(text[1].trim_end(), format!("┃   {}", t!("Tour raté : {}", "Turn failed: {}", label)));
+        assert_eq!(text[2].trim_end(), "┃   ↳ Encodeur des touches kitty");
+        assert!(text[3].ends_with(" ⟳ 41 % "), "{text:#?}");
+        let orange = Paint::Color(State::Error.color());
+        assert_eq!(lines[0].0[0], ("╻".to_string(), Paint::Bold(State::Error.color())));
+        assert!(
+            lines[1]
+                .0
+                .iter()
+                .any(|(text, paint)| text.starts_with(&t!("Tour raté", "Turn failed")) && *paint == orange)
+        );
+        assert!(lines[2].0.iter().any(|(text, paint)| text.starts_with('↳') && *paint == Paint::Dim));
+        // On one line: the reason only. With a command still running: the failure's sign.
+        let one = card(&failed, 60, 1, Helpers::Left, &right, &b);
+        assert_eq!(one.len(), 3);
+        let busy = Card { shell: true, ..failed.clone() };
+        assert!(card(&busy, 60, 0, Helpers::Left, &right, &b)[0].text().starts_with("╻ ✗"));
+
+        // The states for the menu: the error's text.
+        let mut memory = Memory::default();
+        memory.since.insert("dev-saisie".into(), (State::Error, Instant::now()));
+        let states = memory.states(&b, SystemTime::now(), Instant::now());
+        assert_eq!(states.members["dev-saisie"].state, State::Error);
+        assert_eq!(states.errors["dev-saisie"], "API Error: 529 overloaded");
+
+        // From the panes: the state and the error's text.
+        let pane = backend::PaneState {
+            id: "%1".into(),
+            member: "dev-saisie".into(),
+            role: String::new(),
+            window: "Moteur".into(),
+            status: Some(State::Error),
+            since: Some(now() as u64 - 240),
+            error: Some("API Error: 529 overloaded".into()),
+        };
+        let sessions = Sessions {
+            told: told(Some(std::slice::from_ref(&pane))),
+            failed: super::failed(Some(std::slice::from_ref(&pane))),
+            ..Default::default()
+        };
+        let state = tempfile::tempdir().unwrap();
+        let seen = Memory::default().board(&snapshot(&["dev-saisie"]), state.path(), &sessions);
+        assert_eq!(seen.cards[0].failed, Some((label, Some("API Error: 529 overloaded".into()))));
+        assert!((240..243).contains(&seen.cards[0].since));
     }
 
     #[test]
@@ -3711,6 +3837,14 @@ mod tests {
             Board { glyphs: Glyphs::Nerd, ..board(long) },
             board(many),
             Board { error: Some("claude agents: boom".into()), usage: Vec::new(), ..board(Vec::new()) },
+            board(vec![
+                Card {
+                    failed: Some((look::error_label(Some("API Error: 529")), None)),
+                    doing: Some(Task { now: "Encodeur des touches kitty".into(), done: None }),
+                    ..sample_card("dev-saisie", false, State::Error)
+                },
+                sample_card("dev-terminal", false, State::Working),
+            ]),
         ];
         let s = snapshot(&["coordinateur", "dev-cli"]);
         let failed = std::sync::Mutex::new(Vec::new());

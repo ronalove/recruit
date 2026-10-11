@@ -92,9 +92,11 @@ pub(crate) fn draw(sheet: &Sheet, look: &Look, width: usize, height: usize) -> D
     d.c.hline(0, bottom, width, '─', muted());
     d.c.put(split, bottom, "┴", muted());
     d.list(split, 2, bottom);
-    let hint_row = bottom - 1;
+    // The hint under the sheet, on two rows when it needs them (« Reprendre » explains what it writes).
+    let hint = d.hint_rows(width - 1 - (split + 2 + 2));
+    let hint_row = bottom - hint.len().max(1);
     d.sheet_rows(split + 1, 2, width, hint_row);
-    d.hint(split + 2, hint_row, width - 1);
+    d.hint(&hint, split + 2, hint_row, width - 1);
     d.message(bottom + 1, &said);
     if d.wide {
         d.buttons(height - 2, width);
@@ -108,6 +110,43 @@ pub(crate) fn draw(sheet: &Sheet, look: &Look, width: usize, height: usize) -> D
         _ => {}
     }
     Drawn { canvas: d.c, zones: d.zones, split }
+}
+
+/// The rows a member's sheet shows above its fields: its role and the blank under it, a failed turn (its title, its
+/// error, a blank), what it is gone and a blank.
+struct Room {
+    role: usize,
+    role_gap: usize,
+    failed: usize,
+    error: usize,
+    error_gap: usize,
+    gone: usize,
+    gone_gap: usize,
+}
+
+impl Room {
+    fn used(&self) -> usize {
+        self.role + self.role_gap + self.failed + self.error + self.error_gap + self.gone + self.gone_gap
+    }
+
+    /// Down to `rows` rows, giving way in turn: the blank under the error, the error from its end, the blank under
+    /// what it is gone, that text from its end, the blank under the role, the role from its end. The failed turn's
+    /// title stays.
+    fn fit(&mut self, rows: usize) {
+        let order: [fn(&mut Room) -> &mut usize; 6] = [
+            |r| &mut r.error_gap,
+            |r| &mut r.error,
+            |r| &mut r.gone_gap,
+            |r| &mut r.gone,
+            |r| &mut r.role_gap,
+            |r| &mut r.role,
+        ];
+        for part in order {
+            while self.used() > rows && *part(self) > 0 {
+                *part(self) -= 1;
+            }
+        }
+    }
 }
 
 struct Drawer<'a> {
@@ -140,7 +179,7 @@ impl Drawer<'_> {
         }
         // The members by state, as at the top of the dashboard.
         let mut counts: Vec<(State, usize)> = Vec::new();
-        for state in [State::Working, State::Waiting, State::Idle] {
+        for state in [State::Working, State::Waiting, State::Error, State::Idle] {
             let n = self
                 .sheet
                 .team
@@ -148,7 +187,10 @@ impl Drawer<'_> {
                 .iter()
                 .filter(|p| self.sheet.state(&p.name).map(|(s, _)| s) == Some(state))
                 .count();
-            counts.push((state, n));
+            // A failed turn, only while there is one.
+            if state != State::Error || n > 0 {
+                counts.push((state, n));
+            }
         }
         if self.sheet.states.is_empty() {
             return;
@@ -258,11 +300,12 @@ impl Drawer<'_> {
         self.c.put(1, y, look::stroke(0, 2), Style::fg(color));
         self.c.put(1, y + 1, look::stroke(1, 2), Style::fg(color));
         if let Some((s, _)) = state {
-            let sign = if s == State::Waiting { Style::fg(color).bold() } else { Style::fg(color) };
+            let sign =
+                if matches!(s, State::Waiting | State::Error) { Style::fg(color).bold() } else { Style::fg(color) };
             self.c.put(3, y, &s.icon(self.look.glyphs, self.look.frame).to_string(), sign);
         }
         let name_style = match state.map(|(s, _)| s) {
-            Some(State::Working | State::Waiting) => Style::fg(p.color).bold(),
+            Some(State::Working | State::Waiting | State::Error) => Style::fg(p.color).bold(),
             Some(_) => Style::fg(p.color).dim(),
             None => Style::fg(p.color),
         };
@@ -330,12 +373,56 @@ impl Drawer<'_> {
                 }
                 y += 1;
                 let role = p.layers.as_ref().map_or(p.role.as_str(), |l| l.role.value.as_str());
-                let lines = if self.wide { 2 } else { 1 };
-                for line in wrap(role.trim(), right - x0, lines) {
+                // Its turn failed: since when, and the error whole, as Claude Code gave it (mock-up C).
+                let failed = sheet.state(&p.name).filter(|(state, _)| *state == State::Error);
+                let error = match (failed, sheet.errors.get(&p.name)) {
+                    (Some(_), Some(error)) => {
+                        paragraphs(error, right.saturating_sub(x0 + 2), if self.wide { 2 } else { 1 })
+                    }
+                    _ => Vec::new(),
+                };
+                let gone = if p.gone {
+                    let text = t!(
+                        "« {} » n'est plus dans les fichiers de l'équipe, mais son panneau tourne encore.",
+                        "\"{}\" is no longer in the team's files, but its pane still runs.",
+                        p.name
+                    );
+                    wrap(&text, right - x0, 3)
+                } else {
+                    Vec::new()
+                };
+                // What shows above the rows, and what gives way first so that the focused row always shows: the
+                // blank under the error, the error's text from its end, the blank under what it is gone, its text,
+                // the blank under the role, the role from its end (designer, 2026-10-10).
+                let mut room = Room {
+                    role: if self.wide { 2 } else { 1 },
+                    role_gap: 1,
+                    failed: usize::from(failed.is_some()),
+                    error: error.len(),
+                    error_gap: usize::from(failed.is_some()),
+                    gone: gone.len(),
+                    gone_gap: usize::from(p.gone),
+                };
+                let typing_error = matches!(&sheet.overlay, Overlay::Typing(t) if t.error.is_some()) as usize;
+                let below = if sheet.rows().is_empty() { 0 } else { 1 + typing_error };
+                room.fit(last.saturating_sub(y + below));
+                for line in wrap(role.trim(), right - x0, room.role.max(1)).into_iter().take(room.role) {
                     self.c.put(x0, y, &line, Style::PLAIN);
                     y += 1;
                 }
-                y = top + 1 + lines + 1;
+                y = top + 1 + room.role + room.role_gap;
+                if let Some((_, since)) = failed {
+                    let ago = look::duration(self.look.now.saturating_sub(since).max(0) as u64);
+                    let orange = Style::fg(State::Error.color()).bold();
+                    let x = self.c.put(x0, y, &State::Error.icon(self.look.glyphs, 0).to_string(), orange);
+                    self.c.put_in(x + 1, y, right, &t!("Tour raté il y a {}", "Turn failed {} ago", ago), orange);
+                    y += 1;
+                    for line in error.iter().take(room.error) {
+                        self.c.put_in(x0 + 2, y, right, line, muted());
+                        y += 1;
+                    }
+                    y += room.error_gap;
+                }
                 // The team's files do not read: what it runs with, and nothing to change.
                 if self.sheet.team.unreadable.is_some() {
                     self.c.put(x0, y, &t!("Modèle", "Model"), muted());
@@ -357,18 +444,11 @@ impl Drawer<'_> {
                         self.c.put(x0, y + 3 + i, &line, muted());
                     }
                 }
-                if p.gone {
-                    let text = t!(
-                        "« {} » n'est plus dans les fichiers de l'équipe, mais son panneau tourne encore.",
-                        "\"{}\" is no longer in the team's files, but its pane still runs.",
-                        p.name
-                    );
-                    for line in wrap(&text, right - x0, 3) {
-                        self.c.put(x0, y, &line, Style::PLAIN);
-                        y += 1;
-                    }
+                for line in gone.iter().take(room.gone) {
+                    self.c.put(x0, y, line, Style::PLAIN);
                     y += 1;
                 }
+                y += room.gone_gap;
             }
             None => {
                 self.c.put(x0, y, &t!("Nouvel agent", "New agent"), Style::PLAIN.bold());
@@ -573,9 +653,9 @@ impl Drawer<'_> {
         }
     }
 
-    /// The line under the sheet: where the value comes from in a narrow window, what « default » gives, when a change
-    /// takes effect.
-    fn hint(&mut self, x: usize, y: usize, end: usize) {
+    /// The line under the sheet, cut between words over two rows at most, `room` columns wide: where the value comes
+    /// from in a narrow window, what « default » gives, when a change takes effect.
+    fn hint_rows(&self, room: usize) -> Vec<String> {
         let sheet = self.sheet;
         let mut text = sheet.hint().unwrap_or_default();
         if !self.wide
@@ -585,10 +665,17 @@ impl Drawer<'_> {
             text = if text.is_empty() { origin } else { format!("{origin} · {text}") };
         }
         if text.is_empty() {
-            return;
+            return Vec::new();
         }
-        let x = self.c.put(x, y, "↳ ", muted());
-        self.c.put_in(x, y, end, &fit(&text, end.saturating_sub(x)), muted());
+        wrap(&text, room.max(1), 2)
+    }
+
+    /// The hint's `rows` from row `y`, after « ↳ », the second under the first's text.
+    fn hint(&mut self, rows: &[String], x: usize, y: usize, end: usize) {
+        for (i, row) in rows.iter().enumerate() {
+            let at = if i == 0 { self.c.put(x, y, "↳ ", muted()) } else { x + 2 };
+            self.c.put_in(at, y + i, end, row, muted());
+        }
     }
 
     /// What the last change said, on rows of the screen's width: three at most, the last one cut.
@@ -853,12 +940,14 @@ fn state_word(state: State) -> String {
         State::Working => t!("au travail", "at work"),
         State::Waiting => t!("en attente", "waiting"),
         State::Idle => t!("au repos", "at rest"),
+        State::Error => t!("en erreur", "failed"),
         State::Other => t!("état inconnu", "unknown state"),
     }
 }
 
 fn label(fid: Fid) -> String {
     match fid {
+        Fid::Resume => t!("Reprendre", "Resume"),
         Fid::Model => t!("Modèle", "Model"),
         Fid::Effort => t!("Effort", "Effort"),
         Fid::Mode => t!("Permission", "Permission"),
@@ -892,6 +981,25 @@ fn action_label(action: Action, dashboard: bool, long: bool) -> String {
         (Action::Stop, true) => t!("Quitter", "Quit"),
         (Action::Stop, false) => t!("quitter", "quit"),
     }
+}
+
+/// `text` over at most `lines` rows of `width` columns: cut at its own line breaks, then between words, its tabs as
+/// blanks; the last row ends with « … » when the text goes on. For a text from elsewhere, an error as Claude Code gave
+/// it.
+fn paragraphs(text: &str, width: usize, lines: usize) -> Vec<String> {
+    let text = text.replace('\t', " ");
+    let mut rows: Vec<String> = Vec::new();
+    for paragraph in text.lines().map(str::trim).filter(|p| !p.is_empty()) {
+        rows.extend(wrap(paragraph, width, usize::MAX));
+    }
+    if rows.len() > lines {
+        rows.truncate(lines);
+        if let Some(last) = rows.last_mut() {
+            // « … » after it, or in place of its end when the row is full.
+            *last = if columns(last) < width { format!("{last}…") } else { fit(&format!("{last}…"), width) };
+        }
+    }
+    rows
 }
 
 /// `text` on rows of `width` columns at most, broken between words, `lines` at most (the last one cut with « … »).
@@ -1135,6 +1243,90 @@ mod tests {
         let y = text.iter().position(|r| r.contains("⚑ « ops »") || r.contains("⚑ \"ops\"")).expect("the waiting line");
         let x = text[y].find('⚑').map(|b| text[y][..b].chars().count()).unwrap();
         assert_eq!(drawn.canvas.style(x, y).fg, Some(Color::Red));
+    }
+
+    /// A member whose turn failed (mock-up C): ✗ in orange in the list; on its sheet, since when and the error whole,
+    /// cut at its own line breaks then between words, then « Reprendre » chosen.
+    #[test]
+    fn a_failed_turn_on_its_sheet() {
+        let mut s = sheet();
+        s.states.insert("dev-cli".into(), (State::Error, 760));
+        let error =
+            "API Error: 529\n{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}";
+        s.failed([("dev-cli".to_string(), error.to_string())].into());
+        s.open_on("dev-cli", None);
+        let drawn = draw(&s, &look(), 100, 30);
+        let text = rows(&drawn);
+        let failed = t!("Tour raté il y a {}", "Turn failed {} ago", "4m");
+        let y = text.iter().position(|r| r.contains(&failed)).expect("the failure");
+        let x = text[y].find('✗').map(|b| text[y][..b].chars().count()).unwrap();
+        assert_eq!(drawn.canvas.style(x, y).fg, Some(State::Error.color()));
+        assert!(text[y + 1].trim_end().ends_with("API Error: 529"), "{:?}", text[y + 1]);
+        assert!(text[y + 2].contains("{\"type\":\"error\""), "{:?}", text[y + 2]);
+        let resume = text.iter().position(|r| r.contains(&t!("Reprendre", "Resume"))).expect("the row");
+        assert!(resume > y + 2 && text[resume].contains("continue"), "{:#?}", text);
+        // Its help whole, over two rows, cut between words.
+        let help = text.iter().position(|r| r.contains("↳")).expect("the help");
+        let after = |row: &str, mark: char| row[row.find(mark).unwrap() + mark.len_utf8()..].trim().to_string();
+        let joined = format!("{} {}", after(&text[help], '↳'), after(&text[help + 1], '│'));
+        let said = t!(
+            "Lui envoie « continue » ; il reprend où il s'est arrêté. Rien n'est envoyé si sa saisie contient du texte.",
+            "Sends it “continue”; it picks up where it stopped. Nothing is sent if its prompt holds a draft."
+        );
+        assert_eq!(joined, said, "{:#?}", &text[help..help + 2]);
+        // In the list, ✗ in orange.
+        let row = text.iter().position(|r| r.contains("✗ dev-cli")).expect("the list");
+        let x = text[row].find('✗').map(|b| text[row][..b].chars().count()).unwrap();
+        let style = drawn.canvas.style(x, row);
+        assert_eq!((style.fg, style.bold), (Some(State::Error.color()), true));
+        // Cut at its line breaks, then between words; « … » when it goes on.
+        assert_eq!(paragraphs("a b\nc", 10, 2), ["a b", "c"]);
+        assert_eq!(paragraphs("a\tb", 10, 2), ["a b"]);
+        assert_eq!(paragraphs("a b\nc\nd", 10, 2), ["a b", "c…"]);
+        assert_eq!(paragraphs("un deux trois", 7, 1), ["un deu…"]);
+        assert!(paragraphs("", 7, 2).is_empty());
+    }
+
+    /// The focused row always shows, whatever the field and the size (designer, 2026-10-10): on a member whose turn
+    /// failed, the blank under its error gives way first, then its error, then the role. At 64 × 19, the menu's
+    /// layer of the capture (62 × 15) and the smallest it takes.
+    #[test]
+    fn the_focused_row_always_shows() {
+        let env = Fake::quiet();
+        let mut s = sheet();
+        s.states.insert("dev-cli".into(), (State::Error, 995));
+        s.failed([("dev-cli".to_string(), "API Error: 529\n{\"type\":\"error\",\"error\":{}}".to_string())].into());
+        s.open_on("dev-cli", None);
+        let resume = t!("Reprendre", "Resume");
+        for (w, h) in [(64, 19), (62, 15), (MIN_WIDTH, MIN_HEIGHT), (100, 14), (140, 40)] {
+            let text = rows(&draw(&s, &look(), w, h));
+            assert!(text.iter().any(|r| r.contains(&resume)), "{w} × {h}: {text:#?}");
+            assert!(text.iter().any(|r| r.contains(&t!("Tour raté", "Turn failed"))), "{w} × {h}: {text:#?}");
+        }
+        // At 64 × 19, the error still there, only its blank given up.
+        let text = rows(&draw(&s, &look(), 64, 19));
+        assert!(text.iter().any(|r| r.contains("API Error: 529")), "{text:#?}");
+        // Every field, every size: its row drawn, a click on it there.
+        for name in ["dev-cli", "ops"] {
+            s.open_on(name, None);
+            s.key(Key::Right, &env);
+            let count = s.focusable().len();
+            for row in 0..count {
+                s.pane = super::super::sheet::Pane::Sheet;
+                s.row = row;
+                for h in MIN_HEIGHT..24 {
+                    for w in [MIN_WIDTH, 64, WIDE, 120] {
+                        let drawn = draw(&s, &look(), w, h);
+                        assert!(
+                            drawn.zones.iter().any(|z| z.target == Target::Row(row)),
+                            "{name}, row {row} ({:?}) at {w} × {h}: {:#?}",
+                            s.field(),
+                            rows(&drawn)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
