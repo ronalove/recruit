@@ -6,9 +6,12 @@
 
 use crossterm::style::Color;
 
-use super::sheet::{Action, Confirm, Dropdown, Entry, Fid, Overlay, Pane, Person, Said, Sheet, Target, Typing};
+use super::sheet::{
+    Action, Confirm, Dropdown, Entry, Fid, Overlay, Pane, Person, Purpose, Said, Sheet, Target, Team, Typing,
+};
 use crate::canvas::{Canvas, Style, columns, fit};
-use crate::look::{self, Glyphs, RAINBOW, State};
+use crate::config::Layout;
+use crate::look::{self, Glyphs, State};
 use crate::t;
 
 /// From this width, the wide layout.
@@ -16,14 +19,36 @@ pub(crate) const WIDE: usize = 90;
 /// Below this, the menu says the window is too small.
 pub(crate) const MIN_WIDTH: usize = 50;
 pub(crate) const MIN_HEIGHT: usize = 14;
+/// The height from which the team's settings have a row of their own.
+const TALL: usize = 20;
 
-const SELECTED: Color = Color::AnsiValue(237);
-/// The chosen card while the sheet has the focus.
-const CHOSEN: Color = Color::AnsiValue(235);
-const BUTTON: Color = Color::AnsiValue(236);
-const INPUT: Color = Color::AnsiValue(233);
-const FADED: Color = Color::AnsiValue(239);
+/// What dims: the terminal's own grey, which follows its theme.
 const MUTED: Color = Color::DarkGrey;
+
+// What recruit colors itself, for a dark terminal or a light one (`look::palette`).
+/// The chosen line of a list.
+pub(super) fn selected() -> Color {
+    look::palette().selected
+}
+
+/// The chosen card while the sheet has the focus.
+fn chosen_card() -> Color {
+    look::palette().chosen
+}
+
+pub(super) fn button() -> Color {
+    look::palette().button
+}
+
+/// A text edited in place.
+pub(super) fn input() -> Color {
+    look::palette().input
+}
+
+/// What a layer dims around it.
+fn faded() -> Color {
+    look::palette().faded
+}
 
 /// How things look, beside the sheet: the icons, the spinners' image, the time, the keys' sign.
 #[derive(Clone, Copy, Debug)]
@@ -63,11 +88,33 @@ impl Drawn {
     }
 }
 
-fn muted() -> Style {
+pub(super) fn muted() -> Style {
     Style::fg(MUTED)
 }
 
-fn key_style() -> Style {
+/// `text` from `x` on row `y`, the effort `level`'s label (its sign and its name) in its colors wherever it is in the
+/// text, the rest in `style`; the colors bold when `style` is. Returns the column after it.
+pub(super) fn put_effort_text(
+    c: &mut Canvas,
+    x: usize,
+    y: usize,
+    end: usize,
+    text: &str,
+    level: &str,
+    style: Style,
+) -> usize {
+    let cells = look::effort_cells(level, true, 0);
+    let at = text.find(&look::effort_label(level)).map_or(usize::MAX, |byte| text[..byte].chars().count());
+    let mut x = x;
+    for (n, ch) in text.chars().enumerate() {
+        let color = n.checked_sub(at).and_then(|k| cells.get(k)).and_then(|(_, color)| *color);
+        let painted = color.map_or(style, |color| Style { fg: Some(color), ..style });
+        x = c.put_in(x, y, end, &ch.to_string(), painted);
+    }
+    x
+}
+
+pub(super) fn key_style() -> Style {
     Style::fg(Color::Cyan)
 }
 
@@ -87,7 +134,9 @@ pub(crate) fn draw(sheet: &Sheet, look: &Look, width: usize, height: usize) -> D
     d.c.put(split, 1, "┬", muted());
     // What the last change said, on up to three rows: then the team's actions, then the keys.
     let said = d.said(width);
-    let bottom = height - 3 - said.len().max(1);
+    // The team's settings on a row of their own when there is room, above its actions.
+    let settings = d.wide && height >= TALL && sheet.actions().iter().any(|a| a.is_setting());
+    let bottom = height - 3 - usize::from(settings) - said.len().max(1);
     d.c.vline(split, 2, bottom - 2, '│', muted());
     d.c.hline(0, bottom, width, '─', muted());
     d.c.put(split, bottom, "┴", muted());
@@ -98,10 +147,23 @@ pub(crate) fn draw(sheet: &Sheet, look: &Look, width: usize, height: usize) -> D
     d.sheet_rows(split + 1, 2, width, hint_row);
     d.hint(&hint, split + 2, hint_row, width - 1);
     d.message(bottom + 1, &said);
-    if d.wide {
-        d.buttons(height - 2, width);
+    // A narrow window with nothing said: the row the message would take holds the team's settings, a key and a value
+    // each; with something said, they fall back to the actions' row, where they are the first to go.
+    let free = !d.wide && said.is_empty() && sheet.actions().iter().any(|a| a.is_setting());
+    if free {
+        d.setting_keys(bottom + 1, width);
+    }
+    if settings {
+        let (set, act): (Vec<Action>, Vec<Action>) = d.actions().into_iter().partition(|a| a.is_setting());
+        d.buttons(height - 3, width, &set);
+        d.buttons(height - 2, width, &act);
+    } else if d.wide {
+        // One row: the settings that do not fit are the first to go.
+        let mut act = d.actions();
+        act.sort_by_key(|a| matches!(a, Action::Grid | Action::AutoCompact));
+        d.buttons(height - 2, width, &act);
     } else {
-        d.action_keys(height - 2, width);
+        d.action_keys(height - 2, width, free);
     }
     d.keys(height - 1, width);
     match &sheet.overlay {
@@ -268,7 +330,12 @@ impl Drawer<'_> {
                     Item::Gap => {}
                     Item::Card(person) => {
                         let chosen = self.sheet.entry == Entry::Member(person.name.clone());
-                        self.card(person, split, row, chosen.then_some(if focus_here { SELECTED } else { CHOSEN }));
+                        self.card(
+                            person,
+                            split,
+                            row,
+                            chosen.then_some(if focus_here { selected() } else { chosen_card() }),
+                        );
                         self.zone(0, row, split, 2, Target::Entry(Entry::Member(person.name.clone())));
                     }
                     Item::New => {
@@ -276,7 +343,7 @@ impl Drawer<'_> {
                         let x = self.c.put(1, row, "+", key_style().bold());
                         self.c.put_in(x, row, split, &t!(" Nouvel agent", " New agent"), key_style());
                         if chosen {
-                            self.c.tint(0, row, split, if focus_here { SELECTED } else { CHOSEN });
+                            self.c.tint(0, row, split, if focus_here { selected() } else { chosen_card() });
                         }
                         self.zone(0, row, split, 1, Target::Entry(Entry::New));
                     }
@@ -337,15 +404,12 @@ impl Drawer<'_> {
         }
     }
 
-    /// An effort: its sign, and its level when `word`, in Claude Code's colors; `max` in a rainbow, still (turning, it
+    /// An effort: its sign, and its name when `word`, in Claude Code's colors; `max` in a rainbow, still (turning, it
     /// would be sent again at each frame).
     fn effort(&mut self, x: usize, y: usize, end: usize, level: &str, word: bool) -> usize {
-        let text =
-            if word { format!("{} {level}", look::effort_sign(level)) } else { look::effort_sign(level).to_string() };
         let mut x = x;
-        for (i, ch) in text.chars().enumerate() {
-            let color = look::effort_color(level).unwrap_or(RAINBOW[i % RAINBOW.len()]);
-            x = self.c.put_in(x, y, end, &ch.to_string(), Style::fg(color));
+        for (ch, color) in look::effort_cells(level, word, 0) {
+            x = self.c.put_in(x, y, end, &ch.to_string(), color.map_or(Style::PLAIN, Style::fg));
         }
         x
     }
@@ -484,7 +548,7 @@ impl Drawer<'_> {
             }
             let on = focused == Some(fid);
             if on {
-                self.c.tint(left, y, right - left, SELECTED);
+                self.c.tint(left, y, right - left, selected());
             }
             self.zone(left, y, right - left, 1, Target::Row(index));
             let label_style = if on { Style::PLAIN.bold() } else { Style::PLAIN };
@@ -511,7 +575,7 @@ impl Drawer<'_> {
                 self.c.put_right(right - 1, y, &fit(&origin, 20), muted());
             }
             if on {
-                self.c.tint(left, y, right - left, SELECTED);
+                self.c.tint(left, y, right - left, selected());
             }
             index += 1;
             y += 1;
@@ -536,7 +600,7 @@ impl Drawer<'_> {
                 for (fresh, text) in [(false, resume), (true, t!(" à neuf ", " afresh "))] {
                     let chosen = on && sheet.fresh == fresh;
                     let style =
-                        if chosen { Style::fg(Color::Black).on(Color::Cyan).bold() } else { Style::PLAIN.on(BUTTON) };
+                        if chosen { Style::fg(Color::Black).on(Color::Cyan).bold() } else { Style::PLAIN.on(button()) };
                     let start = x;
                     x = self.c.put_in(x, y, end, &text, style);
                     self.zone(start, y, x - start, 1, Target::Restart(fresh));
@@ -557,20 +621,20 @@ impl Drawer<'_> {
                     y,
                     end,
                     &t!(" Fermer son panneau ", " Close its pane "),
-                    Style::fg(Color::Red).on(BUTTON),
+                    Style::fg(Color::Red).on(button()),
                 );
             }
             Fid::Compose => {
                 if sheet.draft.composing.is_some() {
                     let sign = look::SPINNER[self.look.frame % look::SPINNER.len()].to_string();
-                    let x = self.c.put_in(x, y, end, &sign, Style::fg(Color::Yellow));
+                    let x = self.c.put_in(x, y, end, &sign, Style::fg(look::palette().working));
                     let text = t!(
                         " Claude compose le nouvel agent… Échap annule",
                         " Claude is composing the new agent… Esc cancels"
                     );
-                    self.c.put_in(x, y, end, &text, Style::fg(Color::Yellow));
+                    self.c.put_in(x, y, end, &text, Style::fg(look::palette().working));
                 } else {
-                    self.c.put_in(x, y, end, &t!(" Composer ", " Compose "), Style::PLAIN.on(BUTTON));
+                    self.c.put_in(x, y, end, &t!(" Composer ", " Compose "), Style::PLAIN.on(button()));
                 }
             }
             Fid::Add => {
@@ -584,11 +648,8 @@ impl Drawer<'_> {
             _ => {
                 let text = sheet.value(fid);
                 let start = x;
-                let shown = if fid == Fid::Effort
-                    && !pending
-                    && sheet.person().and_then(|p| p.layers.as_ref()).is_some_and(|l| l.effort.value.is_some())
-                {
-                    let level = text.clone();
+                let level = if fid == Fid::Effort { sheet.effort_level() } else { None };
+                let shown = if let Some(level) = level {
                     self.effort(start, y, end, &level, true)
                 } else {
                     let style = if fid == Fid::NewName && config_error(sheet).is_some() {
@@ -602,7 +663,13 @@ impl Drawer<'_> {
                 if on && fid.cycles() {
                     self.step_signs(index, start, y, shown, end);
                     if pending {
-                        self.c.put_in(shown + 3, y, end, &t!("à valider ⏎", "to apply ⏎"), Style::fg(Color::Yellow));
+                        self.c.put_in(
+                            shown + 3,
+                            y,
+                            end,
+                            &t!("à valider ⏎", "to apply ⏎"),
+                            Style::fg(look::palette().working),
+                        );
                     }
                 }
             }
@@ -625,7 +692,7 @@ impl Drawer<'_> {
     /// row it takes.
     fn input(&mut self, typing: &Typing, x: usize, y: usize, right: usize, last: usize) -> usize {
         let room = right.saturating_sub(x + 1);
-        self.c.fill(x, y, room + 1, 1, Style::PLAIN.on(INPUT));
+        self.c.fill(x, y, room + 1, 1, Style::PLAIN.on(input()));
         // The part of the text that keeps the cursor in sight.
         let chars: Vec<char> = typing.text.chars().collect();
         let mut start = 0;
@@ -638,7 +705,7 @@ impl Drawer<'_> {
             if col + w > x + room {
                 break;
             }
-            let style = if i == typing.cursor { Style::PLAIN.reverse() } else { Style::PLAIN.on(INPUT) };
+            let style = if i == typing.cursor { Style::PLAIN.reverse() } else { Style::PLAIN.on(input()) };
             col = self.c.put(col, y, &ch.to_string(), style);
         }
         if typing.cursor >= chars.len() && col < x + room + 1 {
@@ -706,30 +773,44 @@ impl Drawer<'_> {
     }
 
     /// The team's actions, as buttons with their key.
-    fn buttons(&mut self, y: usize, width: usize) {
+    fn buttons(&mut self, y: usize, width: usize, actions: &[Action]) {
         let mut x = 1;
-        for action in self.actions() {
-            let text = action_label(action, self.sheet.team.dashboard, true);
+        // Short of room for the whole row, the grid and the share keep their value only: « g 3 × 2 », « c ⟳ 70 % »;
+        // still short, the others keep a word.
+        let label = |stage: usize, action: Action| match (stage, action) {
+            (1.., Action::Grid | Action::AutoCompact) => value_label(action, &self.sheet.team),
+            (2.., Action::New | Action::Dashboard | Action::Layout | Action::RestartAll) => {
+                action_label(action, &self.sheet.team, false)
+            }
+            _ => action_label(action, &self.sheet.team, true),
+        };
+        let wanted = |stage: usize| actions.iter().map(|a| 2 + columns(&label(stage, *a)) + 2 + 1).sum::<usize>() + 1;
+        let stage = (0..=2).find(|stage| wanted(*stage) <= width).unwrap_or(2);
+        for &action in actions {
+            let text = label(stage, action);
             let w = 2 + columns(&text) + 2;
             if x + w >= width {
                 break;
             }
             let start = x;
-            x = self.c.put(x, y, &format!(" {}", action.key()), Style::fg(Color::Cyan).bold().on(BUTTON));
-            x = self.c.put(x, y, &format!(" {text} "), Style::PLAIN.on(BUTTON));
+            x = self.c.put(x, y, &format!(" {}", action.key()), Style::fg(Color::Cyan).bold().on(button()));
+            x = self.c.put(x, y, &format!(" {text} "), Style::PLAIN.on(button()));
             self.zone(start, y, x - start, 1, Target::Action(action));
             x += 1;
         }
     }
 
     /// The team's actions in a narrow window: their key and a word.
-    fn action_keys(&mut self, y: usize, width: usize) {
+    fn action_keys(&mut self, y: usize, width: usize, without_settings: bool) {
         // Short of room, the least needed go first: detaching and stopping stay.
         let mut actions = self.actions();
+        actions.retain(|a| !(without_settings && a.is_setting()));
         let room = |actions: &[Action]| -> usize {
-            actions.iter().map(|a| columns(&action_label(*a, self.sheet.team.dashboard, false)) + 4).sum::<usize>() + 1
+            actions.iter().map(|a| columns(&action_label(*a, &self.sheet.team, false)) + 4).sum::<usize>() + 1
         };
-        for spare in [Action::RestartAll, Action::Dashboard, Action::New] {
+        for spare in
+            [Action::Layout, Action::Grid, Action::AutoCompact, Action::RestartAll, Action::Dashboard, Action::New]
+        {
             if room(&actions) <= width {
                 break;
             }
@@ -737,9 +818,35 @@ impl Drawer<'_> {
         }
         let mut x = 1;
         for action in actions {
-            let text = action_label(action, self.sheet.team.dashboard, false);
+            let text = action_label(action, &self.sheet.team, false);
             let w = columns(&text) + 2;
             if x + w >= width {
+                break;
+            }
+            let start = x;
+            x = self.c.put(x, y, &action.key().to_string(), key_style());
+            x = self.c.put(x, y, &format!(" {text}"), muted());
+            self.zone(start, y, x - start, 1, Target::Action(action));
+            x += 2;
+        }
+    }
+
+    /// The team's settings on a row of their own in a narrow window: a key and the value, nothing else:
+    /// `t tableau oui  l grille  g 3 × 2  c ⟳ 70 %`.
+    fn setting_keys(&mut self, y: usize, width: usize) {
+        let team = &self.sheet.team;
+        let mut x = 1;
+        for action in self.actions().into_iter().filter(|a| a.is_setting()) {
+            let text = match action {
+                Action::Dashboard if team.dashboard => t!("tableau oui", "dashboard yes"),
+                Action::Dashboard => t!("tableau non", "dashboard no"),
+                Action::Layout => match team.layers.as_ref().map(|l| l.layout.value) {
+                    Some(Layout::Focus) => "focus".to_string(),
+                    _ => t!("grille", "grid"),
+                },
+                _ => value_label(action, team),
+            };
+            if x + columns(&text) + 2 >= width {
                 break;
             }
             let start = x;
@@ -821,14 +928,25 @@ impl Drawer<'_> {
         let wanted = 6 + label_width + if detail_width > 0 { 2 + detail_width } else { 0 } + 2 + columns(&current) + 2;
         let x = value_x.saturating_sub(2).min(width.saturating_sub(wanted.min(width - split - 2) + 1)).max(split + 1);
         let box_width = wanted.min(width - x - 1);
+        // A team setting opens above its button; a row of the sheet, under it or above it.
+        let button = match list.purpose {
+            Purpose::Grid => Some(Action::Grid),
+            Purpose::Compaction => Some(Action::AutoCompact),
+            _ => None,
+        };
+        let button = button.and_then(|a| self.zones.iter().find(|z| z.target == Target::Action(a))).map(|z| (z.x, z.y));
         let field_row = self
             .zones
             .iter()
-            .find(|z| matches!(z.target, Target::Row(i) if self.sheet.focusable().get(i) == Some(&list.field)))
+            .find(|z| matches!(z.target, Target::Row(i) if self.sheet.focusable().get(i) == list.field.as_ref()))
             .map_or(2, |z| z.y);
         let rows = list.items.len().min(bottom.saturating_sub(4));
         let height = rows + 2;
-        let y = if field_row + 1 + height <= bottom { field_row + 1 } else { field_row.saturating_sub(height).max(2) };
+        let (x, y) = match button {
+            Some((bx, by)) => (bx.min(width.saturating_sub(box_width + 1)).max(1), by.saturating_sub(height).max(2)),
+            None if field_row + 1 + height <= bottom => (x, field_row + 1),
+            None => (x, field_row.saturating_sub(height).max(2)),
+        };
         self.c.frame(x, y, box_width, height, muted());
         let first = list.at.saturating_sub(rows.saturating_sub(1));
         for (row, (i, item)) in list.items.iter().enumerate().skip(first).take(rows).enumerate() {
@@ -836,7 +954,7 @@ impl Drawer<'_> {
             let on = i == list.at;
             let inner_end = x + box_width - 1;
             if on {
-                self.c.tint(x + 1, iy, box_width - 2, SELECTED);
+                self.c.tint(x + 1, iy, box_width - 2, selected());
                 self.c.put(x + 2, iy, "›", key_style());
             }
             let style = if on {
@@ -846,7 +964,14 @@ impl Drawer<'_> {
             } else {
                 Style::PLAIN
             };
-            self.c.put_in(x + 4, iy, inner_end, &item.label, style);
+            match &item.level {
+                Some(level) => {
+                    put_effort_text(&mut self.c, x + 4, iy, inner_end, &item.label, level, style);
+                }
+                None => {
+                    self.c.put_in(x + 4, iy, inner_end, &item.label, style);
+                }
+            }
             if let Some(detail) = &item.detail {
                 // Its own column, and room for « current » on the current one's row.
                 let detail_x = x + 6 + label_width;
@@ -858,7 +983,7 @@ impl Drawer<'_> {
                 self.c.put_right(inner_end - 1, iy, &current, muted());
             }
             if on {
-                self.c.tint(x + 1, iy, box_width - 2, SELECTED);
+                self.c.tint(x + 1, iy, box_width - 2, selected());
             }
             self.zone(x + 1, iy, box_width - 2, 1, Target::Item(i));
         }
@@ -902,9 +1027,9 @@ impl Drawer<'_> {
         let yes_style = if confirm.at == 0 {
             Style::fg(Color::Black).on(yes_color).bold()
         } else {
-            Style::fg(yes_color).on(BUTTON)
+            Style::fg(yes_color).on(button())
         };
-        let no_style = if confirm.at == 1 { Style::PLAIN.bold().on(SELECTED) } else { Style::PLAIN.on(BUTTON) };
+        let no_style = if confirm.at == 1 { Style::PLAIN.bold().on(selected()) } else { Style::PLAIN.on(button()) };
         let end = x + box_width - 2;
         let yes = fit(&format!(" {} ", confirm.yes), box_width / 2);
         let after_yes = self.c.put_in(x + 3, buttons_y, end, &yes, yes_style);
@@ -920,7 +1045,7 @@ impl Drawer<'_> {
             kx = self.c.put_in(kx, buttons_y + 2, end, &key, key_style());
             kx = self.c.put_in(kx, buttons_y + 2, end, &format!(" {text}"), muted()) + 3;
         }
-        self.c.fade_outside(x, y, box_width, box_height, Style::fg(FADED));
+        self.c.fade_outside(x, y, box_width, box_height, Style::fg(faded()));
         // Nothing under the dialog takes a click.
         self.zones.clear();
         self.zone(x + 3, buttons_y, after_yes - (x + 3), 1, Target::Yes);
@@ -967,13 +1092,41 @@ fn label(fid: Fid) -> String {
     }
 }
 
-fn action_label(action: Action, dashboard: bool, long: bool) -> String {
+/// A team setting's value alone, for a button short of room: the grid, the share (⟳ before it).
+fn value_label(action: Action, team: &Team) -> String {
+    let Some(layers) = &team.layers else { return String::new() };
+    match action {
+        Action::Grid => format!("{} × {}", layers.columns.value, layers.rows.value),
+        _ => match layers.auto_compact.value {
+            Some(at) => t!("⟳ {} %", "⟳ {}%", at),
+            None => t!("⟳ non", "⟳ off"),
+        },
+    }
+}
+
+fn action_label(action: Action, team: &Team, long: bool) -> String {
     match (action, long) {
         (Action::New, true) => t!("Nouvel agent", "New agent"),
         (Action::New, false) => t!("agent", "agent"),
-        (Action::Dashboard, true) if dashboard => t!("Tableau de bord : oui", "Dashboard: yes"),
+        (Action::Dashboard, true) if team.dashboard => t!("Tableau de bord : oui", "Dashboard: yes"),
         (Action::Dashboard, true) => t!("Tableau de bord : non", "Dashboard: no"),
         (Action::Dashboard, false) => t!("tableau", "dashboard"),
+        (Action::Layout, true) => match team.layers.as_ref().map(|l| l.layout.value) {
+            Some(Layout::Focus) => t!("Disposition : focus", "Layout: focus"),
+            _ => t!("Disposition : grille", "Layout: grid"),
+        },
+        (Action::Layout, false) => t!("disposition", "layout"),
+        (Action::Grid, true) => match &team.layers {
+            Some(l) => t!("Grille : {} × {}", "Grid: {} × {}", l.columns.value, l.rows.value),
+            None => t!("Grille", "Grid"),
+        },
+        (Action::Grid, false) => t!("grille", "grid"),
+        (Action::AutoCompact, true) => match team.layers.as_ref().map(|l| l.auto_compact.value) {
+            Some(Some(at)) => t!("Compaction auto : {} %", "Auto-compaction: {}%", at),
+            Some(None) => t!("Compaction auto : non", "Auto-compaction: off"),
+            None => t!("Compaction auto", "Auto-compaction"),
+        },
+        (Action::AutoCompact, false) => t!("compaction", "compaction"),
         (Action::RestartAll, true) => t!("Réinitialiser", "Reset"),
         (Action::RestartAll, false) => t!("réinitialiser", "reset"),
         (Action::Detach, true) => t!("Détacher", "Detach"),
@@ -1003,7 +1156,7 @@ fn paragraphs(text: &str, width: usize, lines: usize) -> Vec<String> {
 }
 
 /// `text` on rows of `width` columns at most, broken between words, `lines` at most (the last one cut with « … »).
-fn wrap(text: &str, width: usize, lines: usize) -> Vec<String> {
+pub(super) fn wrap(text: &str, width: usize, lines: usize) -> Vec<String> {
     let mut rows: Vec<String> = Vec::new();
     let mut row = String::new();
     for word in text.split_whitespace() {
@@ -1135,7 +1288,11 @@ mod tests {
         assert!(text[0].contains("⠋ 1   ⚑ 1   ◷ 1"), "the states counted: {}", text[0]);
         assert_eq!(text[1].chars().nth(34), Some('┬'), "the list 34 wide");
         assert!(text[3].contains("⠋ coordinateur") && text[3].ends_with("") && text[3].contains("3m"), "{}", text[3]);
-        assert!(text[4].contains("Opus   ▆ high"), "the model, then the effort: {}", text[4]);
+        assert!(
+            text[4].contains(&format!("Opus   {}", look::effort_label("high"))),
+            "the model, then the effort, its sign and its name: {}",
+            text[4]
+        );
         assert!(text[2].contains("dev-cli") && text[2].contains("◷"), "the sheet's title: {}", text[2]);
         let model = text.iter().find(|r| r.contains(&t!("Modèle", "Model"))).unwrap();
         assert!(model.contains("Opus") && model.trim_end().ends_with(&t!("équipe", "team")), "{model}");
@@ -1145,6 +1302,86 @@ mod tests {
         assert_eq!(drawn.hit(5, 3), Some(Target::Entry(Entry::Member("coordinateur".into()))));
         assert!(matches!(drawn.hit(3, 26), Some(Target::Action(Action::New))));
         assert_eq!(drawn.split, 34);
+    }
+
+    #[test]
+    fn the_team_settings_have_a_row() {
+        let mut s = sheet();
+        let drawn = draw(&s, &look(), 100, 28);
+        let text = rows(&drawn);
+        let (grid, share) = (t!("Grille : 3 × 2", "Grid: 3 × 2"), t!("Compaction auto : 70 %", "Auto-compaction: 70%"));
+        let row = &text[25];
+        assert!(row.contains(&t!("Tableau de bord : oui", "Dashboard: yes")), "{row}");
+        assert!(row.contains(&grid) && row.contains(&share), "{row}");
+        assert!(row.contains(&t!("Disposition : grille", "Layout: grid")), "{row}");
+        assert!(!text[26].contains(&grid) && text[26].contains(&t!("Détacher", "Detach")), "{}", text[26]);
+        let x = row[..row.find(&grid).unwrap()].chars().count() + 2;
+        assert!(matches!(drawn.hit(x, 25), Some(Target::Action(Action::Grid))));
+        // The list opens above its button, the question under the rows.
+        s.key(Key::Char(Action::Grid.key()), &Fake::quiet());
+        let drawn = draw(&s, &look(), 100, 28);
+        let text = rows(&drawn);
+        let top = text.iter().position(|r| r.contains("3 × 2") && r.contains('›')).expect("the list is drawn");
+        assert!(top < 25, "above the buttons: {top}");
+        assert!(text.iter().any(|r| r.contains("2 × 1")));
+        assert!(matches!(drawn.hit(x, top + 1), Some(Target::Item(2))), "{:?}", drawn.hit(x, top + 1));
+        // Short of height, the settings share the actions' row, last.
+        let short = rows(&draw(&sheet(), &look(), 100, 18));
+        let row = &short[16];
+        assert!(row.contains(&t!("Détacher", "Detach")) && row.contains(&t!("Quitter", "Quit")), "{row}");
+        // The grid keeps its value before anything is cut; the share, last, goes first if the row is still short.
+        assert!(row.contains(" g 3 × 2"), "the short form before cutting: {row}");
+    }
+
+    /// In a light terminal the menu's own backgrounds are the light palette's: the buttons 252, the chosen card 254.
+    #[test]
+    fn the_menu_in_the_light_palette() {
+        let button = |drawn: &Drawn| {
+            let zone = drawn.zones.iter().find(|z| z.target == Target::Action(Action::New)).unwrap();
+            drawn.canvas.style(zone.x + 3, zone.y).bg
+        };
+        let s = sheet();
+        assert_eq!(button(&draw(&s, &look(), 100, 28)), Some(Color::AnsiValue(236)));
+        look::set_light(true);
+        assert_eq!(button(&draw(&s, &look(), 100, 28)), Some(Color::AnsiValue(252)));
+        look::set_light(false);
+    }
+
+    /// At 80 × 24 the row over the actions, free while nothing is said, holds the team's settings: a key and its value.
+    #[test]
+    fn narrow_settings_on_the_free_row() {
+        let mut s = sheet();
+        let drawn = draw(&s, &look(), 80, 24);
+        let text = rows(&drawn);
+        let row = text.iter().position(|r| r.contains(&t!("tableau oui", "dashboard yes"))).expect("the settings row");
+        assert_eq!(row, 21, "the row above the actions: {text:#?}");
+        let line = text[row].trim_end();
+        let expected = t!(" t tableau oui  l grille  g 3 × 2  c ⟳ 70 %", " t dashboard yes  l grid  g 3 × 2  c ⟳ 70%");
+        assert_eq!(line, expected);
+        // They click, and the actions' row has no setting left.
+        let at = text[row][..text[row].find(" g 3").unwrap()].chars().count() + 1;
+        assert!(matches!(drawn.hit(at, row), Some(Target::Action(Action::Grid))));
+        assert!(!text[22].contains(&t!("grille", "grid")) && !text[22].contains("disposition"), "{}", text[22]);
+        assert!(text[22].contains("n ") && text[22].contains("q "), "{}", text[22]);
+        // Something said takes the row: the settings go back to the actions' row, the first to go.
+        s.said = Some(super::super::sheet::Said::Done("ok".into()));
+        let text = rows(&draw(&s, &look(), 80, 24));
+        assert!(!text.iter().any(|r| r.contains(&t!("tableau oui", "dashboard yes"))), "{text:#?}");
+    }
+
+    /// The sheet's effort row in colors, the applied level of Claude Code's own default included: « ● élevé » at the left,
+    /// « Claude Code » at the right (not « défaut de Claude Code » and « défaut »).
+    #[test]
+    fn the_sheet_shows_the_applied_effort_in_its_colors() {
+        let s = sheet();
+        let drawn = draw(&s, &look(), 100, 28);
+        let text = rows(&drawn);
+        let y = text.iter().position(|r| r.contains(&t!("Effort", "Effort"))).unwrap();
+        let label = look::effort_label("high");
+        assert!(text[y].contains(&label) && text[y].trim_end().ends_with("Claude Code"), "{}", text[y]);
+        let at = text[y][..text[y].find(&label).unwrap()].chars().count();
+        assert_eq!(drawn.canvas.style(at, y).fg, look::effort_color("high"), "the sign in its color");
+        assert_eq!(drawn.canvas.style(at + 2, y).fg, look::effort_color("high"), "the name too");
     }
 
     #[test]
@@ -1158,11 +1395,9 @@ mod tests {
         assert!(!text[3].contains("3m"), "no times in the list: {}", text[3]);
         let hint = text.iter().find(|r| r.contains("↳")).unwrap();
         assert!(hint.contains(&t!("équipe", "team")), "the origin under the sheet: {hint}");
-        assert!(
-            text[20].contains("n ") && text[20].contains(&t!("tableau", "dashboard")),
-            "the team's keys: {}",
-            text[20]
-        );
+        // The actions on their row, the settings, a key and a value each, on the free one above.
+        assert!(text[20].contains("n ") && text[20].contains("q "), "the team's keys: {}", text[20]);
+        assert!(text[19].contains(&t!("tableau oui", "dashboard yes")), "the team's settings: {}", text[19]);
         assert!(text.iter().all(|r| columns(r) <= 64));
     }
 
@@ -1174,7 +1409,7 @@ mod tests {
         let keys = &text[12];
         assert!(keys.contains(&t!("quitter", "quit")) && keys.contains(&t!("détacher", "detach")), "{keys}");
         let reset = keys.contains(&t!("réinitialiser", "reset"));
-        assert!(!reset || keys.contains(&t!("tableau", "dashboard")), "the least needed went first: {keys}");
+        assert!(!reset || keys.contains("n "), "the least needed went first: {keys}");
         assert!(columns(keys) <= 50, "{keys}");
     }
 
@@ -1221,7 +1456,7 @@ mod tests {
         let drawn = draw(&s, &look(), 100, 28);
         let text = rows(&drawn);
         assert!(text.iter().any(|r| r.contains(&t!("Quitter l'équipe ?", "Quit the team?"))));
-        assert_eq!(drawn.canvas.style(1, 0).fg, Some(FADED), "the rest faded");
+        assert_eq!(drawn.canvas.style(1, 0).fg, Some(faded()), "the rest faded");
         assert!(
             drawn.zones.iter().all(|z| matches!(z.target, Target::Yes | Target::No)),
             "only its buttons take a click"
@@ -1347,9 +1582,10 @@ mod tests {
         s.said = Some(Said::Failed("mot ".repeat(80)));
         let drawn = draw(&s, &look(), 100, 28);
         let text = rows(&drawn);
-        assert!(text[23].starts_with(" ✗ mot") && text[24].starts_with("   mot"), "{}", text[23]);
-        assert!(text[25].ends_with('…'), "the last row cut: {}", text[25]);
-        assert!(text[22].starts_with('─'), "the line over it");
+        assert!(text[22].starts_with(" ✗ mot") && text[23].starts_with("   mot"), "{}", text[22]);
+        assert!(text[24].ends_with('…'), "the last row cut: {}", text[24]);
+        assert!(text[21].starts_with('─'), "the line over it");
+        assert!(text[25].contains(&t!(" t Tableau", " t Dashboard")), "then the team's settings");
         assert!(text[26].contains(&t!(" n Nouvel agent ", " n New agent ")), "then the buttons");
     }
 

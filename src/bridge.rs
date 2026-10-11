@@ -104,6 +104,12 @@ pub struct Report {
     /// The last compaction the dashboard asked, and how it went; kept until the next one.
     #[serde(default)]
     pub compaction: Option<Compaction>,
+    /// The last compaction made (`done`), automatic or by hand (`auto` tells), kept apart: no refusal, no error and no
+    /// later request touches it, until the next one is made. What the dashboard's trace reads; `compaction` stays the
+    /// outcome of the last request. Its name in the file is not `compacted`: the mod's input carries a flag of that
+    /// name, and the input is read as a report (a flag read as a compaction made every tick fail).
+    #[serde(default, rename = "last_compacted", skip_serializing_if = "Option::is_none")]
+    pub compacted: Option<Compaction>,
     /// When the breakdown was asked, while no answer came: asked again only after a while. 0 when none waits.
     #[serde(default)]
     pub breakdown_asked: i64,
@@ -111,6 +117,10 @@ pub struct Report {
     /// as it lists them (see [`helpers`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub helpers: Vec<Helper>,
+    /// Why the last tick's input could not be read, if it could not: the report is then the one before, and this
+    /// says so. Gone with the next tick that reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_error: Option<String>,
 }
 
 /// An agent a member's session started, as its mod last listed it (`$.agent.list()`): a subagent, or a teammate of
@@ -312,7 +322,8 @@ pub struct Threshold {
     pub at: i64,
 }
 
-/// A compaction asked from the dashboard: done, skipped by a hook, or refused (a turn running).
+/// A compaction asked from the dashboard, or by the server on its own: done, skipped by a hook, or refused (a turn
+/// running).
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Compaction {
     pub id: String,
@@ -324,6 +335,21 @@ pub struct Compaction {
     pub error: Option<String>,
     #[serde(default)]
     pub at: i64,
+    /// Asked by the server, the member at rest for a while (`request_auto_compaction`), not by a click.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto: bool,
+    /// Its context before, in percent of its window: as the server saw it for an automatic one, as the report knew it
+    /// when the request was taken for one asked by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u8>,
+    /// Its context after, in percent of its window, as soon as the session tells (see [`COMPACTED_AFTER`]); only in
+    /// [`Report::compacted`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u8>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -525,6 +551,20 @@ fn start(snapshot: &Snapshot, state: &Path, member: &str, input: &Value) -> Resu
     Ok(json!({ "register": register, "quiet": info.is_some_and(|m| m.quiet) }))
 }
 
+/// A tick's input that does not read, said once in the server's log (`server.log` of the team's state folder, where the
+/// server writes its own): nothing else shows it, the mod's tick goes on.
+fn unreadable(state: &Path, member: &str, error: &str) {
+    use std::io::Write;
+    let line = format!(
+        "{} recruit[{}]: bridge: the tick of {member} does not read ({error})\n",
+        board::now(),
+        std::process::id()
+    );
+    if let Ok(mut log) = fs::OpenOptions::new().create(true).append(true).open(state.join("server.log")) {
+        let _ = log.write_all(line.as_bytes());
+    }
+}
+
 /// How often the context's breakdown is asked, in seconds: estimated by the session itself, but over all its
 /// context.
 const BREAKDOWN_EVERY: i64 = 300;
@@ -532,13 +572,26 @@ const BREAKDOWN_EVERY: i64 = 300;
 fn tick(snapshot: &Snapshot, state: &Path, member: &str, input: &Value) -> Result<Value> {
     let now = board::now();
     let before = report(state, member).unwrap_or_default();
-    let mut report: Report = serde_json::from_value(input.clone()).unwrap_or_default();
-    report.at = now;
+    // An input that does not read leaves the report as it was, and says why in it, instead of starting an empty one:
+    // as it was also means as old as it was (its time, its measure's and its compaction's), nothing in it is news.
+    let (mut report, readable) = match serde_json::from_value::<Report>(input.clone()) {
+        Ok(report) => (report, true),
+        Err(error) => {
+            if before.input_error.is_none() {
+                unreadable(state, member, &error.to_string());
+            }
+            (Report { input_error: Some(error.to_string()), ..before.clone() }, false)
+        }
+    };
+    report.at = if readable { now } else { before.at };
     report.helpers = helpers_now(&before, input, now);
     // Just compacted, the session tells no context until it answers again: the breakdown's count stands in, asked at
     // once, until the session answers.
-    let compacted = input["compaction"]["done"] == true;
-    let measured_now = report.threshold.is_some();
+    // A compaction just made: one asked for (the mod's answer), or the person's own `/compact` (`typed`, that the mod
+    // saw go by).
+    let typed = input.get("typed").filter(|t| t.is_object());
+    let compacted = input["compaction"]["done"] == true || typed.is_some();
+    let measured_now = input["threshold"].is_object();
     let counted = report.threshold.as_ref().and_then(|t| t.used);
     let measured = report.context.as_ref().is_some_and(|c| c.percent.is_some());
     if !measured && (compacted || before.context.as_ref().is_some_and(|c| c.estimated)) {
@@ -555,13 +608,72 @@ fn tick(snapshot: &Snapshot, state: &Path, member: &str, input: &Value) -> Resul
             _ => before.context.clone().unwrap_or(waiting),
         });
     }
+    // Stamped when the input carries them; else the report's own, with its own time.
     match &mut report.threshold {
-        Some(threshold) => threshold.at = now,
+        Some(threshold) if input["threshold"].is_object() => threshold.at = now,
+        Some(_) => {}
         None => report.threshold = before.threshold,
     }
     match &mut report.compaction {
-        Some(compaction) => compaction.at = now,
+        Some(compaction) if input["compaction"].is_object() => compaction.at = now,
+        Some(_) => {}
         None => report.compaction = before.compaction,
+    }
+    // An automatic request is refused while an agent of the session works, the refusal told in the report as a hook's
+    // veto would be; otherwise it is handed to the mod with what to keep.
+    let asked = take_compaction(state, member, now);
+    let mut compact = None;
+    if let Some(Asked { id, auto, percent }) = asked {
+        // A request by hand says nothing of the context: the one the report knows now.
+        let percent = percent.or_else(|| {
+            let known = report.context.as_ref().and_then(|c| c.percent).or(before.context.as_ref()?.percent);
+            known.map(|p| p.round().clamp(0.0, 100.0) as u8)
+        });
+        if auto && working(&report.helpers, now) {
+            report.compaction = Some(Compaction {
+                id,
+                skip: Some(SKIP_HELPERS.to_string()),
+                at: now,
+                auto,
+                percent,
+                ..Default::default()
+            });
+        } else {
+            compact = Some((id, auto, percent));
+        }
+    }
+    report.compacted = match &report.compaction {
+        Some(c) if input["compaction"]["done"] == true && c.done => Some(c.clone()),
+        _ => before.compacted.clone(),
+    };
+    // A `/compact` typed in the panel is traced as one by hand: the context before is the last figure of the report
+    // (the header's own), else the conversation's size the compaction recorded against the window.
+    if let Some(typed) = typed {
+        let window = [report.context.as_ref(), before.context.as_ref()]
+            .into_iter()
+            .flatten()
+            .find_map(|c| c.window)
+            .filter(|w| *w > 0);
+        let known = before
+            .context
+            .as_ref()
+            .and_then(|c| c.percent)
+            .or_else(|| Some(typed["tokensBefore"].as_u64()? as f64 * 100.0 / window? as f64));
+        report.compacted = Some(Compaction {
+            id: format!("typed-{}", request_id()),
+            done: true,
+            at: now,
+            percent: known.map(|p| p.round().clamp(0.0, 100.0) as u8),
+            ..Default::default()
+        });
+    }
+    // Its context after: the first figure the session gives once it answers again, within a minute (later, the
+    // conversation has grown).
+    if !compacted {
+        let after = report.context.as_ref().and_then(|c| c.percent).map(|p| p.round().clamp(0.0, 100.0) as u8);
+        if let Some(c) = report.compacted.as_mut().filter(|c| c.after.is_none() && now - c.at <= COMPACTED_AFTER) {
+            c.after = after;
+        }
     }
     let due = report.threshold.as_ref().is_none_or(|t| {
         now - t.at >= BREAKDOWN_EVERY || (t.model.is_some() && report.model.is_some() && t.model != report.model)
@@ -584,8 +696,20 @@ fn tick(snapshot: &Snapshot, state: &Path, member: &str, input: &Value) -> Resul
         // fifth too many. Else the estimate, for the threshold alone.
         reply["breakdown"] = json!(if compacted { "full" } else { "summary" });
     }
-    if let Some(id) = take_compaction(state, member, now) {
+    if let Some((id, auto, percent)) = compact {
         reply["compact"] = json!(id);
+        // What the mod tells back with its answer (`auto`, `percent`), and, for an automatic one, what to keep.
+        let mut ask = serde_json::Map::new();
+        if auto {
+            ask.insert("auto".into(), json!(true));
+            ask.insert("instructions".into(), json!(AUTO_COMPACT_INSTRUCTIONS));
+        }
+        if let Some(percent) = percent {
+            ask.insert("percent".into(), json!(percent));
+        }
+        if !ask.is_empty() {
+            reply["compactAsk"] = Value::Object(ask);
+        }
     }
     if let Some(answer) = input.get("resumption").and_then(|r| serde_json::from_value::<Resumption>(r.clone()).ok()) {
         resumed(state, member, &Resumption { at: now, ..answer })?;
@@ -604,8 +728,21 @@ fn tick(snapshot: &Snapshot, state: &Path, member: &str, input: &Value) -> Resul
 pub fn request_compaction(state: &Path, member: &str) -> Result<()> {
     let request = json!({ "id": request_id(), "until": board::now() + COMPACTION_LAPSE });
     fs::create_dir_all(compactions(state))?;
-    let file = compactions(state).join(member);
-    fs::write(&file, request.to_string()).with_context(|| file.display().to_string())
+    write_atomic(&compactions(state).join(member), &request.to_string())
+}
+
+/// Asks a member's session to compact on its own, from the server (decision of 2026-10-11): at rest for
+/// `config::AUTO_COMPACT_IDLE` seconds, its context at `percent` of its window, at or over the team's
+/// `auto_compact`. As [`request_compaction`], and besides: skipped while a subagent or a teammate of the session
+/// works, the compaction told to keep the details of the work last done, and the compaction that follows marked
+/// `auto`, for the dashboard. Returns the request's id: the member's report tells how it went
+/// (`Compaction.id`), or nothing if the request lapsed.
+pub fn request_auto_compaction(state: &Path, member: &str, percent: u8) -> Result<String> {
+    let id = request_id();
+    let request = json!({ "id": id, "until": board::now() + COMPACTION_LAPSE, "auto": true, "percent": percent });
+    fs::create_dir_all(compactions(state))?;
+    write_atomic(&compactions(state).join(member), &request.to_string())?;
+    Ok(id)
 }
 
 /// Asks a member's session to take up its work after a failed turn (« Reprendre », decision of 2026-10-10): its mod
@@ -728,17 +865,60 @@ fn resumption_at(state: &Path, member: &str, now: i64) -> Option<Resumption> {
     Some(answer)
 }
 
+/// How long after a compaction its context after is still taken from the session, in seconds.
+const COMPACTED_AFTER: i64 = 60;
+
 /// How long a compaction request waits for the member's mod, in seconds.
 const COMPACTION_LAPSE: i64 = 10;
 
-/// The compaction asked for a member, taken: its id, unless it lapsed.
-fn take_compaction(state: &Path, member: &str, now: i64) -> Option<String> {
+/// What a compaction asked for a member says: its id, and, for the server's own (`request_auto_compaction`), the share
+/// of the window its context held.
+struct Asked {
+    id: String,
+    auto: bool,
+    percent: Option<u8>,
+}
+
+/// The compaction asked for a member, taken: unless it lapsed.
+fn take_compaction(state: &Path, member: &str, now: i64) -> Option<Asked> {
     let file = compactions(state).join(member);
     let request: Value = serde_json::from_str(&fs::read_to_string(&file).ok()?).ok()?;
     let _ = fs::remove_file(&file);
-    let id = request["id"].as_str()?;
-    (request["until"].as_i64()? >= now).then(|| id.to_string())
+    let id = request["id"].as_str()?.to_string();
+    if request["until"].as_i64()? < now {
+        return None;
+    }
+    let percent = request["percent"].as_u64().and_then(|p| u8::try_from(p).ok());
+    Some(Asked { id, auto: request["auto"] == true, percent })
 }
+
+/// Why an automatic compaction is not made: an agent of the session works (see [`working`]). Said in a
+/// [`Compaction`]'s `skip`, as a hook's own reason would be.
+pub const SKIP_HELPERS: &str = "helpers";
+
+/// Why a compaction is not made when the mod answers it: a turn runs (the member went back to work). Not a failure.
+pub const SKIP_BUSY: &str = "busy";
+
+/// A subagent or a teammate of the session works, as its mod last listed them: the summary a compaction makes would
+/// leave out what they are about to hand back. A teammate that stayed `Running` for [`TEAMMATE_UNKNOWN`] (30 minutes)
+/// is taken for a ghost (see [`Helper::unknown`]) and no longer blocks.
+fn working(helpers: &[Helper], now: i64) -> bool {
+    helpers.iter().any(|h| h.status == HelperStatus::Running && !h.unknown(now))
+}
+
+/// What an automatic compaction tells the summarizer to keep (the model reads it, the user does not): the member is
+/// idle, and carries on from the summary alone when its next message comes.
+const AUTO_COMPACT_INSTRUCTIONS: &str = "\
+This is an automatic compaction: the session was idle, and its context grew large. The member is idle, waiting for \
+its next message (from the user or a teammate); when it comes, it carries on from this summary alone. Say what it \
+last handed back, to whom, and whether it was waiting on someone. Keep in detail what the last stretch of work \
+holds, and drop what is settled and needs no more than a line:
+- the files touched and why (paths, functions, what changed), and the commands that mattered with their results;
+- the choices made and the reasons given, and what was ruled out;
+- the open points: what is half done, what fails, what was left for later, what was not checked;
+- who asked for what (the user, a teammate), the exact request, the answer promised and to whom, and any \
+instruction or constraint given on the way that still holds.
+Do not tidy these into generalities: keep names, paths, identifiers and figures as they were.";
 
 /// What a conversation heard of its member's place in the team: the prompt it started with, when known, and the
 /// last one it was given, at its start or in a note. Both whole, as `prompt::build` writes them.
@@ -1518,6 +1698,11 @@ mod tests {
         // Taken once.
         assert!(tick("dev", json!({})).get("compact").is_none());
         // How it went, kept until the next one.
+        // A manual one carries no instructions, whatever the agents do.
+        request_compaction(state, "dev").unwrap();
+        let busy = json!([{"id": "a", "type": "Explore", "description": "look", "status": "running"}]);
+        let reply = tick("dev", json!({"agents": busy}));
+        assert!(reply["compact"].is_string() && reply["compactAsk"]["instructions"].is_null());
         tick("dev", json!({"compaction": {"id": id, "error": "a turn is running"}}));
         tick("dev", json!({}));
         let kept = report(state, "dev").unwrap().compaction.unwrap();
@@ -1530,6 +1715,274 @@ mod tests {
         request_compaction(state, "lead").unwrap();
         assert!(tick("dev", json!({})).get("compact").is_none());
         assert!(tick("lead", json!({})).get("compact").is_some());
+    }
+
+    #[test]
+    fn auto_compaction_refused_while_an_agent_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let s = snapshot(Lang::Fr);
+        let tick = |input: Value| tick(&s, state, "dev", &input).unwrap();
+        let agent = |status: &str| json!({"id": "a", "type": "Explore", "description": "look", "status": status});
+        let teammate = |status: &str| json!({"id": "t", "teammateId": "scout@crew", "name": "scout", "status": status});
+
+        // A subagent at work: refused, said as a hook's veto, and nothing handed to the mod.
+        request_auto_compaction(state, "dev", 82).unwrap();
+        let reply = tick(json!({"agents": [agent("running")]}));
+        assert!(reply.get("compact").is_none() && reply.get("compactAsk").is_none());
+        let kept = report(state, "dev").unwrap().compaction.unwrap();
+        assert_eq!(
+            (kept.skip.as_deref(), kept.done, kept.auto, kept.percent),
+            (Some(SKIP_HELPERS), false, true, Some(82))
+        );
+        assert!(!compactions(state).join("dev").exists(), "taken, not asked again");
+        // The refusal stays in the report until the next compaction.
+        tick(json!({"agents": [agent("running")]}));
+        assert_eq!(report(state, "dev").unwrap().compaction.unwrap().skip.as_deref(), Some(SKIP_HELPERS));
+
+        // A teammate at work too; one waiting for a message, or a subagent over, does not count.
+        request_auto_compaction(state, "dev", 82).unwrap();
+        assert!(tick(json!({"agents": [teammate("running")]})).get("compact").is_none());
+        for agents in [json!([teammate("idle")]), json!([agent("completed")]), json!([agent("failed")]), json!([])] {
+            request_auto_compaction(state, "dev", 75).unwrap();
+            let reply = tick(json!({ "agents": agents }));
+            assert!(reply["compact"].is_string(), "{agents}");
+            assert_eq!((&reply["compactAsk"]["percent"], &reply["compactAsk"]["auto"]), (&json!(75), &json!(true)));
+            let said = reply["compactAsk"]["instructions"].as_str().unwrap();
+            assert!(
+                said.contains("files touched") && said.contains("open points") && said.contains("who asked for what")
+            );
+        }
+        // An agents list the session could not give leaves those it had, and a mod that lists none asks nothing.
+        request_auto_compaction(state, "dev", 75).unwrap();
+        tick(json!({"agents": [agent("running")]}));
+        request_auto_compaction(state, "dev", 75).unwrap();
+        assert!(tick(json!({"agents": null})).get("compact").is_none());
+        request_auto_compaction(state, "dev", 75).unwrap();
+        assert!(tick(json!({})).get("compact").is_some());
+    }
+
+    #[test]
+    fn compaction_traced_with_the_context_before_and_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let s = snapshot(Lang::Fr);
+        let tick = |input: Value| tick(&s, state, "dev", &input).unwrap();
+        let context = |percent: f64| json!({"context": {"percent": percent, "tokens": 148_000, "window": 200_000}});
+        // By hand: the context the report knows when the request is taken, handed to the mod to tell back.
+        tick(context(74.0));
+        request_compaction(state, "dev").unwrap();
+        let reply = tick(context(74.2));
+        let id = reply["compact"].as_str().unwrap().to_string();
+        assert_eq!(reply["compactAsk"], json!({"percent": 74}));
+        // Not asked by the server: no `auto`.
+        tick(json!({"compaction": {"id": id, "done": true, "percent": 74}, "context": {"window": 200_000}}));
+        let made = report(state, "dev").unwrap().compacted.unwrap();
+        assert_eq!((made.done, made.auto, made.percent, made.after), (true, false, Some(74), None));
+        // The session tells nothing yet; then the breakdown's count stands in, and the context after is kept.
+        tick(json!({"context": {"window": 200_000}}));
+        assert_eq!(report(state, "dev").unwrap().compacted.unwrap().after, None);
+        let used = json!({"context": {"window": 200_000}, "threshold": {"tokens": 167_000, "enabled": true, "window": 200_000, "used": 18_000}});
+        tick(used.clone());
+        let made = report(state, "dev").unwrap().compacted.unwrap();
+        assert_eq!((made.percent, made.after), (Some(74), Some(9)));
+        // Kept as is when the conversation goes on, and through a refusal or an error that follow.
+        tick(context(30.0));
+        request_auto_compaction(state, "dev", 80).unwrap();
+        let id = tick(json!({}))["compact"].as_str().unwrap().to_string();
+        tick(json!({"compaction": {"id": id, "error": "a turn is running", "auto": true, "percent": 80}}));
+        let kept = report(state, "dev").unwrap();
+        assert_eq!(kept.compacted.unwrap().after, Some(9));
+        assert_eq!(kept.compaction.unwrap().error.as_deref(), Some("a turn is running"));
+        // A later figure than a minute after is not "after" any more.
+        let mut old = report(state, "dev").unwrap();
+        let mut stale = old.compacted.take().unwrap();
+        stale.after = None;
+        stale.at = board::now() - COMPACTED_AFTER - 5;
+        old.compacted = Some(stale);
+        write_atomic(&reports(state).join("dev.json"), &serde_json::to_string(&old).unwrap()).unwrap();
+        tick(context(55.0));
+        assert_eq!(report(state, "dev").unwrap().compacted.unwrap().after, None);
+    }
+
+    #[test]
+    fn a_tick_as_the_mod_sends_it_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let s = snapshot(Lang::Fr);
+        // The input's keys as `tick` in `mod/hooks/register.ts` makes them, `compacted` (a flag) included, with what a
+        // handover adds.
+        let input = json!({
+            "session": "s1",
+            "model": "claude-haiku-5-5",
+            "own": {"model": "claude-haiku-5-5", "effort": "high"},
+            "context": {"tokens": 24_000, "window": 200_000, "percent": 12.0},
+            "rateLimits": [{"kind": "five_hour", "percentUsed": 21.0}],
+            "threshold": {"tokens": 167_000, "enabled": true, "window": 200_000, "model": "claude-haiku-5-5", "used": 23_000},
+            "compacted": false,
+            "agents": [],
+            "summary": {"id": "x", "text": "t"},
+            "compaction": {"id": "1", "done": true, "auto": true, "percent": 71},
+            "resumption": {"id": "2", "sent": true},
+            "typed": {"tokensBefore": 1},
+        });
+        for flag in [false, true] {
+            let reply = tick(&s, state, "dev", &json!({ "compacted": flag, "session": "s1" }));
+            assert!(reply.is_ok());
+        }
+        tick(&s, state, "dev", &input).unwrap();
+        let kept = report(state, "dev").unwrap();
+        assert!(kept.input_error.is_none(), "{:?}", kept.input_error);
+        assert_eq!((kept.session.as_deref(), kept.model.as_deref()), (Some("s1"), Some("claude-haiku-5-5")));
+        assert_eq!(kept.context.as_ref().and_then(|c| c.percent), Some(12.0));
+        assert_eq!(kept.threshold.as_ref().and_then(|t| t.tokens), Some(167_000));
+        assert_eq!(kept.rate_limits.len(), 1);
+        assert!(kept.compacted.is_some());
+        // The file names the last compaction apart from the flag.
+        let file: Value = serde_json::from_str(&fs::read_to_string(reports(state).join("dev.json")).unwrap()).unwrap();
+        assert!(file["last_compacted"]["done"] == true && file.get("compacted").is_none());
+    }
+
+    #[test]
+    fn an_unreadable_tick_is_no_news() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let s = snapshot(Lang::Fr);
+        // A report from a while ago: a failed automatic compaction, a measure of the threshold.
+        let old = board::now() - 600;
+        let failed = Compaction {
+            id: "c1".into(),
+            at: old,
+            auto: true,
+            error: Some("API surchargée".into()),
+            ..Default::default()
+        };
+        let threshold = Threshold { tokens: Some(167_000), at: old, ..Default::default() };
+        let before = Report {
+            session: Some("s1".into()),
+            at: old,
+            compaction: Some(failed.clone()),
+            threshold: Some(threshold.clone()),
+            ..Default::default()
+        };
+        fs::create_dir_all(reports(state)).unwrap();
+        write_atomic(&reports(state).join("dev.json"), &serde_json::to_string(&before).unwrap()).unwrap();
+        for _ in 0..2 {
+            tick(&s, state, "dev", &json!({"session": "s1", "context": "twelve"})).unwrap();
+        }
+        let kept = report(state, "dev").unwrap();
+        // Nothing stamped as new: the dashboard sees it stale, and the journal's key (the request and its time) holds.
+        assert_eq!((kept.at, kept.compaction, kept.threshold), (old, Some(failed), Some(threshold)));
+        assert!(kept.input_error.is_some());
+        // Said once in the log, at the first.
+        let log = fs::read_to_string(state.join("server.log")).unwrap();
+        assert_eq!(log.lines().count(), 1, "{log}");
+        assert!(log.contains("tick of dev does not read"), "{log}");
+        // A tick that reads is news again, and its compaction's time is its own.
+        tick(&s, state, "dev", &json!({"session": "s1", "compaction": {"id": "c2", "error": "x"}})).unwrap();
+        let fresh = report(state, "dev").unwrap();
+        assert!(fresh.at >= old + 600 && fresh.input_error.is_none());
+        assert_eq!(fresh.compaction.map(|c| (c.id, c.at >= old + 600)), Some(("c2".into(), true)));
+    }
+
+    #[test]
+    fn an_unreadable_tick_keeps_the_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let s = snapshot(Lang::Fr);
+        let tick = |input: Value| tick(&s, state, "dev", &input).unwrap();
+        tick(json!({"session": "s1", "model": "claude-haiku-5-5", "context": {"percent": 12.0, "window": 200_000}}));
+        // A context that is not one: the report stays, and says why.
+        tick(json!({"session": "s1", "context": "twelve"}));
+        let kept = report(state, "dev").unwrap();
+        assert_eq!(kept.model.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(kept.context.as_ref().and_then(|c| c.percent), Some(12.0));
+        assert!(kept.input_error.as_deref().is_some_and(|e| e.contains("context") || e.contains("invalid type")));
+        // The next tick that reads clears it.
+        tick(json!({"session": "s1", "model": "claude-haiku-5-5"}));
+        assert!(report(state, "dev").unwrap().input_error.is_none());
+    }
+
+    #[test]
+    fn compaction_typed_in_the_panel_is_traced() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let s = snapshot(Lang::Fr);
+        let tick = |input: Value| tick(&s, state, "dev", &input).unwrap();
+        let context = |percent: f64| json!({"context": {"percent": percent, "tokens": 148_000, "window": 200_000}});
+        // The person's `/compact`: the context before is the report's last figure; asked to count at once.
+        tick(context(74.0));
+        let reply = tick(json!({"typed": {"tokensBefore": 150_000, "tokensAfter": 20_000}, "compacted": true,
+            "context": {"window": 200_000}}));
+        assert_eq!(reply["breakdown"], "full");
+        let made = report(state, "dev").unwrap().compacted.unwrap();
+        assert!(made.id.starts_with("typed-"));
+        assert_eq!((made.done, made.auto, made.percent, made.after), (true, false, Some(74), None));
+        // The last request is not that: nothing asked.
+        assert!(report(state, "dev").unwrap().compaction.is_none());
+        // The context after, once the session counts.
+        let used = json!({"context": {"window": 200_000}, "threshold": {"tokens": 167_000, "enabled": true, "window": 200_000, "used": 18_000}});
+        tick(used);
+        let made = report(state, "dev").unwrap().compacted.unwrap();
+        assert_eq!((made.percent, made.after), (Some(74), Some(9)));
+        // A report with no figure before: the size the compaction recorded, against the window.
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = |input: Value| tick_fresh(&s, dir.path(), &input);
+        fresh(json!({"typed": {"tokensBefore": 150_000}, "context": {"window": 200_000}}));
+        let made = report(dir.path(), "dev").unwrap().compacted.unwrap();
+        assert_eq!((made.percent, made.after), (Some(75), None));
+        // Nothing to go by: no figure rather than a guess.
+        let dir = tempfile::tempdir().unwrap();
+        tick_fresh(&s, dir.path(), &json!({"typed": {}}));
+        assert_eq!(report(dir.path(), "dev").unwrap().compacted.unwrap().percent, None);
+    }
+
+    fn tick_fresh(s: &Snapshot, state: &Path, input: &Value) -> Value {
+        tick(s, state, "dev", input).unwrap()
+    }
+
+    #[test]
+    fn auto_compaction_told_to_the_dashboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let s = snapshot(Lang::Fr);
+        let tick = |input: Value| tick(&s, state, "dev", &input).unwrap();
+        request_auto_compaction(state, "dev", 71).unwrap();
+        let id = tick(json!({}))["compact"].as_str().unwrap().to_string();
+        // The mod's answer says it was automatic; the next ticks keep it.
+        tick(json!({"compaction": {"id": id, "done": true, "auto": true, "percent": 71}}));
+        tick(json!({}));
+        let kept = report(state, "dev").unwrap().compaction.unwrap();
+        assert_eq!((kept.id, kept.done, kept.auto, kept.percent), (id.clone(), true, true, Some(71)));
+        let made = report(state, "dev").unwrap().compacted.unwrap();
+        assert_eq!((made.id.as_str(), made.done, made.auto, made.percent), (id.as_str(), true, true, Some(71)));
+        // A later refusal replaces the outcome of the last request, not the last compaction made.
+        request_auto_compaction(state, "dev", 80).unwrap();
+        let busy = json!([{"id": "a", "type": "Explore", "description": "look", "status": "running"}]);
+        tick(json!({"agents": busy}));
+        let after = report(state, "dev").unwrap();
+        assert_eq!(after.compaction.unwrap().skip.as_deref(), Some(SKIP_HELPERS));
+        assert_eq!(after.compacted, Some(made.clone()));
+        // A compaction made by hand takes its place, with no `auto`.
+        request_compaction(state, "dev").unwrap();
+        let manual = tick(json!({}))["compact"].as_str().unwrap().to_string();
+        tick(json!({"compaction": {"id": manual, "done": true}}));
+        let by_hand = report(state, "dev").unwrap().compacted.unwrap();
+        assert_eq!((by_hand.id.as_str(), by_hand.auto), (manual.as_str(), false));
+        // As does a new automatic one.
+        request_auto_compaction(state, "dev", 90).unwrap();
+        let second = tick(json!({}))["compact"].as_str().unwrap().to_string();
+        tick(json!({"compaction": {"id": second, "done": true, "auto": true, "percent": 90}}));
+        let latest = report(state, "dev").unwrap().compacted.unwrap();
+        assert_eq!((latest.id, latest.percent), (second, Some(90)));
+        // Taken once.
+        assert!(tick(json!({})).get("compact").is_none());
+        // Lapsed: dropped.
+        request_auto_compaction(state, "dev", 71).unwrap();
+        let lapsed = json!({"id": "1", "until": board::now() - 1, "auto": true, "percent": 71});
+        fs::write(compactions(state).join("dev"), lapsed.to_string()).unwrap();
+        assert!(tick(json!({})).get("compact").is_none());
+        assert!(!compactions(state).join("dev").exists());
     }
 
     /// The dashboard sees `member` in `state`, now.

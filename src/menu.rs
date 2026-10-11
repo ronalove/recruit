@@ -11,6 +11,7 @@
 //! changed (`canvas`). Team files that do not read still open it: the members as launched, to detach or stop.
 
 mod draw;
+mod quick;
 mod sheet;
 
 use std::collections::{HashMap, HashSet};
@@ -37,7 +38,16 @@ use sheet::{Done, Effect, Env, Key, Person, Said, Sheet, Team};
 
 /// The menu of the team whose folder is `state`, on `member`'s sheet if given (else the first member's), its `field`
 /// focused: `name`, `model` or `effort`; another word is left out.
-pub fn run(state: &Path, client: Option<&str>, nerd: bool, member: Option<&str>, field: Option<&str>) -> Result<()> {
+/// With `list`, only the list of `field`'s values for `member`, under its pane's header (lot of 2026-10-11, direction A):
+/// its size told to the server by `CSI 8 ; rows ; cols t` (`Relay::Resize`), at its start and at each change.
+pub fn run(
+    state: &Path,
+    client: Option<&str>,
+    nerd: bool,
+    member: Option<&str>,
+    field: Option<&str>,
+    list: bool,
+) -> Result<()> {
     let mut running = Running::open(state)?;
     let mut sheet = Sheet::new(load(&running, client.is_some()));
     // What the dashboard saw, if it still looks: a small file, read before the first frame (and before choosing the
@@ -46,7 +56,15 @@ pub fn run(state: &Path, client: Option<&str>, nerd: bool, member: Option<&str>,
         sheet.seen(Some(states));
         sheet.failed(errors);
     }
-    if let Some(member) = member {
+    if list {
+        // Only the values of a model or an effort: anything else, or a member that is not there, ends it at once.
+        if let (Some(member), Some(field)) = (member, field.and_then(field_of)) {
+            sheet.open_list(member, field, &Live { running: &running });
+        }
+        if sheet.quick.is_none() {
+            return Ok(());
+        }
+    } else if let Some(member) = member {
         sheet.open_on(member, field.and_then(field_of));
     }
     let (send_states, states) = mpsc::channel();
@@ -63,7 +81,13 @@ pub fn run(state: &Path, client: Option<&str>, nerd: bool, member: Option<&str>,
         composers: Composers::default(),
         start: Instant::now(),
         glyphs: if nerd { Glyphs::Nerd } else { Glyphs::Unicode },
+        told: None,
+        short: false,
     };
+    if sheet.quick.is_some() {
+        // The pointer over a value moves the cursor to it: moves without a button, which the menu does not ask for.
+        menu.session.write(MOVES_ON.as_bytes())?;
+    }
     let result = menu.run(&mut sheet);
     menu.close();
     result
@@ -182,6 +206,7 @@ fn load(running: &Running, detach: bool) -> Team {
                 people: s.members.iter().enumerate().map(|(i, m)| person(i, m)).collect(),
                 config: config::Team { members: members.collect(), ..Default::default() },
                 dashboard: !s.dashboard.is_empty(),
+                layers: None,
                 detach,
                 file: String::new(),
                 unreadable: Some(format!("{error:#}")),
@@ -208,15 +233,25 @@ fn load(running: &Running, detach: bool) -> Team {
             }
         })
         .collect();
-    let dashboard =
-        config::dashboard_layers(&origin, &found.name).map_or(!s.dashboard.is_empty(), |layers| layers.value);
+    let layers = config::team_layers(&origin, &found.name).ok();
+    let dashboard = layers.as_ref().map_or(!s.dashboard.is_empty(), |layers| layers.dashboard.value);
     let file = match &found.root {
         Some(root) => {
             found.file.strip_prefix(root).map_or_else(|_| config::tilde(&found.file), |p| p.display().to_string())
         }
         None => config::tilde(&found.file),
     };
-    Team { name: found.name.clone(), origin, people, config: found.team, dashboard, detach, file, unreadable: None }
+    Team {
+        name: found.name.clone(),
+        origin,
+        people,
+        config: found.team,
+        dashboard,
+        layers,
+        detach,
+        file,
+        unreadable: None,
+    }
 }
 
 /// What the sheet asks of the running team.
@@ -257,12 +292,25 @@ struct Menu<'a> {
     composers: Composers,
     start: Instant,
     glyphs: Glyphs,
+    /// The quick list: the size last told to the server, and whether the screen left it too narrow for where the
+    /// default comes from.
+    told: Option<(usize, usize)>,
+    short: bool,
 }
+
+/// Mouse moves without a button, for the quick list's hover; and back.
+const MOVES_ON: &str = "\x1b[?1003h";
+const MOVES_OFF: &str = "\x1b[?1003l";
 
 impl Menu<'_> {
     fn run(&mut self, sheet: &mut Sheet) -> Result<()> {
         loop {
             let drawn = self.draw(sheet)?;
+            // The quick list's ↻ come from the files: read once the first image is up, then drawn.
+            if sheet.unmarked() {
+                sheet.mark_restarts(&Live { running: self.running });
+                continue;
+            }
             let working = sheet.states.values().any(|(s, _)| *s == State::Working) || sheet.draft.composing.is_some();
             // The spinners turn while someone works; otherwise only the times move, on the second.
             let wait = if working { look::FRAME } else { Duration::from_millis(1000 - millis() % 1000) };
@@ -297,7 +345,18 @@ impl Menu<'_> {
             now: board::now(),
             option: cfg!(target_os = "macos"),
         };
-        let drawn = draw::draw(sheet, &look, width, height);
+        let drawn = if sheet.quick.is_some() {
+            // Its size told whenever it changes, before the frame that needs it.
+            if let Some(want) = quick::size(sheet, &look, self.short)
+                && self.told != Some(want)
+            {
+                self.session.write(format!("\x1b[8;{};{}t", want.0, want.1).as_bytes())?;
+                self.told = Some(want);
+            }
+            quick::draw(sheet, &look, self.short, width, height)
+        } else {
+            draw::draw(sheet, &look, width, height)
+        };
         let bytes = self.painter.frame(&drawn.canvas);
         self.session.write(&bytes)?;
         Ok(drawn)
@@ -311,6 +370,15 @@ impl Menu<'_> {
                 None => Vec::new(),
             },
             Event::Paste(text) => sheet.key(Key::Paste(text), &env),
+            // The server gave the quick list less than it asked for: the default loses where it comes from.
+            Event::Resize(width, _) => {
+                if let Some(told) = self.told
+                    && (width as usize) < told.1
+                {
+                    self.short = true;
+                }
+                Vec::new()
+            }
             Event::Mouse(mouse) => {
                 let (x, y) = (mouse.column as usize, mouse.row as usize);
                 match mouse.kind {
@@ -318,6 +386,12 @@ impl Menu<'_> {
                         Some(target) => sheet.click(target, &env),
                         None => Vec::new(),
                     },
+                    MouseEventKind::Moved => {
+                        sheet.hover(drawn.hit(x, y));
+                        Vec::new()
+                    }
+                    MouseEventKind::ScrollDown if sheet.quick.is_some() => sheet.key(Key::Down, &env),
+                    MouseEventKind::ScrollUp if sheet.quick.is_some() => sheet.key(Key::Up, &env),
                     MouseEventKind::ScrollDown => sheet.wheel(x < drawn.split, true, &env),
                     MouseEventKind::ScrollUp => sheet.wheel(x < drawn.split, false, &env),
                     _ => Vec::new(),
@@ -340,6 +414,19 @@ impl Menu<'_> {
     /// Carries out an effect; true when the menu is done.
     fn carry(&mut self, sheet: &mut Sheet, effect: Effect) -> Result<bool> {
         let failed = |error: anyhow::Error| Said::Failed(format!("{error:#}"));
+        if sheet.quick.is_some()
+            && let Effect::Apply { edits, .. } = &effect
+        {
+            // The quick list ends with the write; refused, it stays open and says why on its last line.
+            match self.running.apply(edits) {
+                Ok(()) => return Ok(true),
+                Err(error) => {
+                    sheet.said = Some(failed(error));
+                    sheet.reopen_list(&Live { running: self.running });
+                    return Ok(false);
+                }
+            }
+        }
         match effect {
             Effect::Apply { edits, said, select } => {
                 let added = edits.iter().any(|e| matches!(e, Edit::Add { .. }));
@@ -492,6 +579,9 @@ impl Menu<'_> {
 
     /// The menu closes: every Claude still composing is stopped, those about to start too (waited for a little).
     fn close(&mut self) {
+        if self.told.is_some() {
+            let _ = self.session.write(MOVES_OFF.as_bytes());
+        }
         let until = Instant::now() + Duration::from_millis(500);
         loop {
             while let Ok(news) = self.news.1.try_recv() {

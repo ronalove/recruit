@@ -38,6 +38,7 @@ layout = "auto"
 columns = 3
 rows = 2
 dashboard = true
+auto_compact = 70
 
 [teams.web.members.coordinateur]
 role = "Point d'entrée de l'utilisateur : répartit le travail, suit l'avancement"
@@ -82,12 +83,13 @@ Ignorée. recruit 1 faisait tourner ses équipes dans tmux, et cette section ré
 | `instructions` | texte | aucune | Règles communes à tous les membres, ajoutées au prompt de chacun. |
 | `permission_mode` | texte | celui de Claude Code | Mode de permission de Claude Code de tous les membres : `default`, `acceptEdits`, `auto`, `plan`, `bypassPermissions`… |
 | `model` | texte | celui de Claude Code | Modèle de Claude de tous les membres : un alias (`opus`, `sonnet`, `haiku`, `fable`) ou un nom de modèle complet. |
-| `effort` | texte | celui de Claude Code | Effort de tous les membres : `low`, `medium`, `high`, `xhigh` ou `max`. |
+| `effort` | texte | celui de Claude Code | Effort de tous les membres : `low`, `medium`, `high`, `xhigh` ou `max`. recruit les affiche faible, moyen, élevé, extra et max, comme Claude Code nomme `xhigh` « Extra ». |
 | `args` | liste de textes | `[]` | Arguments donnés en plus à `claude` pour tous les membres. |
-| `layout` | `"auto"` ou `"tabs"` | `"auto"` | `auto` : les interlocuteurs dans un premier onglet, puis les agents de travail dans des onglets de `columns × rows` au plus. `tabs` : un onglet par membre. Voir [Onglets](/recruit/fr/guides/contacts-and-agents/#onglets). |
+| `layout` | `"auto"`, `"focus"` ou `"tabs"` | `"auto"` | `auto` : les interlocuteurs dans un premier onglet, puis les agents de travail dans des onglets de `columns × rows` au plus, chaque onglet en grille. `focus` : les mêmes onglets, mais ceux des agents de travail montrent un membre en grand à gauche et les mieux placés à droite. `tabs` : un onglet par membre. Voir [Onglets](/recruit/fr/guides/contacts-and-agents/#onglets) et [Focus](/recruit/fr/guides/contacts-and-agents/#focus). |
 | `columns` | entier | `3` | Le nombre maximal de colonnes dans un onglet. |
 | `rows` | entier | `2` | Le nombre maximal de lignes dans un onglet. |
 | `dashboard` | booléen | `true` | Le [tableau de bord et le journal](/recruit/fr/guides/dashboard/), à droite des interlocuteurs. Avec `false`, les interlocuteurs sont côte à côte. |
+| `auto_compact` | booléen ou entier | `true` | La [compaction automatique](/recruit/fr/guides/dashboard/#compaction-automatique) : un membre au repos depuis 15 minutes est compacté quand son contexte atteint cette part de sa fenêtre, en pourcentage, de 1 à 100. `true` vaut 70, `false` la désactive. |
 
 ## Membres
 
@@ -117,6 +119,7 @@ recruit vérifie les fichiers chaque fois qu'il les lit (pour lancer une équipe
 - le nom d'une équipe ou d'un membre ne suit pas les [règles des noms](/recruit/fr/guides/teams/#noms), ou deux membres d'une équipe ne diffèrent que par la casse ;
 - un membre n'a pas de rôle ;
 - une équipe a plus de deux interlocuteurs ;
+- `auto_compact` est un nombre hors de 1 à 100 ;
 - `config_dir` est un chemin relatif ;
 - le `tab` d'un membre prend le nom d'un onglet de recruit.
 

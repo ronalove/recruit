@@ -1157,7 +1157,7 @@ fn ansi256(r: u8, g: u8, b: u8) -> u8 {
 /// Mouse reports: presses, releases, the wheel and drags, in SGR coordinates; not the moves without a button, which
 /// would wake the program at each one.
 const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
-const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
 /// The terminal while a full screen is on it: raw, on its alternate screen, without its cursor, with the mouse and
 /// pastes reported. Dropping it gives everything back; a panic does it before its message.

@@ -47,21 +47,30 @@ The top border tells you about the member, from left to right:
 
 - its state: a spinner while it works, ⚑ when it waits for you, ◷ at rest, ❯ when a command it started still runs;
 - its name, in its color, the same as on the dashboard and in the journal;
-- on the right, its model, its effort, its context and the time in its state, for example `Opus ▆ high · 29 % · 6m`. The context turns orange as the conversation nears its automatic compaction, red at Claude Code's warning;
+- on the right, its model, its effort, its context and the time in its state, for example `Opus ● high · 29 % · 6m`. The effort's sign says its level as under Claude Code's prompt: ○ low, ◐ medium, ● high, ◉ extra, ◈ max. The context turns orange as the conversation nears its automatic compaction, red at Claude Code's warning;
 - ⤢ in the corner.
 
-In a narrow frame, the details go first: the effort's word, then the model, then the time. Frames of the same width show the same details, in columns.
+In a narrow frame, the details go first: the effort's word, then the model's name gives way to its initial (O, S, H, F), then the time, the initial, the effort's sign and the context. Frames of the same width show the same details, in columns.
 
 What a click does:
 
 | Click on | Does |
 |---|---|
-| a member's name, model or effort | opens its sheet in the [team's menu](/recruit/guides/menu/), on that setting |
+| a member's name | opens its sheet in the [team's menu](/recruit/guides/menu/) |
+| its model or its effort | opens the list of its values right under it |
 | ⟳ before the context of a member at rest | offers to compact its conversation, after confirmation |
 | ⤢ | shows this member over the whole tab; ⤡ brings the others back |
 | anywhere in a frame | puts you there |
 
 Under the pointer, a name is underlined and "settings ›" shows next to it.
+
+### Model and effort in one click
+
+The list under the model or the effort starts with "default: …", what the member gets when nothing sets it, with where it comes from ("default: high (settings.toml)", or "(Claude Code)"). "current" marks the value in place, and ↻ a value that will start the member again on its conversation, because its requests cannot carry it. Pick one with the arrows and `⏎`, or click it: it is written in the team's files, as from the [menu](/recruit/guides/menu/#where-changes-are-written), and reaches the member at once. When the member is at work and the value would start it again, the list asks first, on "Cancel". `Esc`, a click outside or a second click on the text close it.
+
+## When a turn fails
+
+When a member's turn ends on an API error (an overloaded API, a lost connection), its frame turns orange and its top border gives a short reason after its name, such as "API overloaded (529)". Its tab shows ✗, after ⚑ when someone also waits there. Out of sight, a notice in orange tells you, and `⌥g` goes there after the members waiting for you. The member stays so until its next turn. "Resume" on its sheet in the [team's menu](/recruit/guides/menu/) sends it "continue", unless its prompt holds text you were typing.
 
 ![The lead shown over its whole tab: the tab in the bar says ⤢ lead](../../../assets/screenshots/zoom.png)
 
@@ -69,7 +78,11 @@ Under the pointer, a name is underlined and "settings ›" shows next to it.
 
 The bottom row holds the team's name, its tabs and two buttons. The current tab is highlighted. Each tab shows the state of its busiest member: a spinner while someone works there, ⚑ when someone waits for you. When a member is shown full screen, its tab says so: `2 Agents (1)  ⤢ dev-saisie`.
 
-On the right, "menu" opens the [team's menu](/recruit/guides/menu/) and "quit" offers to detach or quit. In a narrow window, the other tabs keep only their number and the buttons only their key.
+On the right, "focus (⌥l)" or "grid (⌥l)" switches the layout of the current tab (see [Focus](/recruit/guides/contacts-and-agents/#focus)), "menu" opens the [team's menu](/recruit/guides/menu/) and "quit" offers to detach or quit. In a narrow window, the other tabs keep only their number and the buttons only their key.
+
+## Light or dark
+
+recruit's own colors (the members', the efforts', the highlighted lines and buttons) follow your terminal's background: a light set on a light background, the dark one otherwise. Your terminal's own colors stay its own. The members' programs are told the theme too, when they ask for it.
 
 ## When a member needs you
 
@@ -101,9 +114,10 @@ Each member keeps its history. Where its program does not take the mouse, the wh
 |---|---|
 | `⌥1`…`⌥9` | go to a tab |
 | `⌥⇧←` / `⌥⇧→` | previous / next tab |
-| `⌥n` | next member of the tab |
+| `⌥n` | next member of the tab; in a tab in focus, it comes to the left; shown over the whole tab, it takes the place |
 | `⌥z` | this member over the whole tab, and back |
-| `⌥g` | go to the member waiting for you |
+| `⌥l` | the current tab in [focus](/recruit/guides/contacts-and-agents/#focus), or back to its grid, until you detach |
+| `⌥g` | go to the member waiting for you, else to one whose turn failed |
 | `⌥j` | journal full, reduced, then hidden (or `/team`, `/equipe` in a French team, in a member's prompt) |
 | `⌥r` | the [team's menu](/recruit/guides/menu/), on the sheet of the member you are in (or `/recruit` in a member's prompt) |
 | `⌥q` | detach, quit or cancel |

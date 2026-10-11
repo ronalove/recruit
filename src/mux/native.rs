@@ -173,6 +173,7 @@ impl Backend for Native {
             rows,
             exe: std::env::current_exe().context("recruit")?.to_string_lossy().into_owned(),
             lang: plan.lang.code().to_string(),
+            focus: plan.focus,
         };
         let built = self.ask::<()>(&state, build, BUILD_WAIT);
         if built.is_err() {
@@ -258,9 +259,9 @@ impl Backend for Native {
         self.ask_unit(Request::Respawn { id: id.to_string(), pane: spec(pane, dir)? })
     }
 
-    fn arrange(&self, session: &str, tabs: &[Tab], columns: usize) -> Result<()> {
+    fn arrange(&self, session: &str, tabs: &[Tab], columns: usize, focus: bool) -> Result<()> {
         let tabs = tabs.iter().map(|tab| (tab.title.clone(), tab.members.clone())).collect();
-        self.ask(&self.state_of(session), Request::Arrange { tabs, columns }, client::ANSWER)
+        self.ask(&self.state_of(session), Request::Arrange { tabs, columns, focus }, client::ANSWER)
     }
 
     fn open_panels(&self, dir: &Path, beside: &str, dashboard: &Pane, journal: &Pane) -> Result<()> {

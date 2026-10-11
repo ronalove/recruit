@@ -54,14 +54,34 @@ role = "Interface web"
 tab = "Code"
 ```
 
+La grille se règle aussi depuis le [menu de l'équipe](/recruit/fr/guides/menu/#les-actions-déquipe), « Grille » (`g`) : 4 × 2, 3 × 2, 2 × 2, 3 × 1 ou 2 × 1. Une grille plus petite donne plus de place à chaque membre, sur plus d'onglets. Un terminal n'a qu'une taille de police pour toute sa fenêtre : un panneau ne peut pas avoir sa propre police plus petite, et c'est la grille et le focus, plus bas, qui font de la place.
+
+### Focus
+
+Quand un onglet compte plus de membres que tu ne peux en suivre, `layout = "focus"` en montre un en grand et seulement les plus occupés à côté :
+
+- **À gauche**, le membre que tu as choisi, sur toute la hauteur de l'onglet.
+- **À droite**, les mieux placés des autres, l'un au-dessus de l'autre : ceux qui t'attendent, ceux dont le tour a raté, ceux au travail, puis ceux au repos depuis le moins longtemps. Trois, ou deux dans une fenêtre de moins de 120 × 36.
+- **En dessous**, les autres en cartes, comme au tableau de bord, dans un cadre titré « autres » qui les compte par état. Une carte montre l'état du membre, son modèle et son effort, ce qu'il fait, et la courbe de sa dernière demi-heure.
+
+Les places changent lentement, pour que rien ne saute sous tes yeux. Un membre qui se met à t'attendre, ou dont le tour rate, passe à droite tout de suite, mais jamais à la place d'un autre qui attend ou a raté son tour. Un membre qui se met au travail y passe au bout de 30 secondes, à la place du moins bien placé. Sinon, un panneau garde sa place une minute au moins. Rien ne bouge tant que le pointeur est à droite ou sur les cartes, pendant que tu tapes, ni dans la seconde qui suit un clic.
+
+| Pour | Fais |
+|---|---|
+| amener un membre à gauche | clique sur sa carte, double-clique sur le bord du haut de son panneau à droite, ou `Alt+n` pour le suivant de l'onglet |
+| taper dans un panneau de droite | clique dedans : il reçoit les touches, et reste où il est |
+| revenir à la grille, ou essayer le focus | `Alt+l`, ou le bouton « grille (⌥l) » ou « focus (⌥l) » de la barre : pour l'onglet courant seulement, jusqu'à ce que tu te détaches |
+
+Le premier onglet, avec le tableau de bord et le journal, garde sa grille, tout comme un onglet dans une fenêtre de moins de 80 colonnes ou de 14 lignes. « Disposition » (`l`) dans le menu de l'équipe passe toute l'équipe de la grille au focus, ou l'inverse, et l'écrit dans le fichier.
+
 ### Un onglet par membre
 
 `layout = "tabs"` donne à chaque membre son propre onglet, à son nom, interlocuteurs en tête. Le tableau de bord et le journal vont dans le premier onglet.
 
 ## Changer en cours de route
 
-Le [menu de l'équipe](/recruit/fr/guides/menu/) fait d'un membre un interlocuteur ou un agent de travail, ou le change d'onglet. Son panneau se déplace sans que son Claude s'arrête. Quand le seul interlocuteur part ou devient agent de travail, le menu demande qui le remplace.
+Le [menu de l'équipe](/recruit/fr/guides/menu/) fait d'un membre un interlocuteur ou un agent de travail, le change d'onglet, et règle la grille et la disposition. Les panneaux se déplacent sans que leur Claude s'arrête. Quand le seul interlocuteur part ou devient agent de travail, le menu demande qui le remplace.
 
 ## Passer d'un onglet à l'autre
 
-`Alt+1`…`Alt+9` mènent à un onglet, `Alt+Maj+←` / `Alt+Maj+→` au précédent ou au suivant, `Alt+n` au membre suivant de l'onglet, et un clic sur la carte d'un membre dans le tableau de bord mène à son panneau. Quand un membre que tu ne vois pas t'attend, une notification te le dit, et `Alt+g` t'y mène. Voir [L'écran de l'équipe](/recruit/fr/guides/screen/).
+`Alt+1`…`Alt+9` mènent à un onglet, `Alt+Maj+←` / `Alt+Maj+→` au précédent ou au suivant, `Alt+n` au membre suivant de l'onglet (un membre montré sur tout l'onglet le reste : le suivant prend sa place), et un clic sur la carte d'un membre dans le tableau de bord mène à son panneau. Quand un membre que tu ne vois pas t'attend, une notification te le dit, et `Alt+g` t'y mène. Voir [L'écran de l'équipe](/recruit/fr/guides/screen/).

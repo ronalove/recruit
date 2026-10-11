@@ -35,7 +35,11 @@ A team has its own language, `lang` in its file, set when it is created: the lan
 
 ### What does a team cost?
 
-Each member is a Claude Code session on your account, and uses it like any other. On top of that, with the mod, Haiku sums up each new request in one short call for the dashboard, and compacting a conversation from the dashboard costs what Claude Code's own compaction costs. The dashboard's bottom line shows your 5-hour and 7-day usage.
+Each member is a Claude Code session on your account, and uses it like any other. On top of that, with the mod, Haiku sums up each new request in one short call for the dashboard, and compacting a conversation costs what Claude Code's own compaction costs: from the dashboard, and on its own for a member at rest with a large context ([automatic compaction](/recruit/guides/dashboard/#automatic-compaction), on by default, `auto_compact = false` to turn it off). The dashboard's bottom line shows your 5-hour and 7-day usage.
+
+### Can a pane have a smaller font?
+
+No: a terminal has one font size for its whole window. To fit more members, or to give each one more room, set the [grid](/recruit/guides/contacts-and-agents/#tabs) of the tabs, or show a busy tab in [focus](/recruit/guides/contacts-and-agents/#focus) (`⌥l`): one member large, the busiest beside it, the others as cards.
 
 ### Does recruit change my Claude Code settings?
 

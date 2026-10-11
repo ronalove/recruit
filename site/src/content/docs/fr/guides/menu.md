@@ -13,7 +13,7 @@ Chaque changement est enregistré dans les fichiers de l'équipe, et la plupart 
 
 - `Alt+r` (`⌥r` sous macOS) dans n'importe quel panneau de l'équipe ;
 - le bouton « menu » en bas à droite ;
-- un clic sur le nom, le modèle ou l'effort d'un membre, dans le bord du haut de son cadre : le menu s'ouvre sur ce réglage ;
+- un clic sur le nom d'un membre, dans le bord du haut de son cadre : le menu s'ouvre sur sa fiche. Un clic sur son modèle ou son effort n'ouvre que [la liste de ses valeurs](/recruit/fr/guides/screen/#le-modèle-et-leffort-dun-clic), juste en dessous ;
 - `/recruit`, tapé dans l'invite d'un membre, avec [le mod de recruit](/recruit/fr/guides/claude-code/#le-mod-de-recruit).
 
 Le menu s'ouvre par-dessus l'équipe, le reste atténué ; `Alt+r` et le bouton l'ouvrent sur la fiche du membre où tu es. Il lui faut une fenêtre de 50 × 14 au moins.
@@ -54,17 +54,22 @@ Tout se clique. Dans une fenêtre étroite, la liste ne garde que les noms, et l
 | Relancer | le relancer, sur sa conversation ou à neuf |
 | Retirer | le sortir de l'équipe, et fermer son panneau |
 
+Quand le dernier tour du membre a raté, sa fiche commence par l'erreur, et « Reprendre » lui envoie « continue », sauf si son invite contient un texte que tu étais en train de taper. Voir [Quand un tour rate](/recruit/fr/guides/screen/#quand-un-tour-rate).
+
 ## Les actions d'équipe
 
 | Touche | Action |
 |---|---|
 | `n` | Nouvel agent : un rôle intégré, un agent que Claude compose d'après ta demande, ou un agent que tu écris. « ⏎ Ajouter et lancer » lui donne tout de suite un panneau. |
 | `t` | Tableau de bord : le tableau de bord et le journal, oui ou non |
+| `l` | Disposition : les onglets des agents de travail en grille ou en [focus](/recruit/fr/guides/contacts-and-agents/#focus) |
+| `g` | Grille : combien de panneaux tient un onglet, `colonnes × lignes`, dans une liste (4 × 2, 3 × 2, 2 × 2, 3 × 1, 2 × 1, chacune avec son nombre par onglet) |
+| `c` | Compaction auto : non, ou la part de sa fenêtre à partir de laquelle un membre au repos est [compacté de lui-même](/recruit/fr/guides/dashboard/#compaction-automatique), de 50 à 90 % |
 | `R` | Réinitialiser : chaque membre sur une nouvelle conversation, les contextes vidés (demande « Réinitialiser l'équipe ? ») |
 | `d` | Détacher : laisser l'équipe tourner |
 | `q` | Quitter : arrêter l'équipe, la session de chaque membre fermée (demande « Quitter l'équipe ? ») |
 
-Ces touches marchent depuis la liste des membres ; dans une fiche, une lettre ne fait rien. Un clic marche partout.
+Ces touches marchent depuis la liste des membres ; dans une fiche, une lettre ne fait rien. Un clic marche partout. Dans une fenêtre assez haute, les réglages d'équipe (tableau de bord, disposition, grille, compaction auto) ont leur propre ligne, au-dessus des actions ; faute de place, ils ne gardent que leur valeur (« g 3 × 2 », « c ⟳ 70 % »). Avec `layout = "tabs"`, la disposition et la grille disparaissent : chaque membre a son onglet.
 
 ## Où s'écrivent les changements
 
@@ -77,7 +82,7 @@ Choisir « défaut » retire le réglage de ce fichier, et une table devenue vid
 
 ## Quand les changements prennent effet
 
-- **Tout de suite** : un nouvel agent a son panneau, un membre retiré perd le sien, et les panneaux changent d'onglet sans que leur Claude s'arrête.
+- **Tout de suite** : un nouvel agent a son panneau, un membre retiré perd le sien, et les panneaux changent d'onglet sans que leur Claude s'arrête. Une nouvelle grille ou une nouvelle disposition réarrange les onglets ; une nouvelle part de compaction auto s'applique dans les secondes qui suivent.
 - **Dès la requête suivante**, avec le mod : un nouveau modèle ou un nouvel effort.
 - **Avec le message suivant**, avec le mod : un nouveau rôle, de nouvelles instructions ou de nouveaux coéquipiers arrivent à chaque membre dans une note jointe à son prochain message, sans déclencher de tour.
 - **Après une relance sur sa conversation** : un membre renommé, un nouveau mode de permission, ou un modèle ou un effort que ses requêtes ne peuvent pas porter (le retour au défaut de Claude Code, par exemple). Quand l'interlocuteur principal change et que tes réglages donnent une ligne d'état, l'ancien et le nouveau sont relancés aussi, pour que la ligne d'état suive.

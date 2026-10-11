@@ -239,6 +239,7 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
         team: found.name.clone(),
         dir: dir.clone(),
         columns: layout::columns(team),
+        focus: team.layout == Some(crate::config::Layout::Focus),
         tabs,
         lang,
     };
@@ -260,6 +261,7 @@ pub fn launch(found: &Found, cwd: &Path, options: &Options) -> Result<()> {
         origin: Some(found.origin()),
         plugin_dir: plugin_dir.clone(),
         status_line: start.status_line,
+        auto_compact: team.auto_compact_at(),
     };
     snapshot.write(&state)?;
     bridge::reset(&state)?;

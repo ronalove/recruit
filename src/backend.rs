@@ -22,6 +22,8 @@ pub struct Plan {
     pub team: String,
     pub dir: PathBuf,
     pub columns: usize,
+    /// The tabs of members without the panels beside them shown in « focus » (`layout = "focus"`).
+    pub focus: bool,
     pub tabs: Vec<TabPlan>,
     /// The team's language, for what the multiplexer writes itself.
     pub lang: Lang,
@@ -140,7 +142,8 @@ pub trait Backend {
     /// Starts `pane`'s program again in pane `id`.
     fn respawn(&self, id: &str, dir: &Path, pane: &Pane) -> Result<()>;
     /// Puts the panes in `tabs`, in their order, without stopping any.
-    fn arrange(&self, session: &str, tabs: &[Tab], columns: usize) -> Result<()>;
+    /// With `focus`, the tabs of members without the panels beside them in « focus » (`layout = "focus"`).
+    fn arrange(&self, session: &str, tabs: &[Tab], columns: usize, focus: bool) -> Result<()>;
 
     // The dashboard and the journal, programs in panes.
     fn open_panels(&self, dir: &Path, beside: &str, dashboard: &Pane, journal: &Pane) -> Result<()>;

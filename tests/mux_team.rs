@@ -299,6 +299,15 @@ fn client_keys_and_buttons() {
     };
     let screen = |term: &TestTerm| term.screen().join("\n");
     let sign = if cfg!(target_os = "macos") { "\u{2325}" } else { "Alt+" };
+    // The first frames may come before the panes are placed (a loaded machine): the layout is waited for.
+    let placed = |term: &TestTerm| {
+        let (lead, board, journal) = (find(term, "lead"), find(term, "Tableau de bord"), find(term, "Journal"));
+        matches!(
+            (lead, board, journal),
+            (Some(l), Some(b), Some(j)) if b.0 > l.0 && b.1 == l.1 && j.0 == b.0 && j.1 > b.1
+        )
+    };
+    let _ = wait(Duration::from_secs(5), || placed(&term) && screen(&term).contains(&format!("menu ({sign}r)")));
     check("A2 the bar names the shortcuts", screen(&term).contains(&format!("menu ({sign}r)")), screen(&term));
     // D3: the dashboard to the right of the contact, on the top row; the journal under it.
     let (lead, board, journal) = (find(&term, "lead"), find(&term, "Tableau de bord"), find(&term, "Journal"));
@@ -568,17 +577,50 @@ fn zoom_named_in_the_bar() {
 fn report(team: &Team, member: &str, model: &str, effort: &str, percent: f64) {
     let dir = team.state().join("members");
     std::fs::create_dir_all(&dir).expect("members folder");
+    let file = dir.join(format!("{member}.json"));
     let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let report = serde_json::json!({
+    let mut report = serde_json::json!({
         "session": "s", "model": model, "own": {"model": model, "effort": effort},
         "context": {"percent": percent, "tokens": (percent * 2000.0) as u64, "window": 200000}, "at": at,
     });
-    std::fs::write(dir.join(format!("{member}.json")), report.to_string()).expect("report");
+    // The mod's answer to a compaction (`answer_compaction`) stays through the reports told again.
+    let kept = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|old| old.get("compaction").cloned());
+    if let Some(compaction) = kept {
+        report["compaction"] = compaction;
+    }
+    std::fs::write(file, report.to_string()).expect("report");
+}
+
+/// What the member's mod says of the compaction `id` it was asked (`compact/<member>`): `outcome` is
+/// `{"done": true}`, `{"skip": "helpers"}` or `{"error": "…"}`, in its report (`bridge::Compaction`).
+fn answer_compaction(team: &Team, member: &str, id: &str, outcome: serde_json::Value) {
+    let file = team.state().join("members").join(format!("{member}.json"));
+    let mut report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).expect("a report to complete")).expect("report: JSON");
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut compaction = serde_json::json!({"id": id, "auto": true, "at": at});
+    for (key, value) in outcome.as_object().expect("an outcome") {
+        compaction[key] = value.clone();
+    }
+    report["compaction"] = compaction;
+    std::fs::write(file, report.to_string()).expect("report");
 }
 
 /// The parts of a member's header that show on `row`: the name, the context, the sign of the effort, the effort's
-/// word, the model, the time in the state, the zoom sign.
-fn header_parts(row: &str) -> [bool; 7] {
+/// name, the model's whole name, the time in the state, the zoom sign, the model's initial.
+const NAME: usize = 0;
+const CONTEXT: usize = 1;
+const SIGN: usize = 2;
+const WORD: usize = 3;
+const MODEL: usize = 4;
+const TIME: usize = 5;
+const INITIAL: usize = 7;
+// (index 6 is the zoom sign, kept apart: no constant, nothing reads it by name)
+
+fn header_parts(row: &str) -> [bool; 8] {
     let has_time = row.split_whitespace().any(|w| {
         w.len() >= 2
             && w.ends_with(['s', 'm', 'h'])
@@ -587,17 +629,28 @@ fn header_parts(row: &str) -> [bool; 7] {
     [
         row.contains(" lead"),
         row.contains('%'),
-        row.contains('\u{2588}'),
-        row.contains("xhigh"),
+        row.contains('\u{25c9}'),
+        row.contains("extra"),
         row.contains("Opus"),
         has_time,
         row.contains('\u{2922}'),
+        // The model reduced to its initial, a word of its own between the state's sign, the name and the rest.
+        row.split_whitespace().any(|w| w == "O"),
     ]
 }
 
+/// The parts that give up one after the other as the header narrows, in the order they stay: the name, the context, the
+/// effort's sign, the model (its whole name or its initial), the time, the model's whole name, the effort's name.
+/// Each implies the ones before it (the zoom sign is kept apart).
+fn header_chain(p: &[bool; 8]) -> [bool; 7] {
+    [p[NAME], p[CONTEXT], p[SIGN], p[MODEL] || p[INITIAL], p[TIME], p[MODEL], p[WORD]]
+}
+
 /// F1: a member's header says its state, name, model, effort, context, time in the state and the zoom sign, and
-/// gives up what does not fit in the planned order: the effort's word, the model, the time, the effort's sign; the
-/// context last, then the name is cut.
+/// gives up what does not fit in the planned order: the effort's name, the model's name (its initial stays), the time,
+/// the initial, the effort's sign; the context last, then the name is cut. The six forms of the decision: the whole
+/// header, without the effort's name, the model as its initial (before the time goes), without the time, without the
+/// initial (before the sign goes), without the sign.
 #[test]
 fn header_gives_up_in_order() {
     let tables = tables("head", &["lead"], &[], "dashboard = false");
@@ -616,7 +669,9 @@ fn header_gives_up_in_order() {
     let mut checks = Checks::default();
     let full = header(&term);
     let parts = header_parts(&full);
-    checks.check("F1 everything fits at 120 columns", parts.iter().all(|p| *p), || format!("{parts:?} {full}"));
+    checks.check("F1 everything fits at 120 columns", parts[..7].iter().all(|p| *p) && !parts[INITIAL], || {
+        format!("{parts:?} {full}")
+    });
     checks.check(
         "F1 the state's sign before the name",
         full.contains("\u{25f7} lead") || full.contains("\u{25cc} lead"),
@@ -625,8 +680,11 @@ fn header_gives_up_in_order() {
     // Narrower and narrower: what stays at each width implies what is less urgent.
     // name ≥ context ≥ sign ≥ time ≥ model ≥ word (the zoom sign is kept apart).
     let mut seen_all = false;
-    let mut last: Option<[bool; 7]> = None;
-    for cols in (14..=120u16).rev().step_by(7) {
+    let mut last: Option<[bool; 8]> = None;
+    // The forms met on the way down: the model whole and the effort named, then without the effort's name, then the
+    // model as its initial with the time, then without the time, then without the initial, then without the sign.
+    let mut forms = std::collections::BTreeSet::new();
+    for cols in (14..=120u16).rev().step_by(2) {
         term.resize(cols, 20);
         // Drawn again for the new size: the frame's corner at the last column.
         let drawn = wait(Duration::from_secs(2), || {
@@ -638,16 +696,35 @@ fn header_gives_up_in_order() {
         }
         let row = header(&term);
         let p = header_parts(&row);
-        let chain = [p[0], p[1], p[2], p[5], p[4], p[3]];
+        let chain = header_chain(&p);
         let ordered = chain.windows(2).all(|w| w[0] || !w[1]);
+        if p[NAME] && p[CONTEXT] {
+            forms.insert(match (p[SIGN], p[MODEL], p[INITIAL], p[TIME], p[WORD]) {
+                (true, true, _, true, true) => "whole",
+                (true, true, _, true, false) => "no effort name",
+                (true, false, true, true, _) => "initial, with the time",
+                (true, false, true, false, _) => "initial, no time",
+                (true, false, false, false, _) => "no model, sign kept",
+                (false, false, false, false, _) => "no sign",
+                _ => "other",
+            });
+        }
         checks.check(&format!("F1 order of giving up at {cols} columns"), ordered, || format!("{p:?} {row}"));
         if last.is_some_and(|before| before != p) {
             println!("{cols:3} columns: {p:?}");
         }
-        seen_all |= p.iter().all(|x| *x);
+        seen_all |= p[..7].iter().all(|x| *x);
         last = Some(p);
     }
     checks.check("F1 the whole header at some width", seen_all, String::new);
+    for form in
+        ["whole", "no effort name", "initial, with the time", "initial, no time", "no model, sign kept", "no sign"]
+    {
+        checks.check(&format!("F1 the form « {form} » is met on the way down"), forms.contains(form), || {
+            format!("{forms:?}")
+        });
+    }
+    checks.check("F1 no header of another form", !forms.contains("other"), || format!("{forms:?}"));
     checks
         .check("F1 the name survives to the narrowest width tried", last.is_some_and(|p| p[0]), || format!("{last:?}"));
     checks.done();
@@ -694,29 +771,30 @@ fn header_clicks_open_the_sheet() {
         lines.iter().any(|row| row.contains(&format!("│ {member} ")) || row.contains(&format!("┃ {member} ")))
             || lines.iter().any(|row| row.split('│').any(|cell| cell.trim() == member))
     };
-    let focused = |lines: &[String], label: &str| lines.iter().any(|row| row.contains(label) && row.contains('‹'));
     for (member, tab_key, part, label) in [
         ("lead", '1', "Opus", "Modèle"),
-        ("lead", '1', "xhigh", "Effort"),
+        ("lead", '1', "extra", "Effort"),
         ("dev", '2', "Sonnet", "Modèle"),
-        ("dev", '2', "high", "Effort"),
+        ("dev", '2', "élevé", "Effort"),
     ] {
         let keys = alt(&term, tab_key);
         term.send(&keys);
-        // The member's own header first: the other tab's shows « xhigh » when « high » is looked for.
+        // The member's own header first: the other tab's shows « extra » when « élevé » is looked for.
         let there = wait(Duration::from_secs(3), || has_header(&term, member) && find_in_header(&term, part).is_some());
         assert!(there, "{part}: {}", shown(&term));
         let at = find_in_header(&term, part).expect("part");
+        let kept = untouched(&term);
         click(&mut term, at);
+        // The model and the effort open their list under the text (lot of 2026-10-11, `quick_list_*`), not the sheet.
         let opened = wait(Duration::from_secs(8), || menu_text(&team).is_some());
         checks.check(&format!("F2 a click on {member}'s {part} opens the menu"), opened, || shown(&term));
+        let listed = wait_list(&team, &term).is_some();
+        checks.check(&format!("F2 {member}'s {part} opens the list of {label}"), listed, || shown(&term));
         let lines = menu_text(&team).unwrap_or_default();
-        let _ = wait(Duration::from_secs(3), || menu_text(&team).is_some_and(|l| focused(&l, label)));
-        let lines = menu_text(&team).unwrap_or(lines);
-        checks.check(&format!("F2 {member}'s sheet"), sheet(&lines, member), || lines.join("\n"));
-        checks.check(&format!("F2 the field {label} in focus"), focused(&lines, label), || lines.join("\n"));
-        let layer = wait(Duration::from_secs(3), || shown(&term).contains("Nouvel agent"));
-        checks.check("F2 the menu is a layer over the team", layer, || shown(&term));
+        checks.check(&format!("F2 {member}'s {part}: the values only, no sheet"), !sheet(&lines, member), || {
+            lines.join("\n")
+        });
+        checks.check("F2 the list leaves the team as it was", untouched(&term) == kept, || shown(&term));
         checks.check("the menu closes", close_menu(&team, &mut term), || shown(&term));
     }
     // The name: the field to rename.
@@ -1135,6 +1213,1163 @@ fn layout_settings_are_followed() {
     four.stop();
 }
 
+/// 1A: the grid changed on a running team (`recruit _edit '[{"grid": …}]'`, as the menu does) rearranges the tabs
+/// and starts nobody again: every pane keeps its process, and no Claude is launched a second time.
+#[test]
+fn grid_changes_rearrange_without_restart() {
+    let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let agents: Vec<(&str, Option<&str>)> = vec![("a1", None), ("a2", None), ("a3", None), ("a4", None)];
+    let mut team = Team::new("gridedit", &tables("gridedit", &["lead"], &agents, ""));
+    team.launch(&["lead", "a1", "a2", "a3", "a4"]);
+    let pids = |team: &Team| -> Vec<(String, Option<u64>)> {
+        let mut all: Vec<_> = team
+            .panes()
+            .iter()
+            .map(|p| (p["member"].as_str().unwrap_or_default().to_string(), p["pid"].as_u64()))
+            .collect();
+        all.sort();
+        all
+    };
+    assert_eq!(team.tabs()[1].1, names(&["a1", "a2", "a3", "a4"]), "3 × 2 by default: {:?}", team.tabs());
+    let before = pids(&team);
+    assert!(before.iter().all(|(_, pid)| pid.is_some()), "a pane without a pid: {before:?}");
+    let state = team.state();
+    let edit = |json: &str| {
+        let out = team.recruit([std::ffi::OsStr::new("_edit"), state.as_os_str(), std::ffi::OsStr::new(json)]);
+        assert!(out.status.success(), "_edit {json}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    // 2 × 1: two members a tab.
+    edit(r#"[{"grid": {"columns": 2, "rows": 1}}]"#);
+    let two = names(&["a1", "a2"]);
+    assert!(
+        wait(Duration::from_secs(8), || {
+            let tabs = team.tabs();
+            tabs.len() == 3 && tabs[1].1 == two && tabs[2].1 == names(&["a3", "a4"])
+        }),
+        "tabs not rearranged to 2 × 1: {:?}",
+        team.tabs()
+    );
+    assert_eq!(pids(&team), before, "a pane was started again by the grid change");
+    // A client sees them side by side.
+    let mut term = client(&team, "lead");
+    let keys = alt(&term, '2');
+    term.send(&keys);
+    assert!(wait(Duration::from_secs(3), || has_header(&term, "a1") && has_header(&term, "a2")), "{}", shown(&term));
+    let a1 = find_in_header(&term, " a1 ").expect("a1");
+    let a2 = find_in_header(&term, " a2 ").expect("a2");
+    assert!(a1.1 == a2.1 && a2.0 > a1.0, "two columns, one row: a1 {a1:?}, a2 {a2:?}");
+    // Back to 3 × 2 (the default: the keys leave the file): one tab again, a client attached meanwhile follows.
+    edit(r#"[{"grid": {"columns": 3, "rows": 2}}]"#);
+    assert!(
+        wait(Duration::from_secs(8), || {
+            let tabs = team.tabs();
+            tabs.len() == 2 && tabs[1].1 == names(&["a1", "a2", "a3", "a4"])
+        }),
+        "tabs not back to 3 × 2: {:?}",
+        team.tabs()
+    );
+    assert_eq!(pids(&team), before, "a pane was started again by the grid change back");
+    for member in ["lead", "a1", "a2", "a3", "a4"] {
+        assert_eq!(team.launches(member).len(), 1, "{member}'s Claude was started again");
+    }
+    assert!(
+        wait(Duration::from_secs(3), || ["a1", "a2", "a3", "a4"].iter().all(|m| has_header(&term, m))),
+        "the client did not follow: {}",
+        shown(&term)
+    );
+    drop(term);
+    team.stop();
+}
+
+/// 1C: in a zoomed tab, ⌥n zooms the next member of the tab (the zoom stays, the bar names the new one), round the
+/// tab and back; ⌥z brings the grid back.
+#[test]
+fn alt_n_keeps_the_zoom() {
+    let mut team =
+        Team::new("zoomn", &tables("zoomn", &["lead"], &[("dev1", None), ("dev2", None), ("dev3", None)], ""));
+    team.launch(&["lead", "dev1", "dev2", "dev3"]);
+    let mut term = client(&team, "lead");
+    let members = ["dev1", "dev2", "dev3"];
+    let keys = alt(&term, '2');
+    term.send(&keys);
+    assert!(wait(Duration::from_secs(3), || members.iter().all(|m| has_header(&term, m))), "{}", shown(&term));
+    let mut checks = Checks::default();
+    let start = active(&term, &members).pop().expect("an active member");
+    let keys = alt(&term, 'z');
+    term.send(&keys);
+    let bar = |term: &TestTerm| term.screen().last().cloned().unwrap_or_default();
+    let only = |term: &TestTerm, name: &str| {
+        has_header(term, name) && members.iter().filter(|m| **m != name).all(|m| !has_header(term, m))
+    };
+    let zoomed = wait(Duration::from_secs(3), || only(&term, &start));
+    checks.check("1C ⌥z: alone in its tab", zoomed, || shown(&term));
+    // ⌥n round the tab: the next one each time, then the first again.
+    let from = members.iter().position(|m| *m == start).unwrap();
+    let next = alt(&term, 'n');
+    for step in 1..=members.len() {
+        let want = members[(from + step) % members.len()];
+        term.send(&next);
+        let got = wait(Duration::from_secs(3), || only(&term, want));
+        checks.check(&format!("1C ⌥n #{step}: {want} alone"), got, || shown(&term));
+        let named = wait(Duration::from_secs(2), || bar(&term).contains(&format!("\u{2922} {want}")));
+        checks.check(&format!("1C ⌥n #{step}: the bar names {want}"), named, || bar(&term));
+        let sized = team.panes().iter().find(|p| p["member"] == want).map(|p| p["cols"].as_u64().unwrap());
+        checks.check(&format!("1C ⌥n #{step}: {want} has the tab's width"), sized.is_some_and(|w| w >= 110), || {
+            format!("{sized:?}")
+        });
+        let sole = active(&term, &members);
+        checks.check(&format!("1C ⌥n #{step}: {want} is the active one"), sole == [want], || format!("{sole:?}"));
+    }
+    // ⌥z: the grid, with the member that was zoomed active.
+    let keys = alt(&term, 'z');
+    term.send(&keys);
+    let back = wait(Duration::from_secs(3), || members.iter().all(|m| has_header(&term, m)));
+    checks.check("1C ⌥z after ⌥n: the grid is back", back, || shown(&term));
+    let last = members[(from + members.len()) % members.len()];
+    let sole = active(&term, &members);
+    checks.check("1C the grid keeps the member last zoomed active", sole == [last], || format!("{sole:?}"));
+    // Not zoomed, ⌥n only moves the focus (the grid stays).
+    term.send(&next);
+    std::thread::sleep(Duration::from_millis(300));
+    checks
+        .check("1C ⌥n out of the zoom keeps the grid", members.iter().all(|m| has_header(&term, m)), || shown(&term));
+    checks.done();
+    team.stop();
+}
+
+/// The reports the mod would write (`report`), told again and again: a report older than a few seconds may be
+/// ignored, and the waits below last longer.
+fn contexts(team: &Team, list: &[(&str, f64)]) {
+    for (member, percent) in list {
+        report(team, member, "opus", "high", *percent);
+    }
+}
+
+/// The automatic compaction the server asked of `member` (`<state>/compact/<member>`), if its mod has not taken it.
+fn compaction_asked(team: &Team, member: &str) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(team.state().join("compact").join(member)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The members whose compaction is asked.
+fn compactions_asked(team: &Team, members: &[&str]) -> Vec<String> {
+    members.iter().filter(|m| compaction_asked(team, m).is_some()).map(|m| m.to_string()).collect()
+}
+
+/// Waits for `check`, telling the contexts again at each try.
+fn wait_with_contexts(team: &Team, list: &[(&str, f64)], timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
+    wait(timeout, || {
+        contexts(team, list);
+        check()
+    })
+}
+
+/// Lets `span` pass, telling the contexts again, and says whether `check` held all along.
+fn holds_with_contexts(team: &Team, list: &[(&str, f64)], span: Duration, mut check: impl FnMut() -> bool) -> bool {
+    !wait_with_contexts(team, list, span, || !check())
+}
+
+/// 4: a member at rest for the idle time (`RECRUIT_AUTO_COMPACT_IDLE`, 2 s here) whose context reaches the share gets
+/// one request, `"auto": true`, in `compact/<member>`; not one at the screen of a client, working, waiting, failed,
+/// running a command, or under the share; and one only per period of rest.
+#[test]
+fn auto_compaction_is_asked_once_at_rest() {
+    let mut team = Team::new(
+        "autoc",
+        &tables(
+            "autoc",
+            &["lead"],
+            &[("dev1", None), ("dev2", None), ("dev3", None), ("dev4", None), ("dev5", None), ("dev6", None)],
+            "",
+        ),
+    );
+    team.env("RECRUIT_AUTO_COMPACT_IDLE", "2");
+    let all = ["lead", "dev1", "dev2", "dev3", "dev4", "dev5", "dev6"];
+    team.launch(&all);
+    let devs = &all[1..];
+    // The client looks at the first tab: lead, the dashboard and the journal.
+    let mut term = client(&team, "lead");
+    let mut high = [
+        ("lead", 90.0),
+        ("dev1", 80.0),
+        ("dev2", 90.0),
+        ("dev3", 90.0),
+        ("dev4", 90.0),
+        ("dev5", 50.0),
+        ("dev6", 50.0),
+    ];
+    says(&team, "lead", "idle");
+    says(&team, "dev1", "idle");
+    says(&team, "dev2", "working");
+    says(&team, "dev3", "blocked:kind=permission");
+    fails(&team, "dev4", OVERLOADED);
+    // The contexts come once the states are in the server's hands: a pane that has told nothing yet takes the
+    // dashboard's state, which is rest, and a slow machine would ask it.
+    let states = team.state().join("states.json");
+    let told = wait(Duration::from_secs(15), || {
+        let Some(v) =
+            std::fs::read_to_string(&states).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        else {
+            return false;
+        };
+        v["members"]["dev2"]["state"] == "working"
+            && v["members"]["dev3"]["state"] == "waiting"
+            && v["members"]["dev4"]["state"] == "error"
+    });
+    assert!(told, "the states never came: {:?}", std::fs::read_to_string(&states));
+    // The command is seen by the dashboard, which polls `claude agents` every few seconds, only once the pane is at
+    // rest: until then dev5's context is under the share, so the rest's clock is not what is tested.
+    says(&team, "dev5", "idle");
+    agent_status(&team, "dev5", "shell");
+    let known = wait_with_contexts(&team, &high, Duration::from_secs(15), || {
+        std::fs::read_to_string(&states)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .is_some_and(|v| v["members"]["dev5"]["shell"] == true)
+    });
+    assert!(known, "the dashboard never saw dev5's command: {:?}", std::fs::read_to_string(&states));
+    high[5].1 = 90.0;
+    says(&team, "dev6", "idle");
+    let mut checks = Checks::default();
+    // dev1 alone, with the share it was seen at.
+    let asked = wait_with_contexts(&team, &high, Duration::from_secs(12), || compaction_asked(&team, "dev1").is_some());
+    checks.check("4 dev1 at rest, 80 %, out of view: asked", asked, || format!("{:?}", compactions_asked(&team, &all)));
+    if let Some(request) = compaction_asked(&team, "dev1") {
+        checks.check("4 the request is automatic", request["auto"] == true, || request.to_string());
+        let percent = request["percent"].as_u64();
+        checks.check("4 the request says the share seen", percent == Some(80), || request.to_string());
+        checks.check("4 the request lapses later", request["until"].as_i64().is_some(), || request.to_string());
+    }
+    // Everyone else had the same time: none is asked.
+    let others = holds_with_contexts(&team, &high, Duration::from_secs(5), || {
+        compactions_asked(&team, &all).iter().all(|m| m == "dev1")
+    });
+    let got = compactions_asked(&team, &all);
+    checks.check(
+        "4 lead (on screen), dev2 (works), dev3 (waits), dev4 (failed), dev5 (command), dev6 (50 %): not asked",
+        others,
+        || {
+            format!(
+                "{got:?}\nstates.json: {}",
+                std::fs::read_to_string(team.state().join("states.json")).unwrap_or_default()
+            )
+        },
+    );
+    // Once per period of rest: the mod takes the request (the file goes) and makes the compaction, and nothing comes
+    // back.
+    let id = compaction_asked(&team, "dev1").and_then(|r| r["id"].as_str().map(String::from)).unwrap_or_default();
+    let _ = std::fs::remove_file(team.state().join("compact/dev1"));
+    answer_compaction(&team, "dev1", &id, serde_json::json!({"done": true}));
+    let again = holds_with_contexts(&team, &high, Duration::from_secs(6), || compaction_asked(&team, "dev1").is_none());
+    checks.check("4 dev1 asked once in its rest", again, || format!("{:?}", compaction_asked(&team, "dev1")));
+    // A new rest, but its pane is on a client's screen: not asked; on the screen of none: asked.
+    says(&team, "dev1", "working");
+    std::thread::sleep(Duration::from_millis(1500));
+    let keys = alt(&term, '2');
+    term.send(&keys);
+    assert!(wait(Duration::from_secs(3), || devs.iter().all(|m| has_header(&term, m))), "{}", shown(&term));
+    says(&team, "dev1", "idle");
+    let seen = holds_with_contexts(&team, &high, Duration::from_secs(6), || compaction_asked(&team, "dev1").is_none());
+    checks.check("4 dev1 new rest, on a client's screen: not asked", seen, || {
+        format!("{:?}", compaction_asked(&team, "dev1"))
+    });
+    let keys = alt(&term, '1');
+    term.send(&keys);
+    let gone = wait_with_contexts(&team, &high, Duration::from_secs(8), || compaction_asked(&team, "dev1").is_some());
+    checks.check("4 dev1 new rest, the client left: asked", gone, || format!("{:?}", compactions_asked(&team, &all)));
+    // The lead, once the client leaves for another tab, is no longer on screen: asked.
+    let keys = alt(&term, '2');
+    term.send(&keys);
+    let lead = wait_with_contexts(&team, &high, Duration::from_secs(8), || compaction_asked(&team, "lead").is_some());
+    checks.check("4 lead no longer on screen: asked", lead, || format!("{:?}", compactions_asked(&team, &all)));
+    // dev2 stops working, out of view again: a rest begins; its share is 90 %.
+    let keys = alt(&term, '1');
+    term.send(&keys);
+    says(&team, "dev2", "idle");
+    let dev2 = wait_with_contexts(&team, &high, Duration::from_secs(8), || compaction_asked(&team, "dev2").is_some());
+    checks.check("4 dev2 at rest after its work: asked", dev2, || format!("{:?}", compactions_asked(&team, &all)));
+    checks.done();
+    drop(term);
+    team.stop();
+}
+
+/// 4: `auto_compact = false` asks nothing, whatever the context; `auto_compact = 85` waits for 85 %; and the switch
+/// changed on the running team (`recruit _edit`) is followed.
+#[test]
+fn auto_compaction_follows_the_settings() {
+    let mut off = Team::new("autooff", &tables("autooff", &["lead"], &[("dev", None)], "auto_compact = false"));
+    off.env("RECRUIT_AUTO_COMPACT_IDLE", "2");
+    off.launch(&["lead", "dev"]);
+    let high = [("lead", 95.0), ("dev", 95.0)];
+    contexts(&off, &high);
+    says(&off, "dev", "idle");
+    says(&off, "lead", "idle");
+    let quiet = holds_with_contexts(&off, &high, Duration::from_secs(7), || {
+        compactions_asked(&off, &["lead", "dev"]).is_empty()
+    });
+    assert!(quiet, "auto_compact = false, asked: {:?}", compactions_asked(&off, &["lead", "dev"]));
+    // Switched on while they rest: the share applies from the next try.
+    let state = off.state();
+    let out = off.recruit([
+        std::ffi::OsStr::new("_edit"),
+        state.as_os_str(),
+        std::ffi::OsStr::new(r#"[{"auto_compact": 70}]"#),
+    ]);
+    assert!(out.status.success(), "_edit: {}", String::from_utf8_lossy(&out.stderr));
+    let asked = wait_with_contexts(&off, &high, Duration::from_secs(10), || compaction_asked(&off, "dev").is_some());
+    assert!(asked, "switched on at 70 %, nothing asked: {:?}", compactions_asked(&off, &["lead", "dev"]));
+    off.stop();
+
+    let mut share = Team::new("autoshare", &tables("autoshare", &["lead"], &[("dev", None)], "auto_compact = 85"));
+    share.env("RECRUIT_AUTO_COMPACT_IDLE", "2");
+    share.launch(&["lead", "dev"]);
+    let under = [("lead", 10.0), ("dev", 80.0)];
+    contexts(&share, &under);
+    says(&share, "dev", "idle");
+    let quiet =
+        holds_with_contexts(&share, &under, Duration::from_secs(6), || compaction_asked(&share, "dev").is_none());
+    assert!(quiet, "80 % under auto_compact = 85, asked: {:?}", compaction_asked(&share, "dev"));
+    let over = [("lead", 10.0), ("dev", 86.0)];
+    let asked =
+        wait_with_contexts(&share, &over, Duration::from_secs(10), || compaction_asked(&share, "dev").is_some());
+    assert!(asked, "86 % over auto_compact = 85, nothing asked");
+    let request = compaction_asked(&share, "dev").expect("request");
+    assert_eq!(request["percent"].as_u64(), Some(86), "{request}");
+    share.stop();
+}
+
+/// Where the quick list (a click on the model or the effort of a header) is on the client's screen: its top left cell
+/// and its size, which the menu in list mode announced (`CSI 8 ; rows ; columns t`) and the server gave its pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListBox {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+}
+
+impl ListBox {
+    fn right(&self) -> usize {
+        self.x + self.w - 1
+    }
+
+    fn bottom(&self) -> usize {
+        self.y + self.h - 1
+    }
+}
+
+/// The quick list as drawn: found by its first row (« défaut : … »), its frame checked against the size
+/// its pane has. None while it is not (all) there.
+fn list_box(team: &Team, term: &TestTerm) -> Option<ListBox> {
+    let panes = team.panes();
+    let menu = panes.iter().find(|p| p["role"] == "menu")?;
+    let (w, h) = (menu["cols"].as_u64()? as usize, menu["rows"].as_u64()? as usize);
+    let screen = term.screen();
+    let (row, line) = screen.iter().enumerate().find(|(_, line)| line.contains("défaut"))?;
+    let label = unicode_width::UnicodeWidthStr::width(&line[..line.find("défaut")?]);
+    // « │ › défaut »: the frame, a blank, the cursor, a blank.
+    let found = ListBox { x: label.checked_sub(4)?, y: row.checked_sub(1)?, w, h };
+    let corner = |col: usize, row: usize| term.cell(col, row).0;
+    let framed = corner(found.x, found.y) == "╭"
+        && corner(found.right(), found.y) == "╮"
+        && corner(found.x, found.bottom()) == "╰"
+        && corner(found.right(), found.bottom()) == "╯";
+    framed.then_some(found)
+}
+
+/// Waits for the quick list, 8 s at most.
+fn wait_list(team: &Team, term: &TestTerm) -> Option<ListBox> {
+    let mut seen = None;
+    wait(Duration::from_secs(8), || {
+        seen = list_box(team, term);
+        seen.is_some()
+    });
+    seen
+}
+
+/// Waits until the quick list is gone: its pane closed and nothing of it on the screen.
+fn wait_list_gone(team: &Team, term: &TestTerm) -> bool {
+    wait(Duration::from_secs(5), || menu_text(team).is_none() && !shown(term).contains("défaut"))
+}
+
+/// A mouse move to `(col, row)`, as the terminal reports it with every motion on (`?1003`).
+fn hover(term: &mut TestTerm, (col, row): (usize, usize)) {
+    term.send(format!("\x1b[<35;{};{}M", col + 1, row + 1).as_bytes());
+}
+
+/// What a cell looks like: its text color, its background and its attributes.
+fn look_of(term: &TestTerm, (col, row): (usize, usize)) -> (String, String, String) {
+    let cell = term.cell(col, row);
+    (cell.1, cell.2, term.flags(col, row))
+}
+
+/// The looks of what the quick list must leave as it is: lead's text, the dashboard's title, the bar's first cells.
+fn untouched(term: &TestTerm) -> Vec<(String, String, String)> {
+    let mut cells = Vec::new();
+    for (text, len) in [("FAKE CLAUDE", 11), ("Tableau de bord", 15)] {
+        if let Some((col, row)) = (0..term.screen().len()).find_map(|r| {
+            let line = term.screen()[r].clone();
+            line.find(text).map(|at| (unicode_width::UnicodeWidthStr::width(&line[..at]), r))
+        }) {
+            cells.extend((0..len).map(|i| look_of(term, (col + i, row))));
+        }
+    }
+    let bar = term.screen().len() - 1;
+    cells.extend((0..8).map(|i| look_of(term, (i, bar))));
+    cells
+}
+
+/// The row of the list where the cursor `›` is, among the rows of `list`.
+fn list_cursor(term: &TestTerm, list: ListBox) -> Option<usize> {
+    let screen = term.screen();
+    (list.y + 1..list.bottom()).find(|row| term.cell(list.x + 2, *row).0 == "›" && screen[*row].contains('›'))
+}
+
+/// The team's project settings file, as it is now.
+fn team_file(team: &Team) -> String {
+    std::fs::read_to_string(team.proj.join(".recruit/settings.toml")).expect("settings.toml")
+}
+
+/// The team with `lead` and `dev` (in the second tab), their models and efforts told as the mod would, and a client
+/// of 120 × 40 that has seen the headers learn them.
+fn quick_team(name: &str, extra: &str) -> (Team, TestTerm) {
+    let team = Team::new(name, &tables(name, &["lead"], &[("dev", None)], extra));
+    team.launch(&["lead", "dev"]);
+    report(&team, "lead", "claude-opus-5-5", "high", 40.0);
+    report(&team, "dev", "claude-opus-5-5", "high", 40.0);
+    says(&team, "lead", "idle");
+    says(&team, "dev", "idle");
+    let term = client(&team, "lead");
+    assert!(wait(Duration::from_secs(8), || find_in_header(&term, "Opus").is_some()), "{}", shown(&term));
+    (team, term)
+}
+
+/// 3: a click on the model or the effort of a header opens, under the text, the list of its values, at the size the
+/// menu announces, the text clicked in reverse video and nothing dimmed; Esc, a click outside or a second click on the
+/// text close it with nothing changed and the focus where it was; ↑↓ and ⏎ (or a click on a value) write the value in
+/// the file that gives it and the header follows; the pointer moving over the values moves the cursor.
+#[test]
+fn quick_list_chooses_a_model_and_an_effort() {
+    let (team, mut term) = quick_team("quick", "");
+    let members = ["lead", "dev"];
+    let mut checks = Checks::default();
+    let before_file = team_file(&team);
+    let before_active = active(&term, &members);
+    let before_untouched = untouched(&term);
+    let model = find_in_header(&term, "Opus").expect("the model");
+    let model_before = look_of(&term, model);
+    let open = |term: &mut TestTerm, at: (usize, usize)| {
+        click(term, at);
+        wait_list(&team, term)
+    };
+
+    // Opens under the text, at the size announced, the text in reverse, nothing dimmed.
+    let Some(list) = open(&mut term, model) else { panic!("no list: {}", shown(&term)) };
+    checks.check("3 under the model: its row is the next", list.y == model.1 + 1, || format!("{list:?} {model:?}"));
+    checks.check("3 under the model: the values start at its column", list.x + 4 == model.0, || {
+        format!("{list:?} {model:?}")
+    });
+    println!(
+        "CLICKED STYLES: {:?}",
+        (0..4).map(|i| (term.cell(model.0 + i, model.1), term.flags(model.0 + i, model.1))).collect::<Vec<_>>()
+    );
+    println!(
+        "HEADER STYLES before? other cells: {:?}",
+        (0..4).map(|i| (term.cell(model.0 - 8 + i, model.1), term.flags(model.0 - 8 + i, model.1))).collect::<Vec<_>>()
+    );
+    let neighbor = find_in_header(&term, "élevé").expect("the effort beside the model");
+    checks.check(
+        "3 the model lit: not styled as the text beside it",
+        (0..4).all(|i| look_of(&term, (model.0 + i, model.1)) != look_of(&term, (neighbor.0 + i, neighbor.1))),
+        || format!("{:?} against {:?}", look_of(&term, model), look_of(&term, neighbor)),
+    );
+    checks.check("3 the model lit: not as it was", look_of(&term, model) != model_before, || {
+        format!("{:?}", model_before)
+    });
+    checks.check("3 nothing dimmed: the rest looks as it did", untouched(&term) == before_untouched, || {
+        format!("{:?}\n{:?}", untouched(&term), before_untouched)
+    });
+    let body = shown(&term);
+    for value in ["défaut", "Opus", "Sonnet", "Haiku", "Fable", "Autre…", "actuel"] {
+        checks.check(&format!("3 the list says {value}"), body.contains(value), || body.clone());
+    }
+    // Hover: the cursor goes to the value under the pointer (rows y+1.. are the values).
+    let rows: Vec<usize> = (list.y + 1..list.bottom()).collect();
+    for (n, row) in rows.iter().enumerate().skip(1).take(3) {
+        hover(&mut term, (list.x + 8, *row));
+        let moved = wait(Duration::from_secs(2), || list_cursor(&term, list) == Some(*row));
+        checks.check(&format!("3 hover #{n}: the cursor follows"), moved, || {
+            format!("at {:?} for {row}\n{}", list_cursor(&term, list), shown(&term))
+        });
+    }
+    // Esc closes: nothing changed, the focus back, no reverse video.
+    term.send(b"\x1b");
+    checks.check("3 Esc closes", wait_list_gone(&team, &term), || shown(&term));
+    checks.check("3 Esc: the file is as it was", team_file(&team) == before_file, || team_file(&team));
+    checks.check(
+        "3 Esc: the focus is back",
+        wait(Duration::from_secs(2), || active(&term, &members) == before_active),
+        || format!("{:?}", active(&term, &members)),
+    );
+    checks.check(
+        "3 Esc: no reverse video left",
+        wait(Duration::from_secs(2), || look_of(&term, model) == model_before),
+        || shown(&term),
+    );
+    // A click outside, in lead's own pane.
+    if open(&mut term, model).is_some() {
+        click(&mut term, (10, 20));
+        checks.check("3 a click outside closes", wait_list_gone(&team, &term), || shown(&term));
+        checks.check("3 outside: the file is as it was", team_file(&team) == before_file, || team_file(&team));
+        checks.check(
+            "3 outside: the focus is back",
+            wait(Duration::from_secs(2), || active(&term, &members) == before_active),
+            || format!("{:?}", active(&term, &members)),
+        );
+    } else {
+        checks.check("3 the list opens again", false, || shown(&term));
+    }
+    // A second click on the text.
+    if open(&mut term, model).is_some() {
+        click(&mut term, (model.0 + 1, model.1));
+        checks.check("3 a second click on the text closes", wait_list_gone(&team, &term), || shown(&term));
+        checks.check("3 second click: the file is as it was", team_file(&team) == before_file, || team_file(&team));
+        checks.check(
+            "3 second click: the focus is back",
+            wait(Duration::from_secs(2), || active(&term, &members) == before_active),
+            || format!("{:?}", active(&term, &members)),
+        );
+    } else {
+        checks.check("3 the list opens a third time", false, || shown(&term));
+    }
+    // ↓↓ ⏎: « default » is in place, Opus then Sonnet.
+    if let Some(list) = open(&mut term, model) {
+        term.send(b"\x1b[B\x1b[B");
+        let down = wait(Duration::from_secs(2), || list_cursor(&term, list) == Some(list.y + 3));
+        checks.check("3 ↓↓ goes to the third value", down, || format!("{:?}", list_cursor(&term, list)));
+        term.send(b"\r");
+        checks.check("3 ⏎ closes", wait_list_gone(&team, &term), || shown(&term));
+        let written = wait(Duration::from_secs(3), || team_file(&team).contains("model = \"sonnet\""));
+        checks.check("3 ⏎ writes model = \"sonnet\" for lead", written, || team_file(&team));
+        let lead = team_file(&team);
+        let table = lead.split("[teams.quick.members.").find(|t| t.starts_with("lead]")).unwrap_or_default();
+        checks.check("3 the value is in lead's table", table.contains("model = \"sonnet\""), || lead.clone());
+        checks.check(
+            "3 dev's table is left alone",
+            !lead.split("members.dev]").nth(1).unwrap_or("").contains("model"),
+            || lead.clone(),
+        );
+        let followed = wait(Duration::from_secs(5), || {
+            term.screen().first().is_some_and(|r| r.contains("Sonnet") && !r.contains("Opus"))
+        });
+        checks.check("3 the header follows: Sonnet", followed, || shown(&term));
+        checks.check(
+            "3 ⏎: the focus is back",
+            wait(Duration::from_secs(2), || active(&term, &members) == before_active),
+            || format!("{:?}", active(&term, &members)),
+        );
+    } else {
+        checks.check("3 the list opens for the choice", false, || shown(&term));
+    }
+    // The effort: its own list, with the levels.
+    let effort = find_in_header(&term, "élevé").expect("the effort");
+    let effort_before = look_of(&term, effort);
+    if let Some(list) = open(&mut term, effort) {
+        let body = shown(&term);
+        for level in ["faible", "moyen", "élevé", "extra", "max"] {
+            checks.check(&format!("3 the effort list says {level}"), body.contains(level), || body.clone());
+        }
+        checks.check("3 under the effort: its row is the next", list.y == effort.1 + 1, || {
+            format!("{list:?} {effort:?}")
+        });
+        checks.check("3 the effort lit", look_of(&term, effort) != effort_before, || shown(&term));
+        term.send(b"\x1b[B");
+        term.send(b"\r");
+        let written = wait(Duration::from_secs(3), || team_file(&team).contains("effort = \"low\""));
+        checks.check("3 ⏎ writes effort = \"low\"", written, || team_file(&team));
+        let followed = wait(Duration::from_secs(5), || term.screen().first().is_some_and(|r| r.contains("faible")));
+        checks.check("3 the header follows: low", followed, || shown(&term));
+    } else {
+        checks.check("3 the effort list opens", false, || shown(&term));
+    }
+    // A click on a value chooses it.
+    let model = find_in_header(&term, "Sonnet").expect("the model");
+    if let Some(list) = open(&mut term, model) {
+        let haiku = (list.y + 1..list.bottom()).find(|row| term.screen()[*row].contains("Haiku"));
+        match haiku {
+            Some(row) => {
+                click(&mut term, (list.x + 8, row));
+                let written = wait(Duration::from_secs(3), || team_file(&team).contains("model = \"haiku\""));
+                checks.check("3 a click on a value writes it", written, || team_file(&team));
+            }
+            None => checks.check("3 Haiku in the list", false, || shown(&term)),
+        }
+    }
+    checks.done();
+    drop(term);
+    let mut team = team;
+    team.stop();
+}
+
+/// 3: the list slides left to stay on the screen (the model of the last of three columns), and opens above the text
+/// when there is no room below (the header of the bottom pane).
+#[test]
+fn quick_list_stays_on_the_screen() {
+    let mut checks = Checks::default();
+    // Three columns of a 120-column screen: the third one's effort is near the right edge.
+    let mut team = Team::new(
+        "quickedge",
+        &tables("quickedge", &["lead"], &[("a1", None), ("a2", None), ("a3", None)], "columns = 3\nrows = 1"),
+    );
+    team.launch(&["lead", "a1", "a2", "a3"]);
+    for m in ["lead", "a1", "a2", "a3"] {
+        report(&team, m, "claude-opus-5-5", "high", 40.0);
+        says(&team, m, "idle");
+    }
+    let mut term = team.attach(120, 24, Profile::default());
+    assert!(term.wait_for("lead", Duration::from_secs(5)));
+    let keys = alt(&term, '2');
+    term.send(&keys);
+    assert!(
+        wait(Duration::from_secs(8), || ["a1", "a2", "a3"].iter().all(|m| has_header(&term, m))),
+        "{}",
+        shown(&term)
+    );
+    assert!(wait(Duration::from_secs(8), || term.screen()[0].matches("Opus").count() == 3), "{}", shown(&term));
+    let row0 = term.screen()[0].clone();
+    // The columns are narrow: the effort shows as its sign only.
+    let at = row0.rfind('\u{25cf}').expect("the last effort");
+    let effort = (unicode_width::UnicodeWidthStr::width(&row0[..at]), 0);
+    let effort_before = look_of(&term, effort);
+    click(&mut term, effort);
+    match wait_list(&team, &term) {
+        Some(list) => {
+            checks
+                .check("3 near the right edge: ends at the screen's edge", list.right() == 119, || format!("{list:?}"));
+            checks.check("3 near the right edge: slid left of the text", list.x + 4 < effort.0, || {
+                format!("{list:?} {effort:?}")
+            });
+            checks.check("3 near the right edge: below the text", list.y == 1, || format!("{list:?}"));
+            checks
+                .check("3 near the right edge: the text lit", look_of(&term, effort) != effort_before, || shown(&term));
+        }
+        None => checks.check("3 the list opens at the right edge", false, || shown(&term)),
+    }
+    term.send(b"\x1b");
+    checks.check("3 the list at the edge closes", wait_list_gone(&team, &term), || shown(&term));
+    drop(term);
+    team.stop();
+
+    // One column of three panes in 20 rows: the bottom pane's header has no room below.
+    let mut team = Team::new(
+        "quickbottom",
+        &tables("quickbottom", &["lead"], &[("a1", None), ("a2", None), ("a3", None)], "columns = 1\nrows = 3"),
+    );
+    team.launch(&["lead", "a1", "a2", "a3"]);
+    for m in ["lead", "a1", "a2", "a3"] {
+        report(&team, m, "claude-opus-5-5", "high", 40.0);
+        says(&team, m, "idle");
+    }
+    let mut term = team.attach(140, 20, Profile::default());
+    assert!(term.wait_for("lead", Duration::from_secs(5)));
+    let keys = alt(&term, '2');
+    term.send(&keys);
+    assert!(
+        wait(Duration::from_secs(8), || ["a1", "a2", "a3"].iter().all(|m| has_header(&term, m))),
+        "{}",
+        shown(&term)
+    );
+    let bottom = wait(Duration::from_secs(8), || {
+        term.screen().iter().filter(|r| r.contains("Opus") && r.contains(" a")).count() == 3
+    });
+    assert!(bottom, "{}", shown(&term));
+    let screen = term.screen();
+    let row = screen.iter().rposition(|r| r.contains("Opus") && r.contains(" a3 ")).expect("a3's header");
+    let col = unicode_width::UnicodeWidthStr::width(&screen[row][..screen[row].find("Opus").unwrap()]);
+    let text_before = look_of(&term, (col, row));
+    click(&mut term, (col, row));
+    match wait_list(&team, &term) {
+        Some(list) => {
+            checks.check("3 at the bottom: the list ends just above the text", list.bottom() + 1 == row, || {
+                format!("{list:?} header on row {row}")
+            });
+            checks.check(
+                "3 at the bottom: the values start at the text's column, or end at the screen's edge",
+                list.x + 4 == col || list.right() == 139,
+                || format!("{list:?} col {col}"),
+            );
+            checks.check("3 at the bottom: the text lit", look_of(&term, (col, row)) != text_before, || shown(&term));
+        }
+        None => checks.check("3 the list opens at the bottom", false, || shown(&term)),
+    }
+    term.send(b"\x1b");
+    checks.check("3 the list at the bottom closes", wait_list_gone(&team, &term), || shown(&term));
+    drop(term);
+    team.stop();
+    checks.done();
+}
+
+/// Makes `dir` read-only, and writable again when dropped: the test's folder goes away either way.
+struct ReadOnly(std::path::PathBuf);
+
+impl ReadOnly {
+    fn new(dir: std::path::PathBuf) -> ReadOnly {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("read-only");
+        ReadOnly(dir)
+    }
+}
+
+impl Drop for ReadOnly {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// 3: a value that starts a member that works again asks first, inside the list, on « Annuler »; Annuler changes
+/// nothing, « Relancer » writes the value and starts the member again on its conversation; a write that is refused
+/// leaves the list open with the reason.
+#[test]
+fn quick_list_asks_and_refuses() {
+    let toml = tables("quickask", &["lead"], &[("dev", None)], "")
+        .replace("role = \"Agent dev\"\n", "role = \"Agent dev\"\nmodel = \"opus\"\n");
+    let mut team = Team::new("quickask", &toml);
+    team.launch(&["lead", "dev"]);
+    report(&team, "lead", "claude-opus-5-5", "high", 40.0);
+    report(&team, "dev", "claude-opus-5-5", "high", 40.0);
+    says(&team, "lead", "idle");
+    says(&team, "dev", "working");
+    let mut term = client(&team, "lead");
+    let keys = alt(&term, '2');
+    term.send(&keys);
+    assert!(
+        wait(Duration::from_secs(8), || has_header(&term, "dev") && find_in_header(&term, "Opus").is_some()),
+        "{}",
+        shown(&term)
+    );
+    let session = noted(&team, "dev");
+    let mut checks = Checks::default();
+    let before_file = team_file(&team);
+    let model = find_in_header(&term, "Opus").expect("dev's model");
+    // Back to the default starts it again (↻): the question opens in the list, on Annuler.
+    click(&mut term, model);
+    assert!(wait_list(&team, &term).is_some(), "no list: {}", shown(&term));
+    checks.check(
+        "3 the default row says ↻",
+        shown(&term).lines().any(|r| r.contains("défaut") && r.contains('↻')),
+        || shown(&term),
+    );
+    term.send(b"\x1b[A");
+    term.send(b"\r");
+    let asked = wait(Duration::from_secs(3), || shown(&term).contains("Annuler"));
+    checks.check("3 working + ↻: the question opens", asked, || shown(&term));
+    let at = find(&term, "Annuler");
+    if let Some(at) = at {
+        let inside = list_box(&team, &term).is_some_and(|l| at.0 > l.x && at.0 < l.right() && at.1 < l.y + l.h);
+        checks.check("3 the question is in the list", inside, || shown(&term));
+        checks.check("3 Annuler is the chosen button", term.flags(at.0 + 2, at.1).contains('b'), || {
+            term.flags(at.0 + 2, at.1)
+        });
+        let yes = shown(&term).lines().find(|r| r.contains("Relancer (r)")).map(String::from);
+        checks.check("3 the other button is not", yes.is_some(), || shown(&term));
+    }
+    term.send(b"\r");
+    checks.check("3 ⏎ on Annuler closes", wait_list_gone(&team, &term), || shown(&term));
+    checks.check("3 Annuler: the file is as it was", team_file(&team) == before_file, || team_file(&team));
+    checks.check("3 Annuler: dev was not started again", team.launches("dev").len() == 1, || {
+        format!("{:?}", team.launches("dev"))
+    });
+    // Again, and « Relancer ».
+    click(&mut term, model);
+    if wait_list(&team, &term).is_some() {
+        term.send(b"\x1b[A");
+        term.send(b"\r");
+        let _ = wait(Duration::from_secs(3), || shown(&term).contains("Annuler"));
+        term.send(b"r");
+        let again = wait(Duration::from_secs(10), || team.launches("dev").len() == 2);
+        checks.check("3 Relancer: dev starts again", again, || format!("{:?}", team.launches("dev")));
+        if again {
+            let second = team.launches("dev")[1].clone();
+            checks.check("3 Relancer: on its conversation", second.ends_with(&format!("-n dev -r {session}")), || {
+                second.clone()
+            });
+        }
+        let written = wait(Duration::from_secs(3), || !team_file(&team).contains("model = \"opus\""));
+        checks.check("3 Relancer: the default leaves the key out", written, || team_file(&team));
+        checks.check("3 Relancer: the list closes", wait_list_gone(&team, &term), || shown(&term));
+    } else {
+        checks.check("3 the list opens again", false, || shown(&term));
+    }
+    // A write that is refused: the list stays, with the reason.
+    let keys = alt(&term, '1');
+    term.send(&keys);
+    assert!(wait(Duration::from_secs(5), || has_header(&term, "lead")), "{}", shown(&term));
+    let lead = find_in_header(&term, "Opus").expect("lead's model");
+    let _read_only = ReadOnly::new(team.proj.join(".recruit"));
+    click(&mut term, lead);
+    if wait_list(&team, &term).is_some() {
+        term.send(b"\x1b[B");
+        term.send(b"\r");
+        let refused = wait(Duration::from_secs(5), || shown(&term).contains("✗"));
+        checks.check("3 refused: the reason shows", refused, || shown(&term));
+        checks.check("3 refused: the list stays open", list_box(&team, &term).is_some(), || shown(&term));
+        checks.check("3 refused: the file is as it was", team_file(&team).contains("[teams.quickask]"), || {
+            team_file(&team)
+        });
+        term.send(b"\x1b");
+        checks.check("3 refused: Esc closes", wait_list_gone(&team, &term), || shown(&term));
+    } else {
+        checks.check("3 the list opens for a refusal", false, || shown(&term));
+    }
+    drop(_read_only);
+    checks.done();
+    drop(term);
+    team.stop();
+}
+
+/// What `_ctl panes` says of `member`'s pane: the state its program told (`status`) and since when (`since`, seconds).
+fn pane_status(team: &Team, member: &str) -> (Option<String>, Option<u64>) {
+    let panes = team.panes();
+    let pane = panes.iter().find(|p| p["member"] == member);
+    (pane.and_then(|p| p["status"].as_str().map(String::from)), pane.and_then(|p| p["since"].as_u64()))
+}
+
+/// The spinner of a member at work, in any of its steps.
+fn spinning(text: &str) -> bool {
+    text.chars().any(|c| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(c))
+}
+
+/// 4: the `working` that Claude Code says while it compacts is no turn: the member stays at rest (header, bar, `_ctl
+/// panes` with the same `since`) until its mod answers. Made: the `working` is dropped, and the `idle` that follows
+/// changes nothing. Refused for helpers, or failed: the `working` is a turn after all, told since it began.
+#[test]
+fn a_compaction_holds_the_working() {
+    let mut team =
+        Team::new("autohold", &tables("autohold", &["lead"], &[("dev1", None), ("dev2", None), ("dev3", None)], ""));
+    team.env("RECRUIT_AUTO_COMPACT_IDLE", "2");
+    let devs = ["dev1", "dev2", "dev3"];
+    team.launch(&["lead", "dev1", "dev2", "dev3"]);
+    let high = [("lead", 10.0), ("dev1", 85.0), ("dev2", 85.0), ("dev3", 85.0)];
+    for member in ["lead", "dev1", "dev2", "dev3"] {
+        says(&team, member, "idle");
+    }
+    let told =
+        wait(Duration::from_secs(15), || devs.iter().all(|m| pane_status(&team, m).0.as_deref() == Some("idle")));
+    assert!(told, "the states never came: {:?}", team.panes());
+    contexts(&team, &high);
+    let asked = wait_with_contexts(&team, &high, Duration::from_secs(15), || {
+        devs.iter().all(|m| compaction_asked(&team, m).is_some())
+    });
+    assert!(asked, "not all asked: {:?}", compactions_asked(&team, &devs));
+    let id = |member: &str| compaction_asked(&team, member).and_then(|r| r["id"].as_str().map(String::from)).unwrap();
+    let ids: Vec<String> = devs.iter().map(|m| id(m)).collect();
+    // The mod takes the requests.
+    for member in devs {
+        let _ = std::fs::remove_file(team.state().join("compact").join(member));
+    }
+    let rest: Vec<Option<u64>> = devs.iter().map(|m| pane_status(&team, m).1).collect();
+    assert!(rest.iter().all(Option::is_some), "no rest start: {:?}", team.panes());
+    // Claude Code compacts: `working`, which is no turn.
+    let began = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    for member in devs {
+        says(&team, member, "working");
+    }
+    let mut checks = Checks::default();
+    let held = holds_with_contexts(&team, &high, Duration::from_millis(2500), || {
+        devs.iter().zip(&rest).all(|(m, since)| {
+            let (status, at) = pane_status(&team, m);
+            status.as_deref() == Some("idle") && at == *since
+        })
+    });
+    checks
+        .check("4 compacting: `_ctl panes` stay at rest, with the same since", held, || format!("{:?}", team.panes()));
+    // The screen: no spinner in the headers, the bar counts them at rest.
+    let mut term = team.attach(140, 40, Profile::default());
+    assert!(term.wait_for("lead", Duration::from_secs(5)));
+    let keys = alt(&term, '2');
+    term.send(&keys);
+    assert!(wait(Duration::from_secs(5), || devs.iter().all(|m| has_header(&term, m))), "{}", shown(&term));
+    let headers: Vec<String> = term
+        .screen()
+        .into_iter()
+        .filter(|row| {
+            row.chars().any(|c| matches!(c, '╭' | '┏')) && devs.iter().any(|m| row.contains(&format!(" {m} ")))
+        })
+        .collect();
+    checks.check("4 compacting: no spinner in the headers", headers.len() == 1 && !spinning(&headers[0]), || {
+        shown(&term)
+    });
+    let bar = bar_of(&term);
+    checks.check("4 compacting: no spinner in the bar", !spinning(&bar), || bar.clone());
+    // dev1: made. The held `working` is dropped; the `idle` that follows changes nothing.
+    answer_compaction(&team, "dev1", &ids[0], serde_json::json!({"done": true}));
+    says(&team, "dev1", "idle");
+    // dev2: refused for helpers; dev3: failed. Their `working` was a turn: told since it began.
+    answer_compaction(&team, "dev2", &ids[1], serde_json::json!({"skip": "helpers"}));
+    answer_compaction(&team, "dev3", &ids[2], serde_json::json!({"error": "boom"}));
+    let turn = wait_with_contexts(&team, &high, Duration::from_secs(10), || {
+        ["dev2", "dev3"].iter().all(|m| pane_status(&team, m).0.as_deref() == Some("working"))
+    });
+    checks.check("4 refused or failed: the held working applies", turn, || format!("{:?}", team.panes()));
+    for member in ["dev2", "dev3"] {
+        let since = pane_status(&team, member).1.unwrap_or_default();
+        checks.check(
+            &format!("4 {member}: the working is told since it began"),
+            since >= began && since <= began + 4,
+            || format!("since {since}, working told at {began}"),
+        );
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    let (status, since) = pane_status(&team, "dev1");
+    checks.check(
+        "4 made: dev1 stays at rest, since unchanged",
+        status.as_deref() == Some("idle") && since == rest[0],
+        || format!("{status:?} {since:?} (rest since {:?})", rest[0]),
+    );
+    let working =
+        wait(Duration::from_secs(8), || term.screen().iter().any(|row| row.contains(" dev2 ") && spinning(row)));
+    checks.check("4 refused: the header shows the work", working, || shown(&term));
+    checks.done();
+    drop(term);
+    team.stop();
+}
+
+/// 4, found with real Claude Code on 2026-10-11 (`claude_auto_compaction`): a message typed while a member compacts is
+/// queued, and its turn starts as the compaction ends, with no `done` and no `working` of its own: Claude Code says
+/// `working` once at the compaction's start and `done` once at the turn's end. The mod answers the compaction (`done`)
+/// in between. The member must then show at work until that `done` (with a `since` between the compaction's start and
+/// its answer); a compaction alone, whose `done` comes before the mod's answer, stays at rest all along.
+#[test]
+fn a_turn_queued_during_a_compaction_shows_at_work() {
+    let mut team = Team::new("autoqueue", &tables("autoqueue", &["lead"], &[("dev1", None), ("dev2", None)], ""));
+    team.env("RECRUIT_AUTO_COMPACT_IDLE", "2");
+    let devs = ["dev1", "dev2"];
+    team.launch(&["lead", "dev1", "dev2"]);
+    let high = [("lead", 10.0), ("dev1", 85.0), ("dev2", 85.0)];
+    for member in ["lead", "dev1", "dev2"] {
+        says(&team, member, "idle");
+    }
+    let told =
+        wait(Duration::from_secs(15), || devs.iter().all(|m| pane_status(&team, m).0.as_deref() == Some("idle")));
+    assert!(told, "the states never came: {:?}", team.panes());
+    contexts(&team, &high);
+    let asked = wait_with_contexts(&team, &high, Duration::from_secs(15), || {
+        devs.iter().all(|m| compaction_asked(&team, m).is_some())
+    });
+    assert!(asked, "not all asked: {:?}", compactions_asked(&team, &devs));
+    let id = |member: &str| compaction_asked(&team, member).and_then(|r| r["id"].as_str().map(String::from)).unwrap();
+    let ids: Vec<String> = devs.iter().map(|m| id(m)).collect();
+    for member in devs {
+        let _ = std::fs::remove_file(team.state().join("compact").join(member));
+    }
+    let rest: Vec<Option<u64>> = devs.iter().map(|m| pane_status(&team, m).1).collect();
+    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    // Both compact: `working`, once.
+    let began = now();
+    for member in devs {
+        says(&team, member, "working");
+    }
+    let mut checks = Checks::default();
+    let held = holds_with_contexts(&team, &high, Duration::from_millis(2000), || {
+        devs.iter().zip(&rest).all(|(m, since)| {
+            let (status, at) = pane_status(&team, m);
+            status.as_deref() == Some("idle") && at == *since
+        })
+    });
+    checks.check("4 compacting: both at rest", held, || format!("{:?}", team.panes()));
+    // dev2, a compaction alone: its `done` comes first, the mod's answer after. At rest all along.
+    says(&team, "dev2", "done");
+    std::thread::sleep(Duration::from_millis(600));
+    answer_compaction(&team, "dev2", &ids[1], serde_json::json!({"done": true}));
+    let alone = holds_with_contexts(&team, &high, Duration::from_millis(3500), || {
+        let (status, at) = pane_status(&team, "dev2");
+        status.as_deref() != Some("working") && at == rest[1] || status.as_deref() == Some("idle")
+    });
+    checks.check("4 a compaction alone stays at rest", alone, || format!("{:?}", team.panes()));
+    // dev1, a turn queued behind it: the mod answers, no `done` has come: at work until it does.
+    let answered = now();
+    answer_compaction(&team, "dev1", &ids[0], serde_json::json!({"done": true}));
+    let works = wait_with_contexts(&team, &high, Duration::from_secs(8), || {
+        pane_status(&team, "dev1").0.as_deref() == Some("working")
+    });
+    checks.check("4 queued turn: at work once the compaction is answered", works, || format!("{:?}", team.panes()));
+    let since = pane_status(&team, "dev1").1.unwrap_or_default();
+    checks.check(
+        "4 queued turn: a since between the compaction's start and a moment after its answer",
+        since >= began && since <= answered + 4,
+        || format!("since {since}, started {began}, answered {answered}"),
+    );
+    // The header of the member shows the work.
+    let mut term = team.attach(140, 40, Profile::default());
+    assert!(term.wait_for("lead", Duration::from_secs(5)));
+    let keys = alt(&term, '2');
+    term.send(&keys);
+    assert!(wait(Duration::from_secs(5), || devs.iter().all(|m| has_header(&term, m))), "{}", shown(&term));
+    let spinner = wait(Duration::from_secs(5), || {
+        term.screen()
+            .iter()
+            .any(|row| row.contains(" dev1 ") && row.chars().any(|c| matches!(c, '╭' | '┏')) && spinning(row))
+    });
+    checks.check("4 queued turn: the header shows the work", spinner, || shown(&term));
+    // It stays so, for as long as the turn lasts.
+    let stays = holds_with_contexts(&team, &high, Duration::from_millis(3000), || {
+        pane_status(&team, "dev1").0.as_deref() == Some("working")
+    });
+    checks.check("4 queued turn: still at work 3 s later", stays, || format!("{:?}", team.panes()));
+    // Its `done`: at rest, since now.
+    let ended = now();
+    says(&team, "dev1", "done");
+    let rested = wait_with_contexts(&team, &high, Duration::from_secs(5), || {
+        pane_status(&team, "dev1").0.as_deref() == Some("idle")
+    });
+    checks.check("4 queued turn: its done brings the rest", rested, || format!("{:?}", team.panes()));
+    let (_, after) = pane_status(&team, "dev1");
+    checks.check(
+        "4 queued turn: the rest begins with that done",
+        after.is_some_and(|a| a >= ended.saturating_sub(1)),
+        || format!("{after:?} against {ended}"),
+    );
+    checks.done();
+    drop(term);
+    team.stop();
+}
+
+/// The tab in « focus » (`layout = "focus"`, ⌥l): six agents, the active one on the left, three panels on the right, the
+/// two others as cards in « others ». A member in a card that waits, or whose turn failed, enters at once, over the
+/// minute a panel keeps its place; the one it takes the place of goes to the cards. (Decision of 2026-10-11 : a member
+/// at work respects the minute: `focus_a_member_at_work_waits_its_turn`, which is long.)
+#[test]
+fn focus_a_member_that_waits_or_failed_enters_at_once() {
+    let tables = tables(
+        "focus",
+        &["lead"],
+        &[
+            ("a1", Some("crew")),
+            ("a2", Some("crew")),
+            ("a3", Some("crew")),
+            ("a4", Some("crew")),
+            ("a5", Some("crew")),
+            ("a6", Some("crew")),
+        ],
+        "layout = \"focus\"",
+    );
+    let mut team = Team::new("focus", &tables);
+    let members = ["lead", "a1", "a2", "a3", "a4", "a5", "a6"];
+    team.launch(&members);
+    for member in members {
+        report(&team, member, "claude-opus-5-5", "high", 40.0);
+    }
+    for (member, state) in [
+        ("lead", "idle"),
+        ("a1", "working"),
+        ("a2", "working"),
+        ("a3", "working"),
+        ("a4", "idle"),
+        ("a5", "idle"),
+        ("a6", "idle"),
+    ] {
+        says(&team, member, state);
+    }
+    let mut term = client(&team, "lead");
+    let keys = alt(&term, '2');
+    term.send(&keys);
+    let shown_panels = |term: &TestTerm| -> Vec<String> {
+        ["a1", "a2", "a3", "a4", "a5", "a6"].iter().filter(|m| has_header(term, m)).map(|m| m.to_string()).collect()
+    };
+    // Four panels (the active one and three), two cards.
+    let laid = wait(Duration::from_secs(8), || shown_panels(&term).len() == 4);
+    assert!(laid, "focus: four panels expected: {:?}\n{}", shown_panels(&term), shown(&term));
+    let panels = shown_panels(&term);
+    let card = ["a1", "a2", "a3", "a4", "a5", "a6"].into_iter().find(|m| !panels.contains(&m.to_string())).unwrap();
+    let mut checks = Checks::default();
+    // A card that waits enters at once.
+    says(&team, card, "blocked:kind=permission");
+    let entered = wait(Duration::from_secs(4), || has_header(&term, card));
+    checks.check(&format!("focus: {card}, a card, waits: its panel shows within 4 s"), entered, || {
+        format!("{:?}\n{}", shown_panels(&term), shown(&term))
+    });
+    checks.check("focus: four panels still", shown_panels(&term).len() == 4, || format!("{:?}", shown_panels(&term)));
+    // A card whose turn failed, the same.
+    says(&team, card, "idle");
+    std::thread::sleep(Duration::from_millis(800));
+    let panels = shown_panels(&term);
+    if let Some(other) = ["a1", "a2", "a3", "a4", "a5", "a6"].into_iter().find(|m| !panels.contains(&m.to_string())) {
+        fails(&team, other, OVERLOADED);
+        let entered = wait(Duration::from_secs(4), || has_header(&term, other));
+        checks.check(&format!("focus: {other}, a card, failed: its panel shows within 4 s"), entered, || {
+            format!("{:?}\n{}", shown_panels(&term), shown(&term))
+        });
+    } else {
+        checks.check("focus: a card left to fail", false, || shown(&term));
+    }
+    checks.done();
+    drop(term);
+    team.stop();
+}
+
+/// What `member`'s program heard of the color scheme, from `fake/scheme.log` (`CSI ? 997 ; N n`: `1` dark, `2` light), once
+/// the fake has read a line (`flush`).
+fn heard_schemes(team: &Team) -> Vec<String> {
+    std::fs::read_to_string(team.profile.join("fake/scheme.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A line to the fake, which hands what it received before it to its log.
+fn flush(team: &Team, member: &str) {
+    team.ctl(["send", "--pane", member, "noop\\r"]);
+}
+
+/// The color scheme reaches the programs that ask for it (`CSI ? 2031 h`), when it changes and not otherwise: a client
+/// of a light terminal attaches, and the program receives `CSI ? 997 ; 2 n`; a new attach with the same scheme tells it
+/// nothing; a client of a dark terminal tells it `; 1 n`. (The terminal answers OSC 10 and 11, as the client asks at
+/// each attach.)
+#[test]
+fn a_program_hears_the_color_scheme_when_it_changes() {
+    let mut team = Team::new("scheme", &tables("scheme", &["lead"], &[("dev", None)], ""));
+    team.launch(&["lead", "dev"]);
+    team.ctl(["send", "--pane", "dev", "scheme\\r"]);
+    std::thread::sleep(Duration::from_millis(500));
+    let mut checks = Checks::default();
+    let light = Profile { light: true, ..Profile::default() };
+    let hears = |team: &Team, want: &[&str], within: Duration| {
+        wait(within, || {
+            flush(team, "dev");
+            std::thread::sleep(Duration::from_millis(150));
+            heard_schemes(team) == want
+        })
+    };
+    // A light client attaches.
+    let term = team.attach(120, 40, light);
+    assert!(term.wait_for("lead", Duration::from_secs(5)), "{}", shown(&term));
+    let got = hears(&team, &["2"], Duration::from_secs(6));
+    checks.check("a light client: the program hears `997 ; 2 n`", got, || format!("{:?}", heard_schemes(&team)));
+    drop(term);
+    std::thread::sleep(Duration::from_millis(500));
+    // The same scheme again: nothing more.
+    let term = team.attach(120, 40, light);
+    assert!(term.wait_for("lead", Duration::from_secs(5)), "{}", shown(&term));
+    let quiet = !wait(Duration::from_secs(3), || {
+        flush(&team, "dev");
+        std::thread::sleep(Duration::from_millis(150));
+        heard_schemes(&team) != ["2"]
+    });
+    checks.check("the same scheme again: nothing more is told", quiet, || format!("{:?}", heard_schemes(&team)));
+    drop(term);
+    std::thread::sleep(Duration::from_millis(500));
+    // A dark client: `; 1 n`.
+    let term = team.attach(120, 40, Profile::default());
+    assert!(term.wait_for("lead", Duration::from_secs(5)), "{}", shown(&term));
+    let got = hears(&team, &["2", "1"], Duration::from_secs(6));
+    checks.check("a dark client after: the program hears `997 ; 1 n`", got, || format!("{:?}", heard_schemes(&team)));
+    drop(term);
+    checks.done();
+    team.stop();
+}
+
 /// L2: `--dry-run` in native: the plan shown in the panes (the command each would run), no Claude started, no login
 /// shell at the end, `recruit list` says a trial runs, and `recruit stop` closes it.
 #[test]
@@ -1363,8 +2598,8 @@ fn hover_redraws_only_on_change() {
         }
     });
     checks.check(
-        "F3 20 changes of element: 10 to 25 frames, the clocks apart",
-        (10..=25 + still + SLACK).contains(&changes),
+        "F3 20 changes of element: 6 to 25 frames, the clocks apart (under load, moves merge into one frame)",
+        (6..=25 + still + SLACK).contains(&changes),
         || format!("{changes} frames against {still} standing still"),
     );
     // The name lit and unlit shows on the screen.
@@ -1374,6 +2609,58 @@ fn hover_redraws_only_on_change() {
     motion(&mut term, inside);
     let unlit = wait(Duration::from_secs(2), || !shown(&term).contains("réglages"));
     checks.check("F3 off it, it goes out", unlit, || shown(&term));
+    checks.done();
+    team.stop();
+}
+
+/// What the mod hands over at each tick (`mod/hooks/register.ts`, `tick`: `session`, `model`, `own`, `context`,
+/// `rateLimits`, `threshold`, `compacted`, `agents`) is kept in the member's report (`<state>/members/<member>.json`),
+/// the `compacted: false` it always carries included. Found by a real session on 2026-10-11: with `compacted` a flag
+/// in the input and a compaction in the report, the whole input failed to read, and every report came back empty (no
+/// model, no context, nothing for the compaction to measure).
+#[test]
+fn a_tick_from_the_mod_is_kept() {
+    use std::io::Write;
+    let mut team = Team::new("tick", &tables("tick", &["lead"], &[("dev", None)], ""));
+    team.launch(&["lead", "dev"]);
+    let state = team.state();
+    let input = serde_json::json!({
+        "session": "11111111-2222-3333-4444-555555555555",
+        "model": "claude-haiku-5-5",
+        "own": {"model": "claude-haiku-5-5", "effort": "high"},
+        "context": {"tokens": 24000, "window": 200000, "percent": 12.0},
+        "rateLimits": [{"kind": "five_hour", "percentUsed": 21.0}],
+        "threshold": {"tokens": 167000, "enabled": true, "window": 200000, "model": "claude-haiku-5-5", "used": 23000},
+        "compacted": false,
+        "agents": [],
+    });
+    let mut child = team
+        .command()
+        .args(["_mod", "tick"])
+        .arg(&state)
+        .arg("lead")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("_mod tick");
+    child.stdin.take().expect("stdin").write_all(input.to_string().as_bytes()).expect("input");
+    let out = child.wait_with_output().expect("tick");
+    assert!(out.status.success(), "_mod tick: {}", String::from_utf8_lossy(&out.stderr));
+    let report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(state.join("members/lead.json")).expect("the report the tick wrote"),
+    )
+    .expect("report: JSON");
+    let mut checks = Checks::default();
+    checks.check("a tick keeps the session", report["session"] == "11111111-2222-3333-4444-555555555555", || {
+        report.to_string()
+    });
+    checks.check("a tick keeps the model", report["model"] == "claude-haiku-5-5", || report.to_string());
+    checks.check("a tick keeps the context", report["context"]["percent"] == 12.0, || report.to_string());
+    checks.check("a tick keeps the threshold", report["threshold"]["tokens"] == 167000, || report.to_string());
+    checks.check("a tick keeps the limits", report["rateLimits"].as_array().is_some_and(|l| l.len() == 1), || {
+        report.to_string()
+    });
     checks.done();
     team.stop();
 }

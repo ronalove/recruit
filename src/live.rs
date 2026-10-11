@@ -246,6 +246,7 @@ impl Running {
             self.snapshot.dashboard = if panels { launch::panel(&exe, lang, "dashboard", &state) } else { Vec::new() };
             self.snapshot.journal = launch::panel(&exe, lang, "journal", &state);
         }
+        self.snapshot.auto_compact = found.team.auto_compact_at();
         self.snapshot.write(&state)?;
 
         for name in &removed {
@@ -301,7 +302,8 @@ impl Running {
                 )?;
             }
         }
-        self.backend.arrange(&session, &tabs, layout::columns(&view))?;
+        let focus = view.layout == Some(config::Layout::Focus);
+        self.backend.arrange(&session, &tabs, layout::columns(&view), focus)?;
 
         for (name, start) in &starting {
             if started.contains(name) {
@@ -356,6 +358,8 @@ impl Named {
                     }
                 }
                 Edit::Dashboard(_) => named.dashboard = true,
+                // Read from the files at each change: the server takes the share from team.json, the tabs follow.
+                Edit::AutoCompact(_) | Edit::Grid { .. } | Edit::Layout(_) => {}
             }
         }
         for (name, running) in now {

@@ -3,7 +3,7 @@
 //! What a program writes that an engine may let pass without a word, found in its output before the engine parses
 //! it: XTVERSION, the color scheme query (`CSI ? 996 n`) and the program status query (`OSC 7501 ; ?`), which want
 //! an answer; desktop notifications (OSC 9, 777, 99) and progress (OSC 9;4), which go to the real terminal and the
-//! interface; the program's status (OSC 7501), for the interface.
+//! interface; the program's status (OSC 7501) and the size it asks for (XTWINOPS 8), for the interface.
 //!
 //! Only escape sequences are looked at: text is skipped with `memchr`, the sequences that matter are kept, the
 //! others are followed without being stored (an OSC 52 of several megabytes costs nothing). A sequence may be cut
@@ -32,11 +32,22 @@ pub(super) enum Sniffed {
     Reset,
     /// `CSI ? 2026 l` (mode 2026 among others, maybe): the end of a synchronized update, wherever it is in a read.
     SyncEnd,
+    /// `CSI ? 2031 h` (mode 2031 among others, maybe): the program asks to be told when the theme changes.
+    ThemeReports,
+    /// `CSI 8 ; rows ; cols t` (XTWINOPS): the program asks for a screen of this size.
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
 }
 
 /// Bytes of a CSI kept, enough for those looked for: a mode reset that lists 2026 among a dozen others too. Past it,
 /// what is kept is cut, and a cut parameter that would read 2026 does no harm (the engine checks the mode itself).
 const CSI_KEPT: usize = 64;
+
+/// The largest side, in cells, that XTWINOPS 8 is read for: a request for more (or for 0, which means "as now") is
+/// not one a list under a header makes.
+const RESIZE_MAX: u16 = 1000;
 
 /// Bytes of an OSC kept, past which a notification is dropped.
 const OSC_KEPT: usize = 64 * 1024;
@@ -131,13 +142,10 @@ impl Sniffer {
                     return match (&self.kept[..], byte) {
                         (b">" | b">0", b'q') => Some(Sniffed::Version),
                         (b"?996", b'n') => Some(Sniffed::ColorScheme),
-                        (kept, b'l')
-                            if kept
-                                .strip_prefix(b"?")
-                                .is_some_and(|modes| modes.split(|&byte| byte == b';').any(|mode| mode == b"2026")) =>
-                        {
-                            Some(Sniffed::SyncEnd)
-                        }
+                        (kept, b'l') if lists_mode(kept, b"2026") => Some(Sniffed::SyncEnd),
+                        (kept, b'h') if lists_mode(kept, b"2031") => Some(Sniffed::ThemeReports),
+                        // A cut sequence may have lost the parameters that made it something else.
+                        (kept, b't') if kept.len() < CSI_KEPT => window_size(kept),
                         _ => None,
                     };
                 }
@@ -256,6 +264,27 @@ impl Sniffer {
             Sniffed::Notify { title: (!title.is_empty()).then_some(title), body }
         })
     }
+}
+
+/// Whether the parameters of a CSI (`?1000;2031`) are those of a private mode list that has `mode` among them.
+fn lists_mode(params: &[u8], mode: &[u8]) -> bool {
+    params.strip_prefix(b"?").is_some_and(|modes| modes.split(|&byte| byte == b';').any(|listed| listed == mode))
+}
+
+/// `8 ; rows ; cols` (the parameters of a CSI ending with `t`): exactly these three, plain decimal numbers, the last
+/// two from 1 to [`RESIZE_MAX`]. Other XTWINOPS (`18`, `22 ; 0`…), and any that is not well formed, are left alone.
+fn window_size(params: &[u8]) -> Option<Sniffed> {
+    let mut fields = params.split(|&byte| byte == b';');
+    let number = |field: Option<&[u8]>| -> Option<u16> {
+        let field = field.filter(|field| !field.is_empty() && field.iter().all(u8::is_ascii_digit))?;
+        std::str::from_utf8(field).ok()?.parse().ok()
+    };
+    if fields.next() != Some(b"8") {
+        return None;
+    }
+    let (rows, cols) = (number(fields.next())?, number(fields.next())?);
+    let in_range = |side: u16| (1..=RESIZE_MAX).contains(&side);
+    (fields.next().is_none() && in_range(rows) && in_range(cols)).then_some(Sniffed::Resize { rows, cols })
 }
 
 /// `7501 ; ?` asks; `7501 ; key=value:…` tells. A state unknown here is left alone.
@@ -385,6 +414,64 @@ mod tests {
         // At the end of a long list of modes, cut anywhere.
         assert_eq!(sniff(&[b"\x1b[?1000;1002;1006;2026l"]), [Sniffed::SyncEnd]);
         assert_eq!(sniff(&[b"\x1b[?1000;1002;10", b"06;1004;2004;2026l"]), [Sniffed::SyncEnd]);
+    }
+
+    #[test]
+    fn modes_turned_on_for_the_theme_are_found() {
+        assert_eq!(
+            sniff(&[b"a\x1b[?2031h b \x1b[?1000;2031;1006h\x1b[?2031l\x1b[2031h\x1b[?20310h\x1b[?2026h\x1b[?203h"]),
+            [Sniffed::ThemeReports, Sniffed::ThemeReports]
+        );
+        // Cut anywhere.
+        assert_eq!(sniff(&[b"\x1b[?20", b"31", b"h"]), [Sniffed::ThemeReports]);
+        assert_eq!(sniff(&[b"\x1b[?1000;1002;10", b"06;1004;2004;2031h"]), [Sniffed::ThemeReports]);
+    }
+
+    #[test]
+    fn window_sizes_are_found() {
+        let size = |rows, cols| Sniffed::Resize { rows, cols };
+        assert_eq!(
+            sniff(&[b"text\x1b[8;24;80t more \x1b[8;1;1000t\x1b[8;030;0100t"]),
+            [size(24, 80), size(1, 1000), size(30, 100)]
+        );
+        // Cut anywhere.
+        assert_eq!(sniff(&[b"\x1b", b"[", b"8;2", b"4;", b"80", b"t"]), [size(24, 80)]);
+        // Missing, empty, or surplus parameters: not a request (0 would mean "as now" anyway).
+        for bad in ["\x1b[8t", "\x1b[8;24t", "\x1b[8;24;t", "\x1b[8;;80t", "\x1b[8;;t", "\x1b[8;24;80;1t"] {
+            assert_eq!(sniff(&[bad.as_bytes()]), [], "{bad:?}");
+        }
+        // Out of bounds, or not plain numbers.
+        for bad in [
+            "\x1b[8;0;80t",
+            "\x1b[8;24;0t",
+            "\x1b[8;1001;80t",
+            "\x1b[8;24;1001t",
+            "\x1b[8;99999;80t",
+            "\x1b[8;24;65536t",
+            "\x1b[8;-1;80t",
+            "\x1b[8;24;+80t",
+            "\x1b[8;2.4;80t",
+            "\x1b[8:24:80t",
+            "\x1b[?8;24;80t",
+            "\x1b[>8;24;80t",
+            "\x1b[8;24;80 t",
+            "\x1b[8;24;80T",
+            "\x1b[8;24;80u",
+        ] {
+            assert_eq!(sniff(&[bad.as_bytes()]), [], "{bad:?}");
+        }
+        // The other XTWINOPS: not ours.
+        for other in ["\x1b[18t", "\x1b[19t", "\x1b[14t", "\x1b[22;0t", "\x1b[23;0t", "\x1b[9;1t", "\x1b[48;24;80t"] {
+            assert_eq!(sniff(&[other.as_bytes()]), [], "{other:?}");
+        }
+        // Digits after a very long run of zeros are not read as if the run was the whole number.
+        let long = format!("\x1b[8;24;{}80t", "0".repeat(100));
+        assert_eq!(sniff(&[long.as_bytes()]), []);
+        // Aborted by CAN, or by another sequence: nothing; the other sequence still counts.
+        assert_eq!(sniff(&[b"\x1b[8;24;\x1880t"]), []);
+        assert_eq!(sniff(&[b"\x1b[8;24;\x1b[>q"]), [Sniffed::Version]);
+        // A C0 control inside it does not end it.
+        assert_eq!(sniff(&[b"\x1b[8;24;\n80t"]), [size(24, 80)]);
     }
 
     #[test]

@@ -226,7 +226,7 @@ fn claude_modes() {
         for fullscreen in [false, true] {
             let env = claude_env(announced, fullscreen);
             let env: Vec<(&str, &OsStr)> = env.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
-            let profile = Profile { kitty_keyboard: true, capture: true, xtversion: None };
+            let profile = Profile { kitty_keyboard: true, capture: true, xtversion: None, light: false };
             let mut term = TestTerm::spawn_in(
                 Some(&dir),
                 OsStr::new("claude"),
@@ -830,4 +830,551 @@ model = \"haiku\"
         .unwrap_or_default();
     println!("folders left under {}: {left:?}", projects.display());
     println!("timeline: target/night/real-states.csv ({} rows)", rows.len());
+}
+
+/// Where `script` records the raw output of each member's Claude (`raw-<member>.log`), and the wrapper that runs it.
+fn compact_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join("recruit-testeur-compact");
+    std::fs::create_dir_all(&dir).expect("compact dir");
+    dir
+}
+
+/// A `claude` that records the raw output of a member's session (`script -q -F`, a pty of its own between the pane and
+/// Claude Code, the bytes unchanged), and runs every other command (`--version`, `agents`…) as it is.
+fn compact_wrapper(dir: &std::path::Path) -> PathBuf {
+    let real = std::process::Command::new("sh")
+        .args(["-c", "command -v claude"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    assert!(!real.is_empty(), "no claude on the PATH");
+    let wrapper = dir.join("claude-wrap");
+    let script = format!(
+        r#"#!/bin/sh
+REAL='{real}'
+case "$1" in --version|agents|plugin|mcp|doctor|config|-p|--print) exec "$REAL" "$@";; esac
+name=x; prev=
+for a in "$@"; do [ "$prev" = "-n" ] && name=$a; prev=$a; done
+exec script -q -F '{dir}/raw-'"$name"'.log' "$REAL" "$@"
+"#,
+        dir = dir.display()
+    );
+    std::fs::write(&wrapper, script).expect("wrapper");
+    std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("chmod");
+    wrapper
+}
+
+/// The OSC 7501 sequences of `bytes` as text (`ESC`, `BEL`, `ST` spelt out), each with where it started.
+fn osc_7501(bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(found) = bytes[at..].windows(6).position(|w| w == b"\x1b]7501") {
+        let start = at + found;
+        let rest = &bytes[start..];
+        let end = rest
+            .iter()
+            .position(|b| *b == 0x07)
+            .map(|i| (i + 1, "BEL"))
+            .into_iter()
+            .chain(rest.windows(2).position(|w| w == b"\x1b\\").map(|i| (i + 2, "ST")))
+            .min_by_key(|(i, _)| *i);
+        match end {
+            Some((len, terminator)) => {
+                let body = String::from_utf8_lossy(&rest[2..len - if terminator == "BEL" { 1 } else { 2 }]).to_string();
+                out.push(format!("ESC ] {body} {terminator}"));
+                at = start + len;
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Samples a real team: each 300 ms or so the raw OSC 7501 each member's Claude wrote (from `script`'s log), what
+/// `_ctl panes` says of each pane, the glyphs of the dashboard's cards, and the events the test names. Writes the
+/// timeline and the raw sequences into `target/night/`.
+struct Recorder<'a> {
+    team: &'a common::team::Team,
+    term: &'a TestTerm,
+    dir: PathBuf,
+    started: std::time::Instant,
+    offsets: std::collections::HashMap<&'static str, u64>,
+    rows: Vec<String>,
+    osc: Vec<String>,
+    event: String,
+    /// Each member's status as `_ctl panes` last said, with since.
+    status: std::collections::HashMap<&'static str, (String, u64)>,
+}
+
+impl<'a> Recorder<'a> {
+    fn new(team: &'a common::team::Team, term: &'a TestTerm, dir: PathBuf) -> Recorder<'a> {
+        Recorder {
+            team,
+            term,
+            dir,
+            started: std::time::Instant::now(),
+            offsets: Default::default(),
+            rows: vec!["t,lead_status,lead_since,dev_status,dev_since,lead_card,dev_card,compact_files,event".into()],
+            osc: Vec::new(),
+            event: String::new(),
+            status: Default::default(),
+        }
+    }
+
+    fn at(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
+
+    fn note(&mut self, event: &str) {
+        println!("[{:6.1}] {event}", self.at());
+        if !self.event.is_empty() {
+            self.event.push_str(" / ");
+        }
+        self.event.push_str(&event.replace(',', ";"));
+    }
+
+    /// The raw sequences written since the last look, per member.
+    fn raw(&mut self) -> Vec<(&'static str, String)> {
+        let mut found = Vec::new();
+        for member in ["lead", "dev"] {
+            let Ok(bytes) = std::fs::read(self.dir.join(format!("raw-{member}.log"))) else { continue };
+            let from = self.offsets.get(member).copied().unwrap_or(0) as usize;
+            if bytes.len() <= from {
+                continue;
+            }
+            // A sequence cut by the end of what was written is read at the next look.
+            let chunk = &bytes[from..];
+            let mut upto = chunk.len();
+            if let Some(open) = chunk.windows(6).rposition(|w| w == b"\x1b]7501") {
+                let tail = &chunk[open..];
+                if !tail.contains(&0x07) && !tail.windows(2).any(|w| w == b"\x1b\\") {
+                    upto = open;
+                }
+            }
+            for sequence in osc_7501(&chunk[..upto]) {
+                found.push((member, sequence));
+            }
+            self.offsets.insert(member, (from + upto) as u64);
+        }
+        found
+    }
+
+    /// One look: the screen, and a row of the timeline.
+    fn sample(&mut self) -> Vec<String> {
+        let t = self.at();
+        for (member, sequence) in self.raw() {
+            self.osc.push(format!("{t:7.2} {member:4} {sequence}"));
+            println!("[{t:6.1}] raw {member}: {sequence}");
+        }
+        for pane in self.team.panes() {
+            let name = match pane["member"].as_str() {
+                Some("lead") => "lead",
+                Some("dev") => "dev",
+                _ => continue,
+            };
+            let status = pane["status"].as_str().unwrap_or("-").to_string();
+            let since = pane["since"].as_u64().unwrap_or(0);
+            if self.status.get(name).map(|(s, _)| s.as_str()) != Some(status.as_str()) {
+                println!("[{t:6.1}] pane {name}: {status} (since {since})");
+            }
+            self.status.insert(name, (status, since));
+        }
+        let screen = self.term.screen();
+        let card = |name: &str| state_of(card_glyph(&screen, name));
+        let files: Vec<String> = ["lead", "dev"]
+            .iter()
+            .filter(|m| self.team.state().join("compact").join(m).exists())
+            .map(|m| m.to_string())
+            .collect();
+        let status = |name: &str| self.status.get(name).cloned().unwrap_or_default();
+        let (lead, dev) = (status("lead"), status("dev"));
+        let row = format!(
+            "{t:.1},{},{},{},{},{},{},{},{}",
+            lead.0,
+            lead.1,
+            dev.0,
+            dev.1,
+            card("lead"),
+            card("dev"),
+            files.join("+"),
+            self.event
+        );
+        self.event.clear();
+        self.rows.push(row);
+        screen
+    }
+
+    /// Samples until `check` holds on the screen, `timeout` at most.
+    fn until(&mut self, timeout: Duration, mut check: impl FnMut(&mut Recorder<'a>, &[String]) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let screen = self.sample();
+            if check(self, &screen) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// Samples for `span`.
+    fn pass(&mut self, span: Duration) {
+        self.until(span, |_, _| false);
+    }
+
+    fn status_of(&self, member: &str) -> String {
+        self.status.get(member).map(|(s, _)| s.clone()).unwrap_or_default()
+    }
+
+    fn save(&self, name: &str) {
+        std::fs::create_dir_all("target/night").ok();
+        std::fs::write(format!("target/night/{name}.csv"), self.rows.join("\n") + "\n").expect("csv");
+        std::fs::write(format!("target/night/{name}-osc.txt"), self.osc.join("\n") + "\n").expect("osc");
+    }
+}
+
+/// One step of the folder-trust question in `member`'s pane, if it is shown and still: a key sent while the screen
+/// moves is read by Claude Code's early-input reader (see `wait_prompt`), so each key goes to a screen that stood still
+/// for 600 ms: Down while « No, exit » is chosen, then Enter on « Yes, I trust ». True if a key was sent.
+fn answer_trust(team: &common::team::Team, member: &str) -> bool {
+    let rows = team.capture(member);
+    if !rows.iter().any(|r| r.contains("trust this folder")) {
+        return false;
+    }
+    std::thread::sleep(Duration::from_millis(600));
+    let again = team.capture(member);
+    if again != rows {
+        return false;
+    }
+    let on_yes = again.iter().any(|r| r.contains('❯') && r.contains("Yes, I trust"));
+    team.ctl(["send", "--pane", member, if on_yes { "\\r" } else { "\\x1b[B" }]);
+    true
+}
+
+/// Typed, then Enter a moment later: text and Enter in one burst is taken for a paste, and not sent.
+fn type_into(team: &common::team::Team, member: &str, text: &str) {
+    team.ctl(["send", "--pane", member, text]);
+    std::thread::sleep(Duration::from_millis(700));
+    team.ctl(["send", "--pane", member, "\\r"]);
+}
+
+/// A member's report (`<state>/members/<member>.json`), as the mod last wrote it.
+fn member_report(team: &common::team::Team, member: &str) -> serde_json::Value {
+    std::fs::read_to_string(team.state().join("members").join(format!("{member}.json")))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// The automatic compaction of a member that rests out of sight, with real Claude Code (2.1.296): what it writes in
+/// OSC 7501 from the request to after its end, a message typed during it, the summary it makes, the report and the
+/// trace, and a `/compact` typed in a pane. Two Haiku sessions in a folder of the tester's own, on the test's terminal
+/// only. The timeline goes to `target/night/real-compact.csv` and the raw sequences (as `script` recorded them) to
+/// `target/night/real-compact-osc.txt`.
+///
+/// ```sh
+/// CLAUDE_SESSIONS=$(date +%F) cargo test --test mux_claude -- --ignored --nocapture claude_auto_compaction
+/// ```
+#[test]
+#[ignore = "real Claude Code sessions (two, on Haiku, about 6 minutes): CLAUDE_SESSIONS and the test named"]
+fn claude_auto_compaction() {
+    if !common::consented("CLAUDE_SESSIONS", "real Claude Code sessions", "claude_auto_compaction") {
+        return;
+    }
+    let before = settings();
+    let dir = compact_dir();
+    for member in ["lead", "dev"] {
+        let _ = std::fs::remove_file(dir.join(format!("raw-{member}.log")));
+    }
+    let wrapper = compact_wrapper(&dir);
+    let tables = format!(
+        "[claude]\ncommand = \"{}\"\n\n[teams.compact]\ndescription = \"test\"\nargs = [\"--strict-mcp-config\"]\n\
+         auto_compact = 1\n[teams.compact.members.lead]\nrole = \"Contact\"\ncontact = true\nmodel = \"haiku\"\n\
+         [teams.compact.members.dev]\nrole = \"Agent\"\nmodel = \"haiku\"\n",
+        wrapper.display()
+    );
+    let mut team = common::team::Team::real("compact", &tables, "en");
+    team.env("RECRUIT_AUTO_COMPACT_IDLE", "6");
+    let out = team.recruit(["--detach"]);
+    assert!(out.status.success(), "recruit --detach: {}", String::from_utf8_lossy(&out.stderr));
+    // The first tab: lead, the dashboard and the journal. `dev` is on the second: out of sight.
+    let term = team.attach(150, 50, Profile::default());
+    let mut rec = Recorder::new(&team, &term, dir.clone());
+    let up = rec.until(Duration::from_secs(150), |rec, screen| {
+        for member in ["lead", "dev"] {
+            if answer_trust(rec.team, member) {
+                rec.note(&format!("{member}: answered the folder question"));
+            }
+        }
+        let _ = screen;
+        rec.status_of("lead") == "idle" && rec.status_of("dev") == "idle"
+    });
+    println!("members up: {up}");
+    if !up {
+        for row in term.screen() {
+            println!("{row}");
+        }
+    }
+    assert!(up, "the members never came up");
+    // Claude Code reads the first keys itself for a moment after it starts: nothing typed before it is settled.
+    rec.pass(Duration::from_secs(4));
+    // A turn ends with `done` (not `idle`): the pane's state says so once it does.
+    let turn = |rec: &mut Recorder, member: &str, text: &str, what: &str| -> bool {
+        rec.note(&format!("{member}: sends {what}"));
+        type_into(rec.team, member, text);
+        let worked = rec.until(Duration::from_secs(90), |rec, _| rec.status_of(member) == "working");
+        let done = worked && rec.until(Duration::from_secs(120), |rec, _| rec.status_of(member) != "working");
+        rec.note(&format!("{member}: {what} answered: {done}"));
+        done
+    };
+    // Text only, no tool: a permission question would stop the turn (nobody answers it here).
+    let dev1 = turn(
+        &mut rec,
+        "dev",
+        "Write a four-line poem about the sea, then end your reply with exactly this line: The harbor code is ZEBRA-42.",
+        "the first task",
+    );
+    let dev2 = turn(
+        &mut rec,
+        "dev",
+        "Give three short tips for a long train trip, then end your reply with exactly this line: Last answer: tips delivered.",
+        "the second task",
+    );
+    let lead1 = turn(&mut rec, "lead", "Reply with the single word ok.", "a word");
+    println!("turns: dev {dev1} {dev2}, lead {lead1}");
+    println!("reports after the turns: lead {}\n  dev {}", member_report(&team, "lead"), member_report(&team, "dev"));
+    // The rest begins; the request comes after 6 s of it (the server, `compact/dev`), and the mod takes it at its next tick.
+    rec.note("rest begins");
+    let asked = rec.until(Duration::from_secs(60), |rec, _| rec.team.state().join("compact/dev").exists());
+    rec.note(&format!("request for dev: {asked}"));
+    if asked {
+        println!("request: {}", std::fs::read_to_string(team.state().join("compact/dev")).unwrap_or_default());
+    }
+    // 1 and 2 (a): until the compaction is over: no message sent.
+    let compacted = rec.until(Duration::from_secs(180), |rec, _| {
+        let r = member_report(rec.team, "dev");
+        r["last_compacted"]["done"] == true
+    });
+    rec.note(&format!("first compaction made: {compacted}"));
+    rec.pass(Duration::from_secs(12));
+    let report = member_report(&team, "dev");
+    println!("dev report.compaction: {}", report["compaction"]);
+    println!("dev report.last_compacted: {}", report["last_compacted"]);
+    println!("dev report.context: {}", report["context"]);
+    for (name, member) in [("dev", "dev"), ("lead", "lead")] {
+        println!("{name} last_compacted: {}", member_report(&team, member)["last_compacted"]);
+    }
+    let shot = |name: &str, screen: &[String]| {
+        std::fs::create_dir_all("target/night").ok();
+        std::fs::write(format!("target/night/real-compact-{name}.txt"), screen.join("\n") + "\n").ok();
+    };
+    let screen = rec.sample();
+    shot("after-first", &screen);
+    for row in screen.iter().filter(|r| r.contains('\u{27f3}') || r.to_lowercase().contains("compact")) {
+        println!("  screen: {row}");
+    }
+    // 2 (b): a second compaction; a message typed into the pane while it runs.
+    let ping = turn(&mut rec, "dev", "Reply with the single word ping.", "a word, after the first compaction");
+    println!("ping answered: {ping}");
+    rec.note("second rest begins");
+    let asked = rec.until(Duration::from_secs(60), |rec, _| rec.team.state().join("compact/dev").exists());
+    rec.note(&format!("second request for dev: {asked}"));
+    let mut sent_at = None;
+    let mut working_seen = false;
+    let mut message_started = false;
+    let second = rec.until(Duration::from_secs(240), |rec, _| {
+        let raw_working = rec.osc.iter().rev().take(6).any(|l| l.contains(" dev ") && l.contains("state=working"));
+        if !working_seen && asked && !rec.team.state().join("compact/dev").exists() && raw_working {
+            working_seen = true;
+        }
+        if working_seen && sent_at.is_none() {
+            sent_at = Some(rec.at());
+            rec.note("dev: typed a message during the compaction");
+            type_into(rec.team, "dev", "Write about 400 words about trains, in plain text, no title.");
+        }
+        if sent_at.is_some() {
+            message_started |=
+                rec.osc.iter().rev().take(10).any(|l| l.contains(" dev ") && l.contains("state=working"));
+        }
+        let r = member_report(rec.team, "dev");
+        sent_at.is_some()
+            && r["last_compacted"]["done"] == true
+            && r["last_compacted"]["at"] != report["last_compacted"]["at"]
+    });
+    let made_at = rec.at();
+    rec.note(&format!("second compaction made: {second}; the message was typed at {sent_at:?}"));
+    // The turn the message makes, and what the member shows during it.
+    rec.pass(Duration::from_secs(45));
+    // `_ctl panes` says `dev` at work from the start of the queued turn (the compaction made, the mod's answer a tick
+    // later) to its `done`, and at rest after it: Claude Code says `working` once and `done` once for both.
+    let done_at = rec
+        .osc
+        .iter()
+        .filter(|l| l.contains(" dev ") && l.contains("state=done"))
+        .filter_map(|l| l.split_whitespace().next()?.parse::<f64>().ok())
+        .filter(|t| *t > sent_at.unwrap_or(f64::MAX))
+        .fold(None, |first: Option<f64>, t| Some(first.map_or(t, |f| f.min(t))));
+    match (sent_at, done_at) {
+        (Some(_), Some(done)) => {
+            let dev_at = |from: f64, to: f64| -> Vec<(f64, String)> {
+                rec.rows
+                    .iter()
+                    .skip(1)
+                    .filter_map(|row| {
+                        let cells: Vec<&str> = row.split(',').collect();
+                        let t: f64 = cells.first()?.parse().ok()?;
+                        (t >= from && t <= to).then(|| (t, cells.get(3).unwrap_or(&"").to_string()))
+                    })
+                    .collect()
+            };
+            let during = dev_at(made_at + 3.0, done - 1.0);
+            let after = dev_at(done + 1.5, done + 6.0);
+            println!(
+                "the queued turn ran until {done:.1} s; compaction made at {made_at:.1} s; rows at work: {}/{} in [{:.1}, {:.1}], at rest: {}/{} after",
+                during.iter().filter(|(_, s)| s == "working").count(),
+                during.len(),
+                made_at + 3.0,
+                done - 1.0,
+                after.iter().filter(|(_, s)| s == "idle").count(),
+                after.len(),
+            );
+            if done - made_at > 5.0 {
+                assert!(
+                    !during.is_empty() && during.iter().all(|(_, s)| s == "working"),
+                    "dev not at work during the queued turn: {during:?}"
+                );
+            }
+            assert!(
+                !after.is_empty() && after.iter().all(|(_, s)| s == "idle"),
+                "dev not at rest after its done: {after:?}"
+            );
+        }
+        other => println!("no queued turn to check: {other:?}"),
+    }
+    let screen = rec.sample();
+    shot("after-second", &screen);
+    println!("message started: {message_started}");
+    println!("dev report.last_compacted: {}", member_report(&team, "dev")["last_compacted"]);
+    // 3: a typed `/compact` in lead's pane.
+    rec.note("lead: types /compact");
+    type_into(&team, "lead", "/compact");
+    let typed =
+        rec.until(Duration::from_secs(150), |rec, _| member_report(rec.team, "lead")["last_compacted"]["done"] == true);
+    rec.note(&format!("lead compacted by hand: {typed}"));
+    rec.pass(Duration::from_secs(15));
+    println!("lead report.compaction: {}", member_report(&team, "lead")["compaction"]);
+    println!("lead report.last_compacted: {}", member_report(&team, "lead")["last_compacted"]);
+    let screen = rec.sample();
+    shot("after-typed", &screen);
+    for row in screen.iter().filter(|r| r.contains('\u{27f3}') || r.to_lowercase().contains("compact")) {
+        println!("  screen: {row}");
+    }
+    rec.save("real-compact");
+    // The summary dev's conversation holds: what the compaction kept.
+    let session = std::fs::read_to_string(team.state().join("sessions/dev")).unwrap_or_default().trim().to_string();
+    let root = team.root.to_string_lossy().to_string();
+    let key: String = format!("{root}/proj").chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    let transcript = home.join(".claude/projects").join(&key).join(format!("{session}.jsonl"));
+    println!("dev's conversation: {}", transcript.display());
+    let text = std::fs::read_to_string(&transcript).unwrap_or_default();
+    let mut summaries = 0;
+    for line in text.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let flat = entry.to_string();
+        if entry["isCompactSummary"] == true
+            || entry["subtype"] == "compact_boundary"
+            || flat.contains("continued from a previous conversation")
+        {
+            summaries += 1;
+            let body = entry["message"]["content"].as_str().map(String::from).unwrap_or_else(|| flat.clone());
+            println!("--- compaction entry {summaries}: type {} subtype {}", entry["type"], entry["subtype"]);
+            println!(
+                "    ZEBRA-42: {}, tips delivered: {}, train: {}",
+                body.contains("ZEBRA-42"),
+                body.contains("tips delivered"),
+                body.contains("train")
+            );
+            std::fs::write(format!("target/night/real-compact-summary-{summaries}.txt"), &body).ok();
+        }
+    }
+    println!("compaction entries in the conversation: {summaries}");
+    // The mod and the bridge agree: no report says it could not read what the mod sent.
+    for member in ["lead", "dev"] {
+        let report = member_report(&team, member);
+        println!(
+            "{member}: input_error {:?}, model {}, context {}",
+            report["input_error"], report["model"], report["context"]
+        );
+        assert!(
+            report["input_error"].is_null(),
+            "{member}'s report: the bridge could not read the mod's tick: {report}"
+        );
+    }
+    let log = std::fs::read_to_string(team.state().join("server.log")).unwrap_or_default();
+    let unread: Vec<&str> = log.lines().filter(|l| l.contains("does not read")).collect();
+    println!("server.log lines with « does not read »: {unread:?}");
+    assert!(unread.is_empty(), "the server could not read what the mod wrote: {unread:?}");
+    let leftovers = vec![format!("~/.claude/projects/{key}*"), format!("~/.claude.json: the entry for {root}/proj")];
+    team.stop();
+    check_settings(&before);
+    println!("traces left to tidy when no Claude runs: {leftovers:?}");
+}
+
+/// What the mod reports of a real session (`<state>/members/<member>.json`: model, context…), with and without the
+/// wrapper that records the raw output (`COMPACT_WRAP=1`): one Haiku member, one word asked.
+///
+/// ```sh
+/// CLAUDE_SESSIONS=$(date +%F) [COMPACT_WRAP=1] cargo test --test mux_claude -- --ignored --nocapture claude_mod_report
+/// ```
+#[test]
+#[ignore = "a real Claude Code session (one, on Haiku, about 1 minute): CLAUDE_SESSIONS and the test named"]
+fn claude_mod_report() {
+    if !common::consented("CLAUDE_SESSIONS", "a real Claude Code session", "claude_mod_report") {
+        return;
+    }
+    let before = settings();
+    let dir = compact_dir();
+    let command = if std::env::var_os("COMPACT_WRAP").is_some() {
+        format!("[claude]\ncommand = \"{}\"\n\n", compact_wrapper(&dir).display())
+    } else {
+        String::new()
+    };
+    let tables = format!(
+        "{command}[teams.rep]\ndescription = \"test\"\nargs = [\"--strict-mcp-config\"]\n[teams.rep.members.lead]\n\
+         role = \"Contact\"\ncontact = true\nmodel = \"haiku\"\n"
+    );
+    let team = common::team::Team::real("rep", &tables, "en");
+    let out = team.recruit(["--detach"]);
+    assert!(out.status.success(), "recruit --detach: {}", String::from_utf8_lossy(&out.stderr));
+    let term = team.attach(120, 40, Profile::default());
+    let up = common::team::wait(Duration::from_secs(120), || {
+        answer_trust(&team, "lead");
+        team.panes().iter().any(|p| p["member"] == "lead" && p["status"] == "idle")
+    });
+    assert!(up, "lead never came up: {:#?} {:?}", team.panes(), team.capture("lead"));
+    std::thread::sleep(Duration::from_secs(3));
+    type_into(&team, "lead", "Reply with the single word ok.");
+    common::team::wait(Duration::from_secs(60), || {
+        team.panes().iter().any(|p| p["member"] == "lead" && p["status"] == "working")
+    });
+    common::team::wait(Duration::from_secs(60), || {
+        team.panes().iter().any(|p| p["member"] == "lead" && p["status"] != "working")
+    });
+    for _ in 0..4 {
+        std::thread::sleep(Duration::from_secs(3));
+        println!("report: {}", member_report(&team, "lead"));
+    }
+    let report = member_report(&team, "lead");
+    assert!(report["input_error"].is_null(), "the bridge could not read the mod's tick: {report}");
+    assert!(report["model"].is_string() && report["context"].is_object(), "an empty report: {report}");
+    let log = std::fs::read_to_string(team.state().join("server.log")).unwrap_or_default();
+    let unread: Vec<&str> = log.lines().filter(|l| l.contains("does not read")).collect();
+    assert!(unread.is_empty(), "the server could not read what the mod wrote: {unread:?}");
+    drop(term);
+    let mut team = team;
+    team.stop();
+    check_settings(&before);
 }

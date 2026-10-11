@@ -69,7 +69,10 @@ pub(crate) struct Header<'a> {
     pub zoom: Option<Zoom>,
     /// The part under the mouse: the name underlined and « réglages › » after it; another part underlined.
     pub hover: Option<Part>,
-    /// The richest form its right part may take, from 0 (all of it) to 5 (none): the poorest that [`form`] gives
+    /// The part whose list of values is open under it (the model or the effort): on the list cursor's background while
+    /// it is, its colors kept.
+    pub open: Option<Part>,
+    /// The richest form its right part may take, from 0 (all of it) to 6 (none): the poorest that [`form`] gives
     /// the members' panes as wide as its own, for their columns to line up (designer, 2026-10-10). 0 by default.
     pub form: usize,
 }
@@ -144,12 +147,34 @@ pub(crate) struct Tab<'a> {
     pub state: State,
     /// The member whose pane takes the tab's room, zoomed: « ⤢ name » after the title.
     pub zoomed: Option<&'a str>,
+    /// What the layout button offers while this tab is the current one (decision of 2026-10-11): none for a tab that
+    /// has no « focus » to go to or come back from.
+    pub switch: Option<Switch>,
+}
+
+/// What the bar's layout button does to the current tab, and says by the layout it goes to: « grille (⌥l) » from the
+/// « focus », « focus (⌥l) » from the grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Switch {
+    ToGrid,
+    ToFocus,
+}
+
+impl Switch {
+    fn word(self) -> String {
+        match self {
+            Switch::ToGrid => t!("grille", "grid"),
+            Switch::ToFocus => "focus".to_string(),
+        }
+    }
 }
 
 /// What a click on the bar reaches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
     Tab(usize),
+    /// The layout button: the current tab goes to the other layout until the client detaches.
+    Layout,
     Menu,
     Quit,
 }
@@ -194,7 +219,7 @@ fn frame_style(header: &Header<'_>, focused: bool) -> Style {
     let style = if header.note.is_some() || member(State::Waiting) {
         Style::fg(Color::Red)
     } else if member(State::Error) {
-        Style::fg(crate::look::ORANGE)
+        Style::fg(crate::look::palette().orange)
     } else if focused && header.color.is_some() {
         Style::PLAIN
     } else {
@@ -206,9 +231,9 @@ fn frame_style(header: &Header<'_>, focused: bool) -> Style {
 /// The sign of a state, as on the dashboard: the spinner in yellow, ⚑ in bold red, ✗ in bold orange, the clock in grey.
 fn sign_style(state: State) -> Style {
     match state {
-        State::Working => Style::fg(Color::Yellow),
+        State::Working => Style::fg(crate::look::palette().working),
         State::Waiting => Style::fg(Color::Red).bold(),
-        State::Error => Style::fg(crate::look::ORANGE).bold(),
+        State::Error => Style::fg(crate::look::palette().orange).bold(),
         State::Idle | State::Other => Style::fg(Color::DarkGrey),
     }
 }
@@ -245,7 +270,7 @@ pub(crate) fn frame(
 }
 
 /// The header in the top border, from its third column: « ⠹ name · alert · ↑ 214 sur 3000 », each part between
-/// blanks that cut the line; at the right « Opus ▆ high · ⟳ 22 % · 18m », then ⤢ in the corner (mock-up B2, B7).
+/// blanks that cut the line; at the right « Opus ● high · ⟳ 22 % · 18m », then ⤢ in the corner (mock-up B2, B7).
 /// An alert comes first, whole, else short (what comes before its « : »), the name cut for it down to three columns,
 /// and cut itself last; then the name, whole while it holds. What is left goes, short of room, in turn (designer,
 /// 2026-10-09): the effort's word, the model, the time; the scroll, whole then short (« ↑ 214 »); the effort's sign;
@@ -299,7 +324,7 @@ fn title(canvas: &mut Canvas, area: Rect, header: &Header<'_>, look: Look) -> Ve
         parts.push((Rect { x: name_at, y, width: name_end - name_at, height: 1 }, Part::Name));
     }
     if let Some(text) = &plan.reason {
-        x = put_part(canvas, x, y, text, Style::fg(crate::look::ORANGE));
+        x = put_part(canvas, x, y, text, Style::fg(crate::look::palette().orange));
     }
     if let Some(text) = &plan.alert {
         x = put_part(canvas, x, y, text, Style::fg(Color::Red));
@@ -312,7 +337,16 @@ fn title(canvas: &mut Canvas, area: Rect, header: &Header<'_>, look: Look) -> Ve
         let mut at = canvas.put(area.x + plan.stop - width - 1, y, " ", Style::PLAIN);
         for (text, style, part) in meta {
             let from = at;
-            let style = part.map_or(*style, |part| hovered(part, *style));
+            let style = part.map_or(*style, |part| {
+                let style = hovered(part, *style);
+                // The part whose list is open, on the background of the list's cursor, in its colors: the model no longer
+                // dimmed (dim on that background is grey on grey).
+                if header.open == Some(part) {
+                    Style { dim: false, ..style }.on(crate::look::palette().selected)
+                } else {
+                    style
+                }
+            });
             at = canvas.put(at, y, text, style);
             if let Some(part) = part {
                 match parts.last_mut() {
@@ -323,6 +357,14 @@ fn title(canvas: &mut Canvas, area: Rect, header: &Header<'_>, look: Look) -> Ve
             }
         }
         canvas.put(at, y, " ", Style::PLAIN);
+        // Its background reaches the blank on each side: a sign that is a full block (█) hides it, and the part reads
+        // as one target.
+        if let Some((rect, _)) = parts.iter().find(|(_, part)| Some(*part) == header.open) {
+            // What is there is always a blank: the one before the right part, a separator, the one after it.
+            for x in [rect.x.checked_sub(1), Some(rect.x + rect.width)].into_iter().flatten() {
+                canvas.tint(x, y, 1, crate::look::palette().selected);
+            }
+        }
     }
     // The hint at the right between blanks, a dash before the corner, after a dash at least.
     if let Some(hint) = header.hint {
@@ -366,7 +408,7 @@ struct Plan {
 
 /// The header's layout in a pane `width` columns wide, with the forms `metas` of its right part: what [`title`]
 /// draws, without drawing it.
-fn plan(width: usize, header: &Header<'_>, metas: &[Vec<Piece>; 5]) -> Plan {
+fn plan(width: usize, header: &Header<'_>, metas: &[Vec<Piece>; FORMS]) -> Plan {
     let right = width.saturating_sub(1);
     let start = 2;
     let lead = match header.color {
@@ -422,27 +464,27 @@ fn plan(width: usize, header: &Header<'_>, metas: &[Vec<Piece>; 5]) -> Plan {
     plan
 }
 
-/// The form the right part of `header` takes on its own in a pane `width` columns wide, from 0 (all of it) to 5
+/// The form the right part of `header` takes on its own in a pane `width` columns wide, from 0 (all of it) to `FORMS`
 /// (none), neither hovered nor scrolled. 0 for a header with nothing to show there: it holds whole. The panes as wide
-/// share their [`common_form`]. 5 for a member whose turn failed: its reason takes room from its own pane only, and
+/// share their [`common_form`]. `FORMS` for a member whose turn failed: its reason takes room from its own pane only, and
 /// holds no one back (mock-up C).
 pub(crate) fn form(header: &Header<'_>, width: usize) -> usize {
     if !reasons(header).is_empty() {
-        return 5;
+        return FORMS;
     }
     let alone = Header { hover: None, scroll: None, form: 0, ..*header };
     let metas = metas(&alone, Look::default());
     if metas.iter().all(Vec::is_empty) {
         return 0;
     }
-    plan(width, &alone, &metas).meta.unwrap_or(5)
+    plan(width, &alone, &metas).meta.unwrap_or(FORMS)
 }
 
 /// The [`Header::form`] of the members' panes as wide, from their own [`form`]s: the poorest, for their columns to
-/// line up as the dashboard's cards of a width do; but a pane with nothing left at the right (5, a very long name)
+/// line up as the dashboard's cards of a width do; but a pane with nothing left at the right (`FORMS`, a very long name)
 /// holds no one back, and gets by alone (architect, 2026-10-10).
 pub(crate) fn common_form(forms: impl IntoIterator<Item = usize>) -> usize {
-    forms.into_iter().filter(|&form| form < 5).max().unwrap_or(0)
+    forms.into_iter().filter(|&form| form < FORMS).max().unwrap_or(0)
 }
 
 /// Whether a header shows its time in the state in a pane `width` columns wide (its whole area, as [`frame`] gets
@@ -473,36 +515,41 @@ const SETTINGS_ROOM: usize = 12;
 /// A piece of the header's right part: its text, its style, and the part a click on it reaches.
 type Piece = (String, Style, Option<Part>);
 
-/// The forms of the header's right part, from the richest: all; without the effort's word; without the model; without
-/// the time; the context alone. Each empty for a pane that has none of what it shows.
-fn metas(header: &Header<'_>, look: Look) -> [Vec<Piece>; 5] {
+/// How many forms the right part has, from the richest (0) to the context alone: past them, nothing.
+const FORMS: usize = 6;
+
+/// The forms of the header's right part, from the richest (decision of 2026-10-11): `Opus ◉ extra · 40 % · 12m`; without
+/// the effort's name; the model as its initial; without the time; without the initial; the context alone. Each empty
+/// for a pane that has none of what it shows.
+fn metas(header: &Header<'_>, look: Look) -> [Vec<Piece>; FORMS] {
     let sep = || (" · ".to_string(), Style::fg(Color::DarkGrey), None);
     let resting = matches!(header.state, State::Idle | State::Other);
-    let model = header.model.map(|model| (model.to_string(), Style::PLAIN.dim(), Some(Part::Model)));
+    // The model, its name or its initial, dimmed; `?` while it is not known, but with an effort to say beside it (a
+    // pane with nothing known shows nothing).
+    let model = |initial: bool| -> Option<Piece> {
+        if header.model.is_none() && header.effort.is_none() {
+            return None;
+        }
+        let text = match header.model {
+            Some(model) if !initial => model.to_string(),
+            model => crate::look::model_initial(model).to_string(),
+        };
+        Some((text, Style::PLAIN.dim(), Some(Part::Model)))
+    };
     let effort = |word: bool| -> Vec<Piece> {
         let Some(level) = header.effort else { return Vec::new() };
-        let sign = crate::look::effort_sign(level);
-        let text = if word { format!("{sign} {level}") } else { sign.to_string() };
-        match crate::look::effort_color(level) {
-            Some(color) => vec![(text, Style::fg(color), Some(Part::Effort))],
-            // `max` in a rainbow, turning with the spinners, as on the dashboard.
-            None => text
-                .chars()
-                .enumerate()
-                .map(|(i, c)| {
-                    // Still out of work: an image drawn for something else does not change its colors.
-                    let turn = if header.state == State::Working { look.frame / 2 } else { 0 };
-                    let color = crate::look::RAINBOW[(i + turn) % crate::look::RAINBOW.len()];
-                    (c.to_string(), Style::fg(color), Some(Part::Effort))
-                })
-                .collect(),
-        }
+        // Still out of work: an image drawn for something else does not change its colors.
+        let turn = if header.state == State::Working { look.frame / 2 } else { 0 };
+        crate::look::effort_cells(level, word, turn)
+            .into_iter()
+            .map(|(c, color)| (c.to_string(), color.map_or(Style::PLAIN, Style::fg), Some(Part::Effort)))
+            .collect()
     };
     let context: Vec<Piece> = match header.context {
         Some(percent) => {
             let style = match header.pressure {
                 Pressure::Warning => Style::fg(Color::Red).bold(),
-                Pressure::Near => Style::fg(crate::look::ORANGE),
+                Pressure::Near => Style::fg(crate::look::palette().orange),
                 Pressure::Calm if resting => Style::PLAIN.dim(),
                 Pressure::Calm => Style::PLAIN,
             };
@@ -521,19 +568,25 @@ fn metas(header: &Header<'_>, look: Look) -> [Vec<Piece>; 5] {
         vec![(crate::look::duration(secs), style, None)]
     });
     // Groups joined by « · »: the model and the effort, the context, the time.
-    let join = |with_model: bool, word: bool, sign: bool, time_too: bool| -> Vec<Piece> {
+    let join = |model_form: Option<bool>, effort_form: Option<bool>, context_too: bool, time_too: bool| -> Vec<Piece> {
         let mut first: Vec<Piece> = Vec::new();
-        if with_model && let Some(model) = &model {
-            first.push(model.clone());
+        if let Some(initial) = model_form
+            && let Some(model) = model(initial)
+        {
+            first.push(model);
         }
-        if sign {
+        if let Some(word) = effort_form {
             let effort = effort(word);
             if !effort.is_empty() && !first.is_empty() {
                 first.push((" ".to_string(), Style::PLAIN, None));
             }
             first.extend(effort);
         }
-        let groups = [first, context.clone(), if time_too { time.clone().unwrap_or_default() } else { Vec::new() }];
+        let groups = [
+            first,
+            if context_too { context.clone() } else { Vec::new() },
+            if time_too { time.clone().unwrap_or_default() } else { Vec::new() },
+        ];
         let mut out = Vec::new();
         for group in groups.into_iter().filter(|g| !g.is_empty()) {
             if !out.is_empty() {
@@ -544,32 +597,33 @@ fn metas(header: &Header<'_>, look: Look) -> [Vec<Piece>; 5] {
         out
     };
     [
-        join(true, true, true, true),
-        join(true, false, true, true),
-        join(false, false, true, true),
-        join(false, false, true, false),
-        join(false, false, false, false),
+        join(Some(false), Some(true), true, true),
+        join(Some(false), Some(false), true, true),
+        join(Some(true), Some(false), true, true),
+        join(Some(true), Some(false), true, false),
+        join(None, Some(false), true, false),
+        join(None, None, true, false),
     ]
 }
 
 /// Which form of the right part (`metas`) and of the scroll (`scrolls`: whole, short) hold together after the left
 /// part ends at `x` (its blank included): the scroll before `end`, the right part ending at `stop` with a blank on
-/// each side and at least a dash before it. In turn: the right part loses its effort's word, its model, its time;
-/// then the scroll shortens and goes; then the right part loses its effort's sign, then itself, and the scroll comes
-/// back if it holds alone.
+/// each side and at least a dash before it. In turn: the right part loses its effort's name, its model's name for its
+/// initial, its time, its initial; then the scroll shortens and goes; then the right part loses its effort's sign, then
+/// itself, and the scroll comes back if it holds alone.
 fn layout(
     x: usize,
     end: usize,
     stop: usize,
-    metas: &[Vec<Piece>; 5],
+    metas: &[Vec<Piece>; FORMS],
     scrolls: &[String],
     richest: usize,
 ) -> (Option<usize>, Option<usize>) {
     let (whole, short) = ((!scrolls.is_empty()).then_some(0), (scrolls.len() > 1).then_some(1));
     // No richer than `richest`: a form before it stands for it.
     let meta = |i: usize| Some(i.max(richest)).filter(|&i| i < metas.len() && !metas[i].is_empty());
-    let mut tries: Vec<(Option<usize>, Option<usize>)> = (0..4).map(|i| (meta(i), whole)).collect();
-    tries.extend([(meta(3), short), (meta(3), None), (meta(4), None), (None, whole), (None, short), (None, None)]);
+    let mut tries: Vec<(Option<usize>, Option<usize>)> = (0..=4).map(|i| (meta(i), whole)).collect();
+    tries.extend([(meta(4), short), (meta(4), None), (meta(5), None), (None, whole), (None, short), (None, None)]);
     let width = |i: usize| metas[i].iter().map(|(text, ..)| columns(text)).sum::<usize>();
     tries
         .into_iter()
@@ -664,20 +718,26 @@ enum Buttons {
 }
 
 /// The buttons on the right of the bar, as `shown`.
-fn buttons(shown: Buttons, glyphs: Glyphs) -> Vec<(String, Target)> {
+fn buttons(shown: Buttons, glyphs: Glyphs, switch: Option<Switch>) -> Vec<(String, Target)> {
     let (menu, quit) = match glyphs {
         // nf-md-menu, nf-md-logout
         Glyphs::Nerd => ("\u{F035C} ", "\u{F0343} "),
         Glyphs::Unicode => ("", ""),
     };
-    match shown {
+    // The layout button first, before the menu's.
+    let layout = switch.map(|switch| match shown {
+        Buttons::Long => (format!(" {} ({ALT}l) ", switch.word()), Target::Layout),
+        _ => (format!(" {ALT}l "), Target::Layout),
+    });
+    let rest = match shown {
         Buttons::Long => vec![
             (format!(" {menu}menu ({ALT}r) "), Target::Menu),
             (format!(" {quit}{} ({ALT}q) ", t!("quitter", "quit")), Target::Quit),
         ],
         Buttons::Keys => vec![(format!(" {ALT}r "), Target::Menu), (format!(" {ALT}q "), Target::Quit)],
         Buttons::None => Vec::new(),
-    }
+    };
+    layout.filter(|_| shown != Buttons::None).into_iter().chain(rest).collect()
 }
 
 /// The bar on `row` (the screen's last): the team, the tabs between rules, then the buttons on the right, a column
@@ -711,8 +771,9 @@ pub(crate) fn bar(
         };
         tabs.iter().enumerate().map(each).sum::<usize>() + 1
     };
+    let switch = tabs.iter().find(|tab| tab.active).and_then(|tab| tab.switch);
     let buttons_width = |shown: Buttons| -> usize {
-        buttons(shown, look.glyphs).iter().map(|(text, _)| columns(text) + 1).sum::<usize>()
+        buttons(shown, look.glyphs, switch).iter().map(|(text, _)| columns(text) + 1).sum::<usize>()
     };
     // The forms from the richest, and the first that leaves a blank before the buttons: the other tabs to their
     // numbers, the team gone, the buttons to their keys (the current title then cut down to its number), the blanks
@@ -738,7 +799,7 @@ pub(crate) fn bar(
     // The buttons first, from the right: the tabs end before them.
     let mut right = end.saturating_sub(1);
     let mut placed = Vec::new();
-    for (text, target) in buttons(shown, look.glyphs).into_iter().rev() {
+    for (text, target) in buttons(shown, look.glyphs, switch).into_iter().rev() {
         let start = right.saturating_sub(columns(&text)).max(row.x);
         // Hovered, brighter: bold.
         let style = if hover == Some(target) { Style::PLAIN.reverse().bold() } else { Style::PLAIN.reverse() };
@@ -1313,7 +1374,7 @@ mod tests {
     /// right part giving its room first. Its form holds no one back. A pane gone wrong keeps its red note instead.
     #[test]
     fn a_failed_turn_in_orange() {
-        let orange = crate::look::ORANGE;
+        let orange = crate::look::palette().orange;
         let label = crate::look::error_label(Some("API Error: 529 overloaded"));
         let header = Header { error: Some(&label), ..rich("dev-saisie", State::Error) };
         let mut canvas = Canvas::new(100, 3);
@@ -1327,7 +1388,7 @@ mod tests {
         assert!(row.starts_with(&format!("┏━ ✗ dev-saisie · {label} ")), "{row}");
         assert_eq!(canvas.style(at("✗"), 0), Style::fg(orange).bold());
         assert_eq!(canvas.style(at(&label), 0), Style::fg(orange));
-        assert!(row.contains("Opus ▆ high"), "{row}");
+        assert!(row.contains(&format!("Opus {}", high())), "{row}");
         // Narrower: the right part goes before the reason, then the short reason, then none; the name stays whole.
         let short = t!("erreur d'API", "API error");
         let widths: Vec<(usize, String)> = (20..100)
@@ -1343,11 +1404,11 @@ mod tests {
         let reduced = widths.iter().find(|(_, row)| row.contains(&format!("· {short} "))).map(|(w, _)| *w).unwrap();
         assert!(reduced < coded && coded < whole, "{reduced} {coded} {whole}");
         let (_, at_whole) = &widths[whole - 20];
-        assert!(!at_whole.contains("Opus") && !at_whole.contains('▆'), "the right part first: {at_whole}");
+        assert!(!at_whole.contains("Opus") && !at_whole.contains('●'), "the right part first: {at_whole}");
         let (_, bare) = &widths[0];
         assert!(bare.contains("✗ dev-saisie") && !bare.contains('·'), "{bare}");
         // Its form holds no one back; a pane gone wrong says its note, not the reason.
-        assert_eq!(form(&header, 40), 5);
+        assert_eq!(form(&header, 40), FORMS);
         let ended = Header { note: Some("terminé"), ..header };
         frame(&mut canvas, area(100), &ended, false, UNICODE);
         assert!(!canvas.row(0).contains(&label) && canvas.style(0, 1) == Style::fg(Color::Red));
@@ -1376,8 +1437,8 @@ mod tests {
         super::notice(&mut canvas, area, &notice, UNICODE);
         let row = canvas.row(2);
         let x = row[..row.find('✗').unwrap()].chars().count();
-        assert_eq!(canvas.style(x, 2), Style::fg(crate::look::ORANGE).bold());
-        assert_eq!(canvas.style(area.x, 2), Style::fg(crate::look::ORANGE));
+        assert_eq!(canvas.style(x, 2), Style::fg(crate::look::palette().orange).bold());
+        assert_eq!(canvas.style(area.x, 2), Style::fg(crate::look::palette().orange));
         assert_eq!(
             canvas.style(row[..row.find("dev-saisie").unwrap()].chars().count(), 2),
             Style::fg(Color::Blue).bold()
@@ -1441,7 +1502,7 @@ mod tests {
         let at = |sign: char| canvas.row(0).chars().position(|c| c == sign).unwrap();
         assert_eq!(canvas.style(at('⠹'), 0), Style::fg(Color::Yellow));
         assert_eq!(canvas.style(at('⚑') + 2, 0), Style::fg(Color::Red));
-        assert_eq!(canvas.style(at('✗'), 0), Style::fg(crate::look::ORANGE));
+        assert_eq!(canvas.style(at('✗'), 0), Style::fg(crate::look::palette().orange));
         assert_eq!(canvas.style(at('◷'), 0), Style::fg(Color::DarkGrey));
         // No one waiting: no ⚑; no one at all: nothing.
         let header = Header { hint: Some(Hint::Counts { working: 2, waiting: 0, error: 0, idle: 0 }), ..header };
@@ -1540,18 +1601,22 @@ mod tests {
         format!("{left}{}{right}", "─".repeat(width - columns(left) - columns(&right)))
     }
 
-    /// Mock-up B7: what goes when the pane narrows, in turn: the effort's word, the model, the time, the effort's sign,
-    /// the context; then the name is cut.
+    /// Mock-up B7, direction A of 2026-10-11: what goes when the pane narrows, in turn: the effort's name, the model's name
+    /// for its initial, the time, the initial, the effort's sign, the context; then the name is cut.
     #[test]
     fn the_full_header_as_wide_as_the_pane() {
         let header = rich("dev-rendu", State::Working);
         let top = |width| framed(&header, width, false).remove(0);
         let left = "╭─ ⠹ dev-rendu ";
+        // French names the effort with one more column.
+        let extra = columns(&high()) - columns("● high");
+        let full = format!("Opus {} · 29 % · 6m", high());
         for (widths, meta) in [
-            ([72, 47], "Opus ▆ high · 29 % · 6m"),
-            ([46, 42], "Opus ▆ · 29 % · 6m"),
-            ([41, 37], "▆ · 29 % · 6m"),
-            ([36, 32], "▆ · 29 %"),
+            ([72, 47 + extra], full.as_str()),
+            ([46 + extra, 42], "Opus ● · 29 % · 6m"),
+            ([41, 39], "O ● · 29 % · 6m"),
+            ([38, 34], "O ● · 29 %"),
+            ([33, 32], "● · 29 %"),
             ([31, 28], "29 %"),
             ([27, 20], ""),
         ] {
@@ -1567,7 +1632,10 @@ mod tests {
         // Thick with the focus, the same header.
         assert_eq!(
             framed(&header, 72, true)[0],
-            bordered(left, "Opus ▆ high · 29 % · 6m", 72).replace('─', "━").replace('╭', "┏").replace('╮', "┓")
+            bordered(left, &format!("Opus {} · 29 % · 6m", high()), 72)
+                .replace('─', "━")
+                .replace('╭', "┏")
+                .replace('╮', "┓")
         );
     }
 
@@ -1599,11 +1667,12 @@ mod tests {
     fn only_what_is_known() {
         let left = "╭─ ◷ dev ";
         let header = Header { model: None, since: None, ..rich("dev", State::Idle) };
-        assert_eq!(framed(&header, 40, false)[0], bordered(left, "▆ high · 29 %", 40));
+        // The model not known yet, an effort to say beside it: « ? ».
+        assert_eq!(framed(&header, 40, false)[0], bordered(left, &format!("? {} · 29 %", high()), 40));
         let header = Header { effort: None, context: None, ..rich("dev", State::Idle) };
         assert_eq!(framed(&header, 40, false)[0], bordered(left, "Opus · 6m", 40));
         let header = Header { context: None, since: None, ..rich("dev", State::Idle) };
-        assert_eq!(framed(&header, 40, false)[0], bordered(left, "Opus ▆ high", 40));
+        assert_eq!(framed(&header, 40, false)[0], bordered(left, &format!("Opus {}", high()), 40));
         // Without the zoom (a pane that is not a member's), dashes in the corner.
         let header = Header { zoom: None, ..member("dev", State::Idle) };
         assert_eq!(framed(&header, 20, false)[0], "╭─ ◷ dev ──────────╮");
@@ -1629,8 +1698,8 @@ mod tests {
         // The model dimmed, the effort in Claude Code's color, the separators grey, the context plain at work, the
         // time dimmed, the zoom grey.
         assert_eq!(canvas.style(at(&canvas, "Opus"), 0), Style::PLAIN.dim());
-        assert_eq!(canvas.style(at(&canvas, "▆"), 0), Style::fg(Color::AnsiValue(141)));
-        assert_eq!(canvas.style(at(&canvas, "high"), 0), Style::fg(Color::AnsiValue(141)));
+        assert_eq!(canvas.style(at(&canvas, "●"), 0), Style::fg(Color::AnsiValue(141)));
+        assert_eq!(canvas.style(at(&canvas, &t!("élevé", "high")), 0), Style::fg(Color::AnsiValue(141)));
         assert_eq!(canvas.style(at(&canvas, "·"), 0), Style::fg(Color::DarkGrey));
         assert_eq!(canvas.style(at(&canvas, "29"), 0), Style::PLAIN);
         assert_eq!(canvas.style(at(&canvas, "6m"), 0), Style::PLAIN.dim());
@@ -1638,13 +1707,13 @@ mod tests {
         // Near compaction orange, where Claude Code warns red; at rest, dimmed, ⟳ before it when it compacts.
         let near = Header { pressure: Pressure::Near, ..rich("dev-rendu", State::Working) };
         frame(&mut canvas, area, &near, false, UNICODE);
-        assert_eq!(canvas.style(at(&canvas, "29"), 0), Style::fg(crate::look::ORANGE));
+        assert_eq!(canvas.style(at(&canvas, "29"), 0), Style::fg(crate::look::palette().orange));
         let warned = Header { pressure: Pressure::Warning, ..rich("dev-rendu", State::Working) };
         frame(&mut canvas, area, &warned, false, UNICODE);
         assert_eq!(canvas.style(at(&canvas, "29"), 0), Style::fg(Color::Red).bold());
         let resting = Header { compactable: true, ..rich("dev-rendu", State::Idle) };
         frame(&mut canvas, area, &resting, false, UNICODE);
-        assert!(canvas.row(0).contains(" Opus ▆ high · ⟳ 29 % · 6m "), "{}", canvas.row(0));
+        assert!(canvas.row(0).contains(&format!(" Opus {} · ⟳ 29 % · 6m ", high())), "{}", canvas.row(0));
         assert_eq!(canvas.style(at(&canvas, "⟳"), 0), Style::PLAIN.dim());
         assert_eq!(canvas.style(at(&canvas, "29"), 0), Style::PLAIN.dim());
         // Waiting, the time in red.
@@ -1653,15 +1722,17 @@ mod tests {
         // `max` in a rainbow that turns with the spinner.
         let max = Header { effort: Some("max"), ..rich("dev-rendu", State::Working) };
         frame(&mut canvas, area, &max, false, UNICODE);
-        let sign = at(&canvas, "█");
-        assert_eq!(canvas.style(sign, 0), Style::fg(crate::look::RAINBOW[1]));
-        assert_eq!(canvas.style(sign + 2, 0), Style::fg(crate::look::RAINBOW[3]));
+        let sign = at(&canvas, "◈");
+        assert_eq!(canvas.style(sign, 0), Style::fg(crate::look::palette().rainbow[1]));
+        // Its name letter by letter, from the second color.
+        assert_eq!(canvas.style(sign + 2, 0), Style::fg(crate::look::palette().rainbow[2]));
+        assert_eq!(canvas.style(sign + 3, 0), Style::fg(crate::look::palette().rainbow[3]));
         frame(&mut canvas, area, &max, false, Look { frame: 4, ..UNICODE });
-        assert_eq!(canvas.style(sign, 0), Style::fg(crate::look::RAINBOW[2]));
+        assert_eq!(canvas.style(sign, 0), Style::fg(crate::look::palette().rainbow[2]));
         // At rest, still.
         let resting = Header { state: State::Idle, ..max };
         frame(&mut canvas, area, &resting, false, Look { frame: 4, ..UNICODE });
-        assert_eq!(canvas.style(at(&canvas, "█"), 0), Style::fg(crate::look::RAINBOW[0]));
+        assert_eq!(canvas.style(at(&canvas, "◈"), 0), Style::fg(crate::look::palette().rainbow[0]));
     }
 
     /// F2: where each part can be clicked; the context only when it compacts.
@@ -1679,7 +1750,7 @@ mod tests {
                 (Part::Zoom, " ⤢ ".into()),
                 (Part::Name, "dev-rendu".into()),
                 (Part::Model, "Opus".into()),
-                (Part::Effort, "▆ high".into()),
+                (Part::Effort, high()),
             ]
         );
         assert!(parts.iter().all(|(rect, _)| rect.y == 0 && rect.height == 1));
@@ -1692,7 +1763,7 @@ mod tests {
         let parts = frame(&mut canvas, area, &max, false, UNICODE);
         let effort: Vec<_> = parts.iter().filter(|(_, part)| *part == Part::Effort).collect();
         assert_eq!(effort.len(), 1);
-        assert_eq!(text(&canvas, effort[0].0), "█ max");
+        assert_eq!(text(&canvas, effort[0].0), "◈ max");
         // A panel: no part.
         let panel = Header { name: "Journal", ..Header::default() };
         assert!(frame(&mut canvas, area, &panel, false, UNICODE).is_empty());
@@ -1701,8 +1772,95 @@ mod tests {
         assert_eq!(parts.iter().map(|(_, p)| *p).collect::<Vec<_>>(), [Part::Zoom, Part::Name]);
     }
 
+    /// The model's initial where its name does not fit, and `?` for a model not known yet, beside a known effort; a click
+    /// on the initial reaches the model like its name (direction A, 2026-10-11). The effort's name in the user's words.
+    #[test]
+    fn the_model_as_its_initial() {
+        let area = Rect { x: 0, y: 0, width: 40, height: 3 };
+        let initial = |model: Option<&'static str>| {
+            let mut canvas = Canvas::new(40, 3);
+            let header = Header { model, ..rich("dev-rendu", State::Idle) };
+            let parts = frame(&mut canvas, area, &header, false, UNICODE);
+            let (rect, _) = parts.iter().find(|(_, part)| *part == Part::Model).expect("the model's zone");
+            (canvas.row(0).chars().skip(rect.x).take(rect.width).collect::<String>(), canvas.style(rect.x, 0).dim)
+        };
+        for (model, expected) in
+            [(Some("Opus"), "O"), (Some("Sonnet"), "S"), (Some("Haiku"), "H"), (Some("Fable"), "F")]
+        {
+            assert_eq!(initial(model), (expected.to_string(), true));
+        }
+        // A family Claude Code does not know: its first letter in capitals; none yet: `?`, dimmed too.
+        assert_eq!(initial(Some("mistral")), ("M".to_string(), true));
+        assert_eq!(initial(None), ("?".to_string(), true));
+        // The levels in the user's words, extra for xhigh, with Claude Code's signs.
+        let wide = Rect { width: 90, ..area };
+        let mut canvas = Canvas::new(90, 3);
+        for (level, text) in [
+            ("low", t!("○ faible", "○ low")),
+            ("medium", t!("◐ moyen", "◐ medium")),
+            ("high", t!("● élevé", "● high")),
+            ("xhigh", t!("◉ extra", "◉ extra")),
+            ("max", "◈ max".to_string()),
+        ] {
+            let header = Header { effort: Some(level), ..rich("dev-rendu", State::Idle) };
+            let parts = frame(&mut canvas, wide, &header, false, UNICODE);
+            let (rect, _) = parts.iter().find(|(_, part)| *part == Part::Effort).unwrap();
+            assert_eq!(canvas.row(0).chars().skip(rect.x).take(rect.width).collect::<String>(), text);
+        }
+    }
+
     /// F3, mock-up B2: the name hovered underlined, « réglages › » after it while the rest keeps some room; another
     /// part underlined; the zoom in bold cyan.
+    /// The part whose list is open keeps its colors, on the list cursor's background.
+    #[test]
+    fn the_header_with_its_list_open() {
+        let area = Rect { x: 0, y: 0, width: 80, height: 5 };
+        for (part, text) in [(Part::Model, "Opus"), (Part::Effort, "high")] {
+            let mut canvas = Canvas::new(80, 5);
+            let open = Header { open: Some(part), effort: Some("high"), ..rich("dev-rendu", State::Working) };
+            let parts = frame(&mut canvas, area, &open, false, UNICODE);
+            let (rect, _) = parts.iter().find(|(_, p)| *p == part).expect("the part is there");
+            assert!(
+                (rect.x..rect.x + rect.width)
+                    .all(|x| canvas.style(x, 0).bg == Some(crate::look::palette().selected)
+                        && !canvas.style(x, 0).reverse),
+                "{text}: on the cursor's background over its zone"
+            );
+            // The blank on each side is on it too; the model is not dimmed there.
+            assert_eq!(
+                canvas.style(rect.x - 1, 0).bg,
+                Some(crate::look::palette().selected),
+                "{text}: the blank before"
+            );
+            assert_eq!(
+                canvas.style(rect.x + rect.width, 0).bg,
+                Some(crate::look::palette().selected),
+                "{text}: the blank after"
+            );
+            assert!(!canvas.style(rect.x, 0).dim, "{text}: in its normal color");
+            let other = if part == Part::Model { Part::Effort } else { Part::Model };
+            let (rect, _) = parts.iter().find(|(_, p)| *p == other).expect("the other part");
+            assert!((rect.x..rect.x + rect.width).all(|x| canvas.style(x, 0).bg.is_none()), "the other one is not");
+            // Not open, the model stays dimmed.
+            if part == Part::Effort {
+                assert!(canvas.style(rect.x, 0).dim);
+            }
+        }
+    }
+
+    /// In a light terminal the part whose list is open is on the light palette's selection (253).
+    #[test]
+    fn the_header_with_its_list_open_in_the_light_palette() {
+        let area = Rect { x: 0, y: 0, width: 80, height: 3 };
+        let mut canvas = Canvas::new(80, 3);
+        crate::look::set_light(true);
+        let open = Header { open: Some(Part::Model), ..rich("dev-rendu", State::Idle) };
+        let parts = frame(&mut canvas, area, &open, false, UNICODE);
+        crate::look::set_light(false);
+        let (rect, _) = parts.iter().find(|(_, p)| *p == Part::Model).unwrap();
+        assert_eq!(canvas.style(rect.x, 0).bg, Some(Color::AnsiValue(253)));
+    }
+
     #[test]
     fn the_header_hovered() {
         let mut canvas = Canvas::new(72, 3);
@@ -1718,7 +1876,10 @@ mod tests {
         let name = parts.iter().find(|(_, part)| *part == Part::Name).unwrap().0;
         assert_eq!((name.x, name.width), (5, 12 + 1 + columns(&settings)));
         // The rest still there, shorter if need be.
-        assert_eq!(row, bordered(&format!("╭─ ⠹ dev-terminal {settings} "), "Opus ▆ high · 29 % · 6m", 72));
+        assert_eq!(
+            row,
+            bordered(&format!("╭─ ⠹ dev-terminal {settings} "), &format!("Opus {} · 29 % · 6m", high()), 72)
+        );
         // Narrow: no room for it, the name underlined alone.
         let parts = frame(&mut canvas, Rect { width: 40, ..area }, &hovered, false, UNICODE);
         assert!(!canvas.row(0).contains(&settings), "{}", canvas.row(0));
@@ -1726,7 +1887,7 @@ mod tests {
         // The model, the effort.
         let hovered = Header { hover: Some(Part::Effort), ..rich("dev-rendu", State::Working) };
         frame(&mut canvas, area, &hovered, false, UNICODE);
-        let at = canvas.row(0).chars().position(|c| c == '▆').unwrap();
+        let at = canvas.row(0).chars().position(|c| c == '●').unwrap();
         assert!(canvas.style(at, 0).underline && canvas.style(at + 5, 0).underline);
         assert!(!canvas.style(at - 2, 0).underline, "not the model");
         // The context that compacts, underlined whole as its zone: « ⟳ 29 % ».
@@ -1749,14 +1910,15 @@ mod tests {
         let left = format!("╭─ ⠹ dev-rendu · {up} ");
         let short = "╭─ ⠹ dev-rendu · ↑ 214 ";
         let top = |width| framed(&header, width, false).remove(0);
-        let wide = columns(&left) + 25 + 7;
-        assert_eq!(top(wide), bordered(&left, "Opus ▆ high · 29 % · 6m", wide));
-        assert_eq!(top(wide - 1), bordered(&left, "Opus ▆ · 29 % · 6m", wide - 1));
+        let full = format!("Opus {} · 29 % · 6m", high());
+        let wide = columns(&left) + columns(&full) + 2 + 7;
+        assert_eq!(top(wide), bordered(&left, &full, wide));
+        assert_eq!(top(wide - 1), bordered(&left, "Opus ● · 29 % · 6m", wide - 1));
         let at = columns(&left) + 10 + 7;
-        assert_eq!(top(at), bordered(&left, "▆ · 29 %", at));
-        assert_eq!(top(at - 1), bordered(short, "▆ · 29 %", at - 1));
+        assert_eq!(top(at), bordered(&left, "● · 29 %", at));
+        assert_eq!(top(at - 1), bordered(short, "● · 29 %", at - 1));
         let at = columns(short) + 10 + 7;
-        assert_eq!(top(at - 1), bordered("╭─ ⠹ dev-rendu ", "▆ · 29 %", at - 1));
+        assert_eq!(top(at - 1), bordered("╭─ ⠹ dev-rendu ", "● · 29 %", at - 1));
         assert_eq!(top(30), bordered("╭─ ⠹ dev-rendu ", "29 %", 30));
     }
 
@@ -1768,36 +1930,36 @@ mod tests {
         let short = rich("pm", State::Working);
         let long = rich("dev-interface", State::Working);
         let longest = rich("un-nom-de-membre-vraiment-très-long", State::Working);
-        assert_eq!([form(&short, 45), form(&long, 45), form(&longest, 45)], [0, 2, 5]);
+        assert_eq!([form(&short, 45), form(&long, 45), form(&longest, 45)], [0, 2, FORMS]);
         // The very long name holds no one back.
         let common = common_form([&short, &long, &longest].map(|h| form(h, 45)));
         assert_eq!(common, 2);
         let top = |header: Header<'_>| framed(&Header { form: common, ..header }, 45, false).remove(0);
-        assert_eq!(top(short), bordered("╭─ ⠹ pm ", "▆ · 29 % · 6m", 45));
-        assert_eq!(top(long), bordered("╭─ ⠹ dev-interface ", "▆ · 29 % · 6m", 45));
+        assert_eq!(top(short), bordered("╭─ ⠹ pm ", "O ● · 29 % · 6m", 45));
+        assert_eq!(top(long), bordered("╭─ ⠹ dev-interface ", "O ● · 29 % · 6m", 45));
         assert!(top(longest).starts_with("╭─ ⠹ un-nom-de-membre-vraiment-tr") && !top(longest).contains('%'));
         // None but a very long name, or none at all: no ceiling.
-        assert_eq!(common_form([5, 5]), 0);
+        assert_eq!(common_form([FORMS, FORMS]), 0);
         assert_eq!(common_form([]), 0);
         // Narrower than its form allows, a pane takes a poorer one all the same.
         let capped = Header { form: 1, ..long };
-        assert_eq!(framed(&capped, 40, false)[0], bordered("╭─ ⠹ dev-interface ", "▆ · 29 %", 40));
+        assert_eq!(framed(&capped, 40, false)[0], bordered("╭─ ⠹ dev-interface ", "O ● · 29 %", 40));
         // Hovered or scrolled, the form is that of the pane at rest.
         let hovered = Header { hover: Some(Part::Name), scroll: Some((3, 9)), ..long };
         assert_eq!(form(&hovered, 45), 2);
         // Nothing at the right: whole, binding no other; too narrow for anything, none.
         assert_eq!(form(&Header { model: None, effort: None, context: None, since: None, ..long }, 45), 0);
-        assert_eq!(form(&long, 20), 5);
+        assert_eq!(form(&long, 20), FORMS);
     }
 
     #[test]
     fn whether_the_time_shows() {
         let header = rich("dev-rendu", State::Working);
         let shown = |width| framed(&header, width, false)[0].contains("6m");
-        for width in [72, 47, 46, 42, 41, 37, 36, 32, 20] {
+        for width in [72, 47, 46, 42, 41, 39, 38, 37, 34, 32, 20] {
             assert_eq!(shows_since(&header, width), shown(width), "{width}");
         }
-        assert!(shows_since(&header, 37) && !shows_since(&header, 36));
+        assert!(shows_since(&header, 39) && !shows_since(&header, 38));
         assert!(!shows_since(&Header { since: None, ..header }, 72));
         // The scroll goes after the time.
         let scrolled = Header { scroll: Some((3, 9)), ..header };
@@ -1811,7 +1973,7 @@ mod tests {
         let left = "╭─ ✗ dev · moteur en échec : panique ";
         let top = |width| framed(&header, width, false).remove(0);
         let at = columns(left) + 5;
-        assert_eq!(top(60), bordered(left, "▆ · 29 % · 6m", 60));
+        assert_eq!(top(60), bordered(left, "O ● · 29 %", 60));
         assert_eq!(top(at), bordered(left, "", at));
         // A column less: the zoom goes, the alert whole.
         assert_eq!(top(at - 1), format!("{left}───╮"));
@@ -1934,6 +2096,8 @@ mod tests {
                     active: i == 0,
                     state: [State::Working, State::Waiting, State::Idle][i % 3],
                     zoomed,
+                    // Every width, with the layout button on the current tab: nothing overflows.
+                    switch: (i == 0).then_some(Switch::ToFocus),
                 };
                 [(0..n).map(|i| tab(i, None)).collect(), (0..n).map(|i| tab(i, Some(long))).collect()]
             })
@@ -2056,11 +2220,16 @@ mod tests {
         assert_eq!(framed(&header, 21, false)[0], "╭─ ◷ 日本語の… ─────╮");
     }
 
+    /// « ● high » in the language of the run: « ● élevé » in French, a column wider.
+    fn high() -> String {
+        t!("● élevé", "● high")
+    }
+
     fn tabs(state: [State; 3]) -> [Tab<'static>; 3] {
         [
-            Tab { title: "Interlocuteurs", active: true, state: state[0], zoomed: None },
-            Tab { title: "Agents (1)", active: false, state: state[1], zoomed: None },
-            Tab { title: "Agents (2)", active: false, state: state[2], zoomed: None },
+            Tab { title: "Interlocuteurs", active: true, state: state[0], zoomed: None, switch: None },
+            Tab { title: "Agents (1)", active: false, state: state[1], zoomed: None, switch: None },
+            Tab { title: "Agents (2)", active: false, state: state[2], zoomed: None, switch: None },
         ]
     }
 
@@ -2100,6 +2269,40 @@ mod tests {
         let text = |r: Rect| row.chars().skip(r.x).take(r.width).collect::<String>();
         assert_eq!(text(zones[1].0), " ⚑ 2 Agents (1) ");
         assert_eq!(text(zones[4].0), quit.trim_end());
+    }
+
+    /// The layout button of the current tab (lot of 2026-10-11): « grille (⌥l) » on a tab in « focus », « focus (⌥l) »
+    /// on one in the grid, before the menu's; nothing for a tab with no focus. Narrow, its key alone; clickable.
+    #[test]
+    fn the_layout_button() {
+        let mut tabs = tabs([State::Working, State::Idle, State::Idle]);
+        let (row, zones, _) = drawn_bar(100, &tabs, UNICODE);
+        assert!(!row.contains("(⌥l)") && !zones.iter().any(|(_, t)| *t == Target::Layout), "{row}");
+        for (switch, word) in [(Switch::ToGrid, t!("grille", "grid")), (Switch::ToFocus, "focus".to_string())] {
+            tabs[0].switch = Some(switch);
+            let (row, zones, canvas) = drawn_bar(100, &tabs, UNICODE);
+            let button = format!(" {word} ({ALT}l) ");
+            let at = row.find(&button).unwrap_or_else(|| panic!("{button:?} in {row:?}"));
+            let menu = row.find(&format!(" menu ({ALT}r) ")).unwrap();
+            assert!(at < menu, "before the menu's: {row}");
+            let (rect, _) = zones.iter().find(|(_, t)| *t == Target::Layout).unwrap();
+            let x = row[..at].chars().count();
+            assert_eq!((rect.x, rect.width), (x, columns(&button)));
+            assert!(canvas.style(x + 2, 0).reverse, "drawn as the other buttons");
+            // Not on the current tab: not shown.
+            let mut other = tabs;
+            other[0].active = false;
+            other[1].active = true;
+            assert!(!drawn_bar(100, &other, UNICODE).0.contains("(⌥l)"));
+        }
+        // Hovered, bold; narrow, its key alone.
+        let mut canvas = Canvas::new(100, 1);
+        bar(&mut canvas, Rect { x: 0, y: 0, width: 100, height: 1 }, "mux", &tabs, UNICODE, Some(Target::Layout));
+        let at = canvas.row(0).find("focus (").unwrap();
+        assert!(canvas.style(canvas.row(0)[..at].chars().count(), 0).bold);
+        let (row, zones, _) = drawn_bar(60, &tabs, UNICODE);
+        assert!(row.contains(&format!(" {ALT}l ")) && !row.contains("focus ("), "{row}");
+        assert!(zones.iter().any(|(_, t)| *t == Target::Layout));
     }
 
     /// Mock-up B6, then narrower: the other tabs keep their numbers, the team goes, the buttons keep their keys, the
@@ -2219,7 +2422,7 @@ mod tests {
 
     #[test]
     fn the_spinner_turns() {
-        let tabs = [Tab { title: "A", active: true, state: State::Working, zoomed: None }];
+        let tabs = [Tab { title: "A", active: true, state: State::Working, zoomed: None, switch: None }];
         let first = drawn_bar(60, &tabs, Look { frame: 0, ..UNICODE }).0;
         let next = drawn_bar(60, &tabs, Look { frame: 1, ..UNICODE }).0;
         assert!(first.starts_with(" mux │ ⠋ 1 A │") && next.starts_with(" mux │ ⠙ 1 A │"));

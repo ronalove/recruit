@@ -387,51 +387,74 @@ fn claude() -> ! {
         let mut line = String::new();
         match std::io::stdin().read_line(&mut line) {
             Ok(0) | Err(_) => break 0,
-            Ok(_) => match line.rsplit("\x1b\\").next().unwrap_or_default().trim() {
-                "Q" => break 0,
-                "X" => break 1,
-                // `osc working`, `osc blocked:kind=permission`…: what Claude Code says of its state (OSC 7501).
-                command if command.starts_with("osc ") => {
-                    let mut out = std::io::stdout().lock();
-                    // The terminal must have said it takes statuses first (`OSC 7501 ; ?`, answered at once): the
-                    // engine ignores them before. Its answer reaches the program's input; `line` drops it.
-                    if !asked {
-                        asked = true;
-                        let _ = out.write_all(b"\x1b]7501;?\x1b\\");
-                        let _ = out.flush();
-                        std::thread::sleep(Duration::from_millis(200));
-                    }
-                    let _ = write!(out, "\x1b]7501;state={}\x07", &command[4..]);
-                    let _ = out.flush();
-                }
-                // `msg <to> <text>`: the conversation records a message to a teammate (a `SendMessage` of the model),
-                // for
-                // the journal.
-                command if command.starts_with("msg ") => {
-                    let (to, text) = command[4..].split_once(' ').unwrap_or((&command[4..], "hello"));
-                    let stamp =
-                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                    let line = serde_json::json!({
-                        "type": "assistant", "timestamp": iso(stamp),
-                        "message": {"content": [{"type": "tool_use", "name": "SendMessage",
-                            "input": {"to": to, "summary": text, "message": text}}]},
-                    });
-                    if let Ok(mut file) =
-                        std::fs::OpenOptions::new().append(true).open(conversation.join(format!("{session}.jsonl")))
+            Ok(_) => {
+                // The color scheme the terminal reports once the program asked for it (`scheme`, `CSI ? 2031 h`):
+                // `CSI ? 997 ; 1 n` dark, `; 2 n` light. Logged, one per line, in `fake/scheme.log`.
+                while let Some(at) = line.find("\x1b[?997;") {
+                    let rest = &line[at + 7..];
+                    let Some(end) = rest.find('n') else { break };
+                    if let Ok(mut log) =
+                        std::fs::OpenOptions::new().create(true).append(true).open(fake.join("scheme.log"))
                     {
-                        let _ = writeln!(file, "{line}");
+                        let _ = writeln!(log, "{}", &rest[..end]);
                     }
+                    line.replace_range(at..at + 7 + end + 1, "");
                 }
-                // `agent busy`, `agent idle`, `agent waiting`: what `claude agents` says of it.
-                command if command.starts_with("agent ") => {
-                    let running = serde_json::json!({
-                        "name": name, "cwd": cwd, "status": &command[6..], "sessionId": session, "pid": pid,
-                    });
-                    let _ = std::fs::write(&run, running.to_string());
-                    write_own(&command[6..]);
+                match line.rsplit("\x1b\\").next().unwrap_or_default().trim() {
+                    "Q" => break 0,
+                    // `scheme`: asks the terminal to report its color scheme (`CSI ? 2031 h`), now and when it changes.
+                    "scheme" => {
+                        let mut out = std::io::stdout().lock();
+                        let _ = out.write_all(b"\x1b[?2031h");
+                        let _ = out.flush();
+                    }
+                    "X" => break 1,
+                    // `osc working`, `osc blocked:kind=permission`…: what Claude Code says of its state (OSC 7501).
+                    command if command.starts_with("osc ") => {
+                        let mut out = std::io::stdout().lock();
+                        // The terminal must have said it takes statuses first (`OSC 7501 ; ?`, answered at once): the
+                        // engine ignores them before. Its answer reaches the program's input; `line` drops it.
+                        if !asked {
+                            asked = true;
+                            let _ = out.write_all(b"\x1b]7501;?\x1b\\");
+                            let _ = out.flush();
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                        let _ = write!(out, "\x1b]7501;state={}\x07", &command[4..]);
+                        let _ = out.flush();
+                    }
+                    // `msg <to> <text>`: the conversation records a message to a teammate (a `SendMessage` of the model),
+                    // for
+                    // the journal.
+                    command if command.starts_with("msg ") => {
+                        let (to, text) = command[4..].split_once(' ').unwrap_or((&command[4..], "hello"));
+                        let stamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs());
+                        let line = serde_json::json!({
+                            "type": "assistant", "timestamp": iso(stamp),
+                            "message": {"content": [{"type": "tool_use", "name": "SendMessage",
+                                "input": {"to": to, "summary": text, "message": text}}]},
+                        });
+                        if let Ok(mut file) =
+                            std::fs::OpenOptions::new().append(true).open(conversation.join(format!("{session}.jsonl")))
+                        {
+                            let _ = writeln!(file, "{line}");
+                        }
+                    }
+                    // `agent busy`, `agent idle`, `agent waiting`: what `claude agents` says of it. `agent shell`: a
+                    // command runs after the turn, which its own file says (`shell`) and `claude agents` calls `busy`.
+                    command if command.starts_with("agent ") => {
+                        let listed = if &command[6..] == "shell" { "busy" } else { &command[6..] };
+                        let running = serde_json::json!({
+                            "name": name, "cwd": cwd, "status": listed, "sessionId": session, "pid": pid,
+                        });
+                        let _ = std::fs::write(&run, running.to_string());
+                        write_own(&command[6..]);
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
         }
     };
     let _ = std::fs::remove_file(&run);

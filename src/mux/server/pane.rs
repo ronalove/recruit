@@ -205,6 +205,10 @@ pub(super) struct Pane {
     pub since: Option<u64>,
     /// Its member's turn failed (`state` `Error`): why, until its program says another state.
     pub error: Option<TurnError>,
+    /// The `working` its program said while its member compacts on its own, held back, and when (seconds since the
+    /// epoch): Claude Code says it for the compaction as for a turn, and the member stays at rest meanwhile. Applied
+    /// if the compaction turns out not to have been made.
+    pub held: Option<(engine::Status, u64)>,
     /// Bytes its programs wrote since it opened, for `_ctl stats`.
     pub read: Arc<AtomicU64>,
 }
@@ -262,6 +266,7 @@ impl Pane {
             state: None,
             since: None,
             error: None,
+            held: None,
             read,
         })
     }

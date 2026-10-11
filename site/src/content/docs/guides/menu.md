@@ -13,7 +13,7 @@ Every change is saved in the team's files, and most reach the running team at on
 
 - `Alt+r` (`⌥r` on macOS) in any pane of the team;
 - the "menu" button at the bottom right;
-- a click on a member's name, model or effort, in the top border of its frame: the menu opens on that setting;
+- a click on a member's name, in the top border of its frame: the menu opens on its sheet. A click on its model or its effort opens only [the list of its values](/recruit/guides/screen/#model-and-effort-in-one-click), right under it;
 - `/recruit`, typed in a member's prompt, with [recruit's mod](/recruit/guides/claude-code/#recruits-mod).
 
 The menu opens over the team, the rest dimmed; `Alt+r` and the button open it on the sheet of the member you are in. It needs a window of 50 × 14 at least.
@@ -54,17 +54,22 @@ Everything can be clicked. In a narrow window, the list keeps only the names, an
 | Restart | start it again, on its conversation or afresh |
 | Remove | take it out of the team, and close its pane |
 
+When the member's last turn failed, its sheet starts with the error, and "Resume" sends it "continue", unless its prompt holds text you were typing. See [When a turn fails](/recruit/guides/screen/#when-a-turn-fails).
+
 ## The team's actions
 
 | Key | Action |
 |---|---|
 | `n` | New agent: a built-in role, one Claude composes from your request, or one you write. "⏎ Add and launch" gives it a pane at once. |
 | `t` | Dashboard: the dashboard and the journal, on or off |
+| `l` | Layout: the working agents' tabs in a grid or in [focus](/recruit/guides/contacts-and-agents/#focus) |
+| `g` | Grid: how many panes a tab holds, `columns × rows`, from a list (4 × 2, 3 × 2, 2 × 2, 3 × 1, 2 × 1, each with how many per tab) |
+| `c` | Auto-compaction: off, or the share of its window from which a member at rest is [compacted on its own](/recruit/guides/dashboard/#automatic-compaction), from 50 to 90% |
 | `R` | Reset: every member on a new conversation, their contexts emptied (asks "Reset the team?") |
 | `d` | Detach: leave the team running |
 | `q` | Quit: stop the team, every member's session closed (asks "Quit the team?") |
 
-These keys work from the list of members; in a sheet, a letter does nothing. A click works everywhere.
+These keys work from the list of members; in a sheet, a letter does nothing. A click works everywhere. In a tall enough window, the team's settings (dashboard, layout, grid, auto-compaction) get a row of their own, above the actions; short of room, they keep only their value ("g 3 × 2", "c ⟳ 70%"). With `layout = "tabs"`, layout and grid are left out: each member has its tab.
 
 ## Where changes are written
 
@@ -77,7 +82,7 @@ Picking "default" takes the setting out of that file, and a table left empty wit
 
 ## When changes take effect
 
-- **At once**: a new agent gets its pane, a removed one loses it, and panes move between tabs without their Claude stopping.
+- **At once**: a new agent gets its pane, a removed one loses it, and panes move between tabs without their Claude stopping. A new grid or layout rearranges the tabs; a new auto-compaction share applies within seconds.
 - **From the next request**, with the mod: a new model or effort.
 - **With the next message**, with the mod: a new role, new instructions or new teammates reach each member in a note joined to its next message, without starting a turn.
 - **After a restart on its conversation**: a renamed member, a new permission mode, or a model or an effort its requests cannot carry (going back to Claude Code's default, for instance). When the main contact changes and your settings give a status line, the former and the new main contact restart too, so that the status line follows.

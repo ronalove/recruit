@@ -32,7 +32,7 @@ A line on the card's left takes the color of the member's state, and the name sa
 
 Claude Code counts a member whose command still runs past its turn as busy. Its turn is over, though, so the dashboard shows it at rest, under that sign; back at work, it shows at work again.
 
-The card also shows for how long the member has been in that state (12s, 22m, 1h05), a curve of its activity over the last half hour, and, in its title, its model and its effort, as far as the room allows: "Opus █ xhigh", else "Opus █", else "Opus". The model is always dimmed. The effort is always bright, in Claude Code's colors (low yellow, medium green, high and xhigh purple, max rainbow), with its level sign. Without the mod, these are the ones the team's file sets, when it sets them.
+The card also shows for how long the member has been in that state (12s, 22m, 1h05), a curve of its activity over the last half hour, and, in its title, its model and its effort, as far as the room allows: "Opus ◉ extra", else "Opus ◉", else "O ◉", the model's initial. The model is always dimmed. The effort is always bright, with the signs and the colors Claude Code shows under its prompt: ○ low in yellow, ◐ medium in green, ● high and ◉ extra (the files' `xhigh`) in purple, ◈ max in a rainbow. Without the mod, these are the ones the team's file sets, when it sets them.
 
 With [recruit's mod](/recruit/guides/claude-code/#recruits-mod), loaded with Claude Code 2.1.287 or newer, the cards show more:
 
@@ -45,18 +45,32 @@ With [recruit's mod](/recruit/guides/claude-code/#recruits-mod), loaded with Cla
 Haiku writes both forms of the line in the same call, once per new request, through the member's session and so on your account: the request read up to 2,000 characters, two lines back.
 :::
 
+A member whose turn failed on an API error shows it on its card, in orange: "Turn failed: API overloaded (529)", then the task it stopped in. See [When a turn fails](/recruit/guides/screen/#when-a-turn-fails).
+
 ### Subagents and teammates
 
-When a member hands part of its work to agents of its own, they show under its card, with [recruit's mod](/recruit/guides/claude-code/#recruits-mod):
+When members hand part of their work to agents of their own, these get cards too, with [recruit's mod](/recruit/guides/claude-code/#recruits-mod), at the bottom, after every member, each kind in a section under a titled rule: "♙ teammates · 3", then "⧗ subagents · 2" at the very bottom.
 
-- **A subagent**, one the member started for a task, gets a line under an hourglass: its type, what it was asked, and for how long it has been working. The line is yellow while it works. Once done, it turns to a dimmed ✓ for about ten seconds, then goes. One that failed or was stopped turns to a red ✗ and stays about thirty seconds. A subagent started by a subagent gets its own line too, in the same list.
-- **A teammate**, an agent of a Claude Code team that the member started, gets a line under a person: its name, and for how long it has been in its state. Yellow at work, dimmed while it waits for a message, red if it failed. The line stays as long as the member's session lists the teammate. A teammate whose state has not changed for half an hour shows `?`: its pane may have died. After two hours, the line goes.
+- **A teammate**, an agent of a Claude Code team that a member started: its name, and on the right the member that started it, dimmed in its color ("♙ dev-interface"). Yellow at work, dimmed while it waits for a message. The card stays as long as the member's session lists the teammate. A teammate whose state has not changed for half an hour shows `?`: its pane may have died. After two hours, it goes.
+- **A subagent**, one a member started for a task: its type, what it was asked, for how long it has been working, and the member that started it ("⧗ dev-interface"). Once done, it turns to a dimmed ✓ for about ten seconds, then goes. A subagent started by a subagent gets its own card too.
 
-They only get the room left once every card shows what its member does: they never shorten a member's task, whether it is theirs or another member's. Short of room, a card counts them on one line ("⧗ 2 subagents   ♙ 1 teammate", or "⧗ 2 · ♙ 1" in a narrow pane), then leaves them out. The [team's menu](/recruit/guides/menu/) does not show them: there is nothing to set on them.
+One that failed shows in orange. A click on a card goes to the pane of the member that started it.
+
+They only get the room left once every member has its card: they never shorten a member's. Short of room, a section becomes a list of names, then a count ("♙ 3 teammates"), the subagents giving way before the teammates. The [team's menu](/recruit/guides/menu/) does not show them: there is nothing to set on them.
 
 ### Compacting a conversation
 
 A click on the context of a member at rest, marked ⟳, offers to compact its conversation, once you confirm. The same ⟳ shows in the top border of the member's own frame. It is what Claude Code would do on its own at the threshold, and costs as much: the member's model rereads its whole context to sum it up. A member that went back to work meanwhile refuses. Until the member's next answer, the card then shows the context as Claude Code counts it, like `/context`.
+
+### Automatic compaction
+
+A member that stays at rest for 15 minutes with a large context is compacted on its own, so that it comes back to work with room, and without waiting for Claude Code to compact it in the middle of a task. By default, from 70% of its window, the figure its frame and its card show. The summary keeps in detail the last stretch of work: the files touched and why, the choices made, what is left open, who asked for what and what was promised.
+
+It is never done to a member on your screen, nor to one that waits for you, whose turn failed, whose command still runs, or whose subagents or teammates are at work (asked again five minutes later). At most once per stretch of rest. Contacts are compacted too, when they are out of sight. During the compaction, the member stays at rest on the dashboard.
+
+Each compaction leaves a trace: a ⟳ in the member's curve, at the time it was made, and a line in the journal, "⟳ dev-interface auto-compacted · 74 → 9 %", the context before and after. A compaction you ask for, from a click or by typing `/compact`, leaves the same line, without "auto". An automatic one that fails leaves a line in orange, with the reason.
+
+`auto_compact = 80` in the [team's settings](/recruit/reference/configuration/#teams) sets another share, `auto_compact = false` turns it off; so does "Auto-compaction" in the [team's menu](/recruit/guides/menu/#the-teams-actions). Each compaction costs as much as one asked by hand.
 
 ### Order and room
 
@@ -74,7 +88,7 @@ When sessions open elsewhere use members' names, a dimmed line over the usage na
 
 ![The journal, full size: the messages the members send each other](../../../assets/screenshots/journal.png)
 
-The journal lists the messages the members send each other, two lines each.
+The journal lists the messages the members send each other, two lines each, and the members' compactions, one line each.
 
 It has three sizes: full (half of the column), reduced (its last three messages, the rest of the column to the dashboard) and hidden. It starts reduced. `Alt+j` (`⌥j` on macOS) takes it from full to reduced, then to hidden, then back to full. `/team` (`/equipe` in a French team), typed in a member's prompt, does the same, even while Claude works.
 

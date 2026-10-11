@@ -40,7 +40,8 @@ pub enum Field {
 
 /// A change to a team, as `edit` takes them; in JSON for `recruit _edit`: `{"set": {"member": "dev", "field":
 /// {"model": "opus"}}}`, `{"rename": {"from": "a", "to": "b"}}`, `{"add": {"name": "x", "member": {"role": "…"}}}`,
-/// `{"remove": "dev"}`, `{"dashboard": false}`.
+/// `{"remove": "dev"}`, `{"dashboard": false}`, `{"auto_compact": 80}` (`null` turns it off), `{"grid": {"columns": 2,
+/// "rows": 2}}`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Edit {
@@ -61,6 +62,17 @@ pub enum Edit {
     Remove(String),
     /// The dashboard and the journal; on by default.
     Dashboard(bool),
+    /// The share of its window, in percent, from which a member at rest is compacted, taken between 1 and 100;
+    /// None turns it off (`auto_compact = false`). 70 by default.
+    AutoCompact(Option<u8>),
+    /// How the members share their tabs: a grid (the default), a tab each, or « focus ».
+    Layout(super::Layout),
+    /// The most panes a tab shows, the contacts' as the agents': `columns` × `rows`, 3 × 2 by default, at least one
+    /// of each. No effect with `layout = "tabs"`.
+    Grid {
+        columns: usize,
+        rows: usize,
+    },
 }
 
 /// The layer a value comes from.
@@ -143,9 +155,47 @@ pub fn member_layers(origin: &Origin, team: &str, member: &str) -> Result<Member
 }
 
 /// Whether the team has its dashboard, where that comes from, and what its default would be.
+#[cfg(test)]
 pub fn dashboard_layers(origin: &Origin, team: &str) -> Result<Layered<bool>> {
     let files = Files::read(origin)?;
     Ok(files.layered(team, &Spot::Team, Kind::Dashboard)?.map(|v| v != Some(Plain::Bool(false))))
+}
+
+/// The team's own settings, as the menu shows them: where each comes from, and what its default would be.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeamLayers {
+    pub dashboard: Layered<bool>,
+    /// The share of its window, in percent, from which a member at rest is compacted; None when it is off.
+    pub auto_compact: Layered<Option<u8>>,
+    pub columns: Layered<usize>,
+    pub rows: Layered<usize>,
+    pub layout: Layered<super::Layout>,
+}
+
+/// The team's own settings, where each one comes from, and what its default would be.
+pub fn team_layers(origin: &Origin, team: &str) -> Result<TeamLayers> {
+    let files = Files::read(origin)?;
+    let count = |kind: Kind| -> Result<Layered<usize>> {
+        let default = match kind.default() {
+            Some(Plain::Int(n)) => n.max(1) as usize,
+            _ => 1,
+        };
+        Ok(files.layered(team, &Spot::Team, kind)?.map(|v| match v {
+            Some(Plain::Int(n)) => n.max(1) as usize,
+            _ => default,
+        }))
+    };
+    Ok(TeamLayers {
+        dashboard: files.layered(team, &Spot::Team, Kind::Dashboard)?.map(|v| v != Some(Plain::Bool(false))),
+        auto_compact: files.layered(team, &Spot::Team, Kind::AutoCompact)?.map(|v| match v {
+            Some(Plain::Bool(false)) => None,
+            Some(Plain::Int(at)) => Some(at.clamp(1, 100) as u8),
+            _ => Some(super::AUTO_COMPACT_AT),
+        }),
+        columns: count(Kind::Columns)?,
+        rows: count(Kind::Rows)?,
+        layout: files.layered(team, &Spot::Team, Kind::Layout)?.map(|v| layout_of(v.as_ref())),
+    })
 }
 
 /// A new member's name: a valid one, that no member has yet, whatever the case.
@@ -174,6 +224,16 @@ fn check_name<'a>(names: impl IntoIterator<Item = &'a str>, name: &str, except: 
 enum Plain {
     Text(String),
     Bool(bool),
+    Int(i64),
+}
+
+/// A layout as a file writes it: "grid", from 0.1, is the default one.
+fn layout_of(value: Option<&Plain>) -> super::Layout {
+    match value {
+        Some(Plain::Text(text)) if text == "tabs" => super::Layout::Tabs,
+        Some(Plain::Text(text)) if text == "focus" => super::Layout::Focus,
+        _ => super::Layout::Auto,
+    }
 }
 
 fn text_of(value: Option<Plain>) -> Option<String> {
@@ -185,13 +245,17 @@ fn text_of(value: Option<Plain>) -> Option<String> {
 
 impl Plain {
     fn read(item: &Item) -> Option<Plain> {
-        item.as_str().map(|s| Plain::Text(s.to_string())).or_else(|| item.as_bool().map(Plain::Bool))
+        item.as_str()
+            .map(|s| Plain::Text(s.to_string()))
+            .or_else(|| item.as_bool().map(Plain::Bool))
+            .or_else(|| item.as_integer().map(Plain::Int))
     }
 
     fn value(&self) -> Value {
         match self {
             Plain::Text(text) => Value::from(text.as_str()),
             Plain::Bool(b) => Value::from(*b),
+            Plain::Int(n) => Value::from(*n),
         }
     }
 }
@@ -206,6 +270,10 @@ enum Kind {
     Model,
     Effort,
     Dashboard,
+    AutoCompact,
+    Columns,
+    Rows,
+    Layout,
 }
 
 impl Kind {
@@ -219,6 +287,10 @@ impl Kind {
             Kind::Model => "model",
             Kind::Effort => "effort",
             Kind::Dashboard => "dashboard",
+            Kind::AutoCompact => "auto_compact",
+            Kind::Columns => "columns",
+            Kind::Rows => "rows",
+            Kind::Layout => "layout",
         }
     }
 
@@ -227,10 +299,16 @@ impl Kind {
         matches!(self, Kind::PermissionMode | Kind::Model | Kind::Effort)
     }
 
-    /// Whether two values of this setting come to the same: a tab of "Agents" is the default group, as no tab.
+    /// Whether two values of this setting come to the same: a tab of "Agents" is the default group, as no tab;
+    /// `auto_compact = true` is the default share.
     fn same(self, a: Option<&Plain>, b: Option<&Plain>) -> bool {
         let agents = Plain::Text("Agents".into());
-        let plain = |v: Option<&Plain>| v.filter(|v| !(self == Kind::Tab && **v == agents)).cloned();
+        let plain = |v: Option<&Plain>| match v {
+            Some(v) if self == Kind::Tab && *v == agents => None,
+            Some(Plain::Bool(true)) if self == Kind::AutoCompact => Some(Plain::Int(super::AUTO_COMPACT_AT.into())),
+            Some(v) if self == Kind::Layout => Some(Plain::Text(format!("{:?}", layout_of(Some(v))).to_lowercase())),
+            v => v.cloned(),
+        };
         plain(a) == plain(b)
     }
 
@@ -239,6 +317,10 @@ impl Kind {
         match self {
             Kind::Contact => Some(Plain::Bool(false)),
             Kind::Dashboard => Some(Plain::Bool(true)),
+            Kind::AutoCompact => Some(Plain::Int(super::AUTO_COMPACT_AT.into())),
+            Kind::Columns => Some(Plain::Int(3)),
+            Kind::Rows => Some(Plain::Int(2)),
+            Kind::Layout => Some(Plain::Text("auto".into())),
             _ => None,
         }
     }
@@ -426,6 +508,22 @@ impl Files {
                 self.set(team, &Spot::Member(member), kind, value)
             }
             Edit::Dashboard(on) => self.set(team, &Spot::Team, Kind::Dashboard, Some(Plain::Bool(*on))),
+            Edit::AutoCompact(at) => {
+                let value = at.map_or(Plain::Bool(false), |at| Plain::Int(at.clamp(1, 100).into()));
+                self.set(team, &Spot::Team, Kind::AutoCompact, Some(value))
+            }
+            Edit::Layout(layout) => {
+                let text = match layout {
+                    super::Layout::Auto => "grid",
+                    super::Layout::Tabs => "tabs",
+                    super::Layout::Focus => "focus",
+                };
+                self.set(team, &Spot::Team, Kind::Layout, Some(Plain::Text(text.into())))
+            }
+            Edit::Grid { columns, rows } => {
+                self.set(team, &Spot::Team, Kind::Columns, Some(Plain::Int((*columns).max(1) as i64)))?;
+                self.set(team, &Spot::Team, Kind::Rows, Some(Plain::Int((*rows).max(1) as i64)))
+            }
             Edit::Rename { from, to } => {
                 self.known(team, from)?;
                 if from == to {
@@ -859,6 +957,50 @@ role = "Seul"
         assert!(!shared(dir.path()).contains("dashboard"));
         edit(&origin, "web", &[Edit::Dashboard(false)]).unwrap();
         assert!(shared(dir.path()).contains("[teams.web]\ndashboard = false\n"), "{}", shared(dir.path()));
+    }
+
+    /// The team's own settings of 2026-10-11: automatic compaction and the grid of a tab.
+    #[test]
+    fn auto_compaction_and_grid() {
+        let (dir, origin) = project(TEAM, None);
+        let layers = team_layers(&origin, "web").unwrap();
+        assert_eq!((layers.auto_compact.value, layers.auto_compact.source), (Some(70), Source::Default));
+        assert_eq!((layers.columns.value, layers.rows.value), (3, 2));
+        // Another share, then off, then the default again: the key goes.
+        edit(&origin, "web", &[Edit::AutoCompact(Some(80))]).unwrap();
+        assert!(shared(dir.path()).contains("[teams.web]\nmodel = \"opus\" # pour tous\nauto_compact = 80\n"));
+        assert_eq!(edit(&origin, "web", &[Edit::AutoCompact(None)]).unwrap().team.auto_compact_at(), None);
+        assert!(shared(dir.path()).contains("auto_compact = false\n"));
+        assert_eq!(team_layers(&origin, "web").unwrap().auto_compact.value, None);
+        edit(&origin, "web", &[Edit::AutoCompact(Some(70))]).unwrap();
+        assert_eq!(shared(dir.path()), TEAM);
+        // `true` is the default share: asking for it takes the key away.
+        let (dir, origin) = project(&TEAM.replace("# pour tous\n", "# pour tous\nauto_compact = true\n"), None);
+        assert_eq!(team_layers(&origin, "web").unwrap().auto_compact.value, Some(70));
+        edit(&origin, "web", &[Edit::AutoCompact(Some(70))]).unwrap();
+        assert_eq!(shared(dir.path()), TEAM);
+        // Two by two, then back to three by two.
+        let (dir, origin) = project(TEAM, None);
+        // Two rows are the default: only the columns are written.
+        let found = edit(&origin, "web", &[Edit::Grid { columns: 2, rows: 2 }]).unwrap();
+        assert_eq!((found.team.columns, found.team.rows), (Some(2), None));
+        let layers = team_layers(&origin, "web").unwrap();
+        assert_eq!((layers.columns.value, layers.columns.source), (2, Source::Shared));
+        assert_eq!((layers.rows.value, layers.rows.source), (2, Source::Default));
+        assert_eq!(layers.columns.fallback, Some((3, Source::Default)));
+        edit(&origin, "web", &[Edit::Grid { columns: 3, rows: 2 }]).unwrap();
+        assert_eq!(shared(dir.path()), TEAM);
+        // « focus », then the grid again: the key goes; "grid", from 0.1, is the default.
+        let found = edit(&origin, "web", &[Edit::Layout(super::super::Layout::Focus)]).unwrap();
+        assert_eq!(found.team.layout, Some(super::super::Layout::Focus));
+        assert!(shared(dir.path()).contains("layout = \"focus\"\n"));
+        assert_eq!(team_layers(&origin, "web").unwrap().layout.value, super::super::Layout::Focus);
+        edit(&origin, "web", &[Edit::Layout(super::super::Layout::Auto)]).unwrap();
+        assert_eq!(shared(dir.path()), TEAM);
+        let (dir, origin) = project(&TEAM.replace("# pour tous\n", "# pour tous\nlayout = \"grid\"\n"), None);
+        assert_eq!(team_layers(&origin, "web").unwrap().layout.value, super::super::Layout::Auto);
+        edit(&origin, "web", &[Edit::Layout(super::super::Layout::Auto)]).unwrap();
+        assert_eq!(shared(dir.path()), TEAM);
     }
 
     /// The rule settled on 2026-10-07: the file that gives the value now, compared with the layers under it.

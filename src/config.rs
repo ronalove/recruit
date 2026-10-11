@@ -19,7 +19,7 @@ use crate::t;
 mod edit;
 
 pub use edit::{
-    Edit, Field, Layered, MemberLayers, Source, check_new_name, dashboard_layers, edit, member_layers, preview,
+    Edit, Field, Layered, MemberLayers, Source, TeamLayers, check_new_name, edit, member_layers, preview, team_layers,
 };
 
 pub const LOCAL_DIR: &str = ".recruit";
@@ -146,9 +146,52 @@ pub struct Team {
     /// The dashboard and the journal, in a column on the right of the contacts. On by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dashboard: Option<bool>,
+    /// A member at rest for a while compacted when its context is high: from 70 % of its window by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact: Option<AutoCompact>,
     #[serde(default)]
     pub members: IndexMap<String, Member>,
 }
+
+/// `auto_compact` (decision of 2026-10-11): `false` turns it off, `true` is the default share, a number is the share
+/// of the window, in percent, from which a member at rest for [`AUTO_COMPACT_IDLE`] seconds is compacted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum AutoCompact {
+    Switch(bool),
+    At(i64),
+}
+
+impl<'de> Deserialize<'de> for AutoCompact {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = AutoCompact;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(&t!(
+                    "true, false ou un pourcentage de 1 à 100",
+                    "true, false or a percentage from 1 to 100"
+                ))
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<AutoCompact, E> {
+                Ok(AutoCompact::Switch(v))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<AutoCompact, E> {
+                Ok(AutoCompact::At(v))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<AutoCompact, E> {
+                Ok(AutoCompact::At(i64::try_from(v).unwrap_or(i64::MAX)))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// The share of its window, in percent, from which a member at rest is compacted, when the team says nothing.
+pub const AUTO_COMPACT_AT: u8 = 70;
+
+/// How long a member stays at rest, in seconds, before its context is looked at for a compaction.
+pub const AUTO_COMPACT_IDLE: u64 = 15 * 60;
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -187,9 +230,21 @@ pub enum Layout {
     Auto,
     /// One tab per member, contacts first.
     Tabs,
+    /// As `Auto`, a tab of members shown in « focus » (decision of 2026-10-11): the main one on the left, the best
+    /// placed on the right, the others as cards (`mux::focus`). The contacts' tab with the panels keeps its grid.
+    Focus,
 }
 
 impl Team {
+    /// The share of its window, in percent, from which a member at rest is compacted; None when it is turned off.
+    pub fn auto_compact_at(&self) -> Option<u8> {
+        match self.auto_compact {
+            None | Some(AutoCompact::Switch(true)) => Some(AUTO_COMPACT_AT),
+            Some(AutoCompact::Switch(false)) => None,
+            Some(AutoCompact::At(at)) => Some(at.clamp(1, 100) as u8),
+        }
+    }
+
     /// The members the user talks to: those marked `contact`, or else the first one.
     pub fn contacts(&self) -> Vec<&str> {
         let marked: Vec<&str> = self.members.iter().filter(|(_, m)| m.contact).map(|(n, _)| n.as_str()).collect();
@@ -498,6 +553,19 @@ fn deserialize(table: toml::Table, file: &Path) -> Result<Settings> {
             file.display(),
             dir
         ));
+    }
+    for (name, team) in &settings.teams {
+        if let Some(AutoCompact::At(at)) = team.auto_compact
+            && !(1..=100).contains(&at)
+        {
+            bail!(t!(
+                "{} : auto_compact de l'équipe « {} » doit être true, false ou un pourcentage de 1 à 100 (« {} »)",
+                "{}: auto_compact of team \"{}\" must be true, false or a percentage from 1 to 100 (\"{}\")",
+                file.display(),
+                name,
+                at
+            ));
+        }
     }
     // A tab with the title of the ones recruit makes would make two windows of one title.
     for (name, team) in &settings.teams {
@@ -934,6 +1002,27 @@ role = "Maquettes"
         let tabs = crate::layout::tabs(&settings.teams["a"]);
         assert_eq!(tabs.len(), 2);
         assert_eq!((tabs[1].title.as_str(), tabs[1].members.len()), ("Agents", 2));
+    }
+
+    #[test]
+    fn auto_compaction_share() {
+        let team = |value: &str| {
+            let file = format!("[teams.a]\n{value}\n[teams.a.members.b]\nrole = 'B'\n");
+            parse_settings(file.parse::<toml::Table>().unwrap(), Path::new("/x/web.toml"))
+        };
+        for (value, at) in [("", Some(70)), ("auto_compact = true", Some(70)), ("auto_compact = false", None)] {
+            assert_eq!(team(value).unwrap().teams["a"].auto_compact_at(), at, "{value}");
+        }
+        assert_eq!(team("auto_compact = 85").unwrap().teams["a"].auto_compact_at(), Some(85));
+        for value in ["auto_compact = 0", "auto_compact = 101", "auto_compact = -5"] {
+            let error = format!("{:#}", team(value).unwrap_err());
+            assert!(error.starts_with("/x/web.toml") && error.contains("auto_compact"), "{error}");
+        }
+        for value in ["auto_compact = 'oui'", "auto_compact = 1.5"] {
+            let error = format!("{:#}", team(value).unwrap_err());
+            let expected = t!("true, false ou un pourcentage de 1 à 100", "true, false or a percentage from 1 to 100");
+            assert!(error.contains(&expected) && !error.contains("untagged"), "{error}");
+        }
     }
 
     #[test]

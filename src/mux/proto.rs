@@ -237,6 +237,10 @@ pub(crate) enum Request {
         /// The team's language, for them.
         #[serde(default)]
         lang: String,
+        /// The tabs of agents are in « focus » (`layout = "focus"`): the active member on the left, the best placed of
+        /// the others on the right. Absent from an older client's request: the grid.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        focus: bool,
     },
     /// A pane in a tab of its own, at the end, titled after it: its id.
     OpenWindow {
@@ -252,6 +256,9 @@ pub(crate) enum Request {
     Arrange {
         tabs: Vec<(String, Vec<String>)>,
         columns: usize,
+        /// As in [`Request::Build`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        focus: bool,
     },
     /// The dashboard over the reduced journal, beside pane `beside`.
     OpenPanels {
@@ -658,6 +665,20 @@ mod tests {
             Request::Clients,
             Request::Capture { pane: None, styles: true, history: 0 },
             Request::Send { pane: "p2".into(), bytes: b"a\r".to_vec() },
+            // « Focus » (2.1.0): optional, absent for the grid; an older client's request reads with the grid.
+            Request::Arrange { tabs: vec![("1".into(), vec!["dev".into()])], columns: 3, focus: false },
+            Request::Arrange { tabs: vec![("1".into(), vec!["dev".into()])], columns: 3, focus: true },
+            Request::Build {
+                team: "t".into(),
+                dir: "/".into(),
+                columns: 3,
+                tabs: Vec::new(),
+                cols: 80,
+                rows: 24,
+                exe: String::new(),
+                lang: String::new(),
+                focus: true,
+            },
         ];
         let text: Vec<String> = requests.iter().map(json).collect();
         assert_eq!(
@@ -674,8 +695,13 @@ mod tests {
                 r#""clients""#,
                 r#"{"capture":{"pane":null,"styles":true,"history":0}}"#,
                 r#"{"send":{"pane":"p2","bytes":[97,13]}}"#,
+                r#"{"arrange":{"tabs":[["1",["dev"]]],"columns":3}}"#,
+                r#"{"arrange":{"tabs":[["1",["dev"]]],"columns":3,"focus":true}}"#,
+                r#"{"build":{"team":"t","dir":"/","columns":3,"tabs":[],"cols":80,"rows":24,"exe":"","lang":"","focus":true}}"#,
             ]
         );
+        let older: Request = read(r#"{"arrange":{"tabs":[["1",["dev"]]],"columns":3}}"#);
+        assert_eq!(older, Request::Arrange { tabs: vec![("1".into(), vec!["dev".into()])], columns: 3, focus: false });
         for request in requests {
             assert_eq!(read::<Request>(&json(&request)), request);
         }

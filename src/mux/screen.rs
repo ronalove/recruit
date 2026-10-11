@@ -11,6 +11,7 @@ use super::chrome::{self, Header, Look, Notice, Part, Tab, Target};
 use super::engine::Engine;
 use super::select::Point;
 use crate::canvas::{Canvas, Cursor, Style};
+use crate::look;
 use crossterm::style::Color;
 
 /// What shows over the team, everything else dimmed, the bar included (direction « Cadres »).
@@ -37,8 +38,10 @@ pub(crate) struct Zones {
     pub notice: Option<Rect>,
 }
 
-/// What is under a layer: as the menu dims what is behind its dialogs.
-const DIMMED: Style = Style { fg: Some(Color::AnsiValue(239)), ..Style::PLAIN };
+/// What is under a layer: as the menu dims what is behind its dialogs, in the palette of the moment.
+fn dimmed() -> Style {
+    Style { fg: Some(look::palette().faded), ..Style::PLAIN }
+}
 
 /// A pane as the screen shows it.
 pub(crate) struct View<'a> {
@@ -52,6 +55,16 @@ pub(crate) struct View<'a> {
     pub focused: bool,
     /// Its selected text (`select::Selection::range`), shown in reverse video.
     pub selection: Option<(Point, Point)>,
+    /// No frame: `area` is exactly the place of its cells, and it has no header, so no clickable parts. For a pane
+    /// that draws its own frame (the menu's dropdown lists).
+    pub bare: bool,
+}
+
+impl View<'_> {
+    /// Where the view's cells go: all of `area` when bare, else inside its frame ([`content`]).
+    pub(crate) fn inside(&self) -> Rect {
+        if self.bare { self.area } else { content(self.area) }
+    }
 }
 
 /// Where a pane's cells go in its `area`: inside its frame. Its engine and its PTY have this size.
@@ -118,7 +131,7 @@ fn draw(
     if area.width == 0 || area.height == 0 {
         return None;
     }
-    let inside = content(area);
+    let inside = view.inside();
     if cells && inside.width > 0 && inside.height > 0 {
         canvas.fill(inside.x, inside.y, inside.width, inside.height, Style::PLAIN);
         view.engine.draw(canvas, inside);
@@ -127,10 +140,12 @@ fn draw(
         }
     }
     let scrolled = view.engine.scrolled();
-    let header =
-        Header { scroll: (scrolled > 0).then(|| (scrolled, view.engine.history().max(scrolled))), ..view.header };
-    let drawn = chrome::frame(canvas, area, &header, view.focused, look);
-    parts.extend(drawn.into_iter().map(|(rect, part)| (rect, index, part)));
+    if !view.bare {
+        let header =
+            Header { scroll: (scrolled > 0).then(|| (scrolled, view.engine.history().max(scrolled))), ..view.header };
+        let drawn = chrome::frame(canvas, area, &header, view.focused, look);
+        parts.extend(drawn.into_iter().map(|(rect, part)| (rect, index, part)));
+    }
     if !view.focused || scrolled > 0 {
         return None;
     }
@@ -176,7 +191,7 @@ fn finish(
         zones.bar = chrome::bar(canvas, row, bar.team, bar.tabs, look, bar.hover);
     }
     if let Some(area) = clear {
-        canvas.fade_outside(area.x, area.y, area.width, area.height, DIMMED);
+        canvas.fade_outside(area.x, area.y, area.width, area.height, dimmed());
         zones.bar.clear();
         match over {
             // The choice's box over whatever stays clear under it.
@@ -225,6 +240,9 @@ pub(crate) struct Screen {
     clear: Option<Rect>,
     /// Where the notice was drawn: kept cells there show it.
     notice: Option<Rect>,
+    /// The color dimmed cells had in the last frame: another one (the theme changed) and everything is drawn, or the
+    /// cells kept under a layer would keep the old one.
+    faded: Option<Color>,
 }
 
 impl Screen {
@@ -248,6 +266,7 @@ impl Screen {
         let same = !self.composing
             && (self.canvas.width(), self.canvas.height()) == (width, height)
             && clear == self.clear
+            && self.faded == Some(look::palette().faded)
             && self.drawn.len() == views.len()
             && self.drawn.iter().zip(views).all(|(drawn, view)| drawn.id == view.id && drawn.area == view.area);
         self.composing = true;
@@ -266,6 +285,7 @@ impl Screen {
             self.drawn.resize(views.len(), Drawn::default());
         }
         self.clear = clear;
+        self.faded = Some(look::palette().faded);
         self.notice = notice.map(|(_, area)| area);
         // The areas of the views drawn before: their frames are drawn again at every frame, and a view over one of
         // them (a layer) is painted again too, or a frame would show through it.
@@ -296,6 +316,11 @@ impl Screen {
         let zones = finish(&mut self.canvas, cursor, parts, &bar, look, over, clear, notice);
         self.composing = false;
         zones
+    }
+
+    /// The next frame is drawn whole, whatever was kept: for what the screen cannot see change by itself.
+    pub(crate) fn redraw(&mut self) {
+        self.composing = true;
     }
 
     /// The last frame composed.
@@ -435,6 +460,7 @@ mod tests {
                 header: header("one"),
                 focused: focus == 0,
                 selection: None,
+                bare: false,
             },
             View {
                 id: "two",
@@ -443,6 +469,7 @@ mod tests {
                 header: header("two"),
                 focused: focus == 1,
                 selection: None,
+                bare: false,
             },
         ]
     }
@@ -453,7 +480,7 @@ mod tests {
     fn panes_in_their_frames() {
         let (a, b) = (left(), right());
         let mut canvas = Canvas::new(20, 5);
-        let tabs = [Tab { title: "A", active: true, state: State::Working, zoomed: None }];
+        let tabs = [Tab { title: "A", active: true, state: State::Working, zoomed: None, switch: None }];
         let zones =
             compose(&mut canvas, &two(&a, &b, 0), "team", &tabs, BAR, None, Look::default(), Over::Nothing, None);
         // Each engine inside its frame, the frames side by side with no line between them.
@@ -640,6 +667,7 @@ mod tests {
                 header: header("one"),
                 focused: true,
                 selection: None,
+                bare: false,
             },
             View {
                 id: "menu",
@@ -648,6 +676,7 @@ mod tests {
                 header: header("menu"),
                 focused: false,
                 selection: None,
+                bare: false,
             },
         ]
     }
@@ -687,10 +716,10 @@ mod tests {
         let (mut a, mut b) = (left(), right());
         (a.generation, b.generation) = (Some(1), Some(1));
         let mut screen = Screen::default();
-        let tabs = [Tab { title: "a long tab title", active: true, state: State::Working, zoomed: None }];
+        let tabs = [Tab { title: "a long tab title", active: true, state: State::Working, zoomed: None, switch: None }];
         screen.compose(20, 5, &two(&a, &b, 0), "team", &tabs, BAR, None, Look::default(), Over::Nothing, None);
         // One pane alone, wider: nothing left of the other, nor of the longer tab.
-        let short = [Tab { title: "t", active: true, state: State::Working, zoomed: None }];
+        let short = [Tab { title: "t", active: true, state: State::Working, zoomed: None, switch: None }];
         screen.compose(20, 5, &alone(&a), "team", &short, BAR, None, Look::default(), Over::Nothing, None);
         let mut fresh = Canvas::new(20, 5);
         compose(&mut fresh, &alone(&a), "team", &short, BAR, None, Look::default(), Over::Nothing, None);
@@ -752,6 +781,7 @@ mod tests {
             header: Header { name: id, state: State::Idle, ..Header::default() },
             focused,
             selection: None,
+            bare: false,
         };
         [
             view("a", a, Rect { x: 0, y: 0, width: 10, height: 10 }, false),
@@ -824,7 +854,7 @@ mod tests {
     fn under_the_menu_dimmed() {
         let (a, c, menu) = (Fill('a', Some(1)), Fill('c', Some(1)), Fill('m', Some(1)));
         let bar = Rect { x: 0, y: 10, width: 20, height: 1 };
-        let tabs = [Tab { title: "t", active: true, state: State::Idle, zoomed: None }];
+        let tabs = [Tab { title: "t", active: true, state: State::Idle, zoomed: None, switch: None }];
         let mut screen = Screen::default();
         let zones = screen.compose(
             20,
@@ -839,9 +869,9 @@ mod tests {
             None,
         );
         // The panes and the bar dimmed, the menu clear; nothing of the bar to click.
-        assert_eq!(screen.canvas().style(1, 1), DIMMED);
-        assert_eq!(screen.canvas().style(0, 10), DIMMED);
-        assert_ne!(screen.canvas().style(7, 4), DIMMED);
+        assert_eq!(screen.canvas().style(1, 1), dimmed());
+        assert_eq!(screen.canvas().style(0, 10), dimmed());
+        assert_ne!(screen.canvas().style(7, 4), dimmed());
         assert_eq!(screen.canvas().row(4).chars().skip(6).take(8).collect::<String>(), "mmmmmmmm");
         assert!(zones.bar.is_empty() && zones.options.is_empty());
         same_as_whole(&screen, &under_a_menu(&a, &c, &menu), &tabs, bar, Over::LastView);
@@ -849,7 +879,7 @@ mod tests {
         let [a_view, c_view, _] = under_a_menu(&a, &c, &menu);
         let views = [a_view, c_view];
         let zones = screen.compose(20, 11, &views, "t", &tabs, bar, None, Look::default(), Over::Nothing, None);
-        assert_ne!(screen.canvas().style(1, 1), DIMMED);
+        assert_ne!(screen.canvas().style(1, 1), dimmed());
         assert!(!zones.bar.is_empty());
         same_as_whole(&screen, &views, &tabs, bar, Over::Nothing);
     }
@@ -866,6 +896,7 @@ mod tests {
             header: header("m"),
             focused: false,
             selection: None,
+            bare: false,
         };
         let mut screen = Screen::default();
         screen.compose(20, 5, &[one, two_, layer], "t", &[], BAR, None, Look::default(), Over::LastView, None);
@@ -886,7 +917,7 @@ mod tests {
         assert_eq!(zones.options.len(), choice.options.len());
         assert!(zones.options.iter().all(|(rect, _)| overlap(rect, &area)));
         assert!(zones.bar.is_empty());
-        assert_eq!(screen.canvas().style(0, 10), DIMMED);
+        assert_eq!(screen.canvas().style(0, 10), dimmed());
         assert_eq!(screen.canvas().cursor(), None);
         same_as_whole(&screen, &views, &[], bar, Over::Choice(&choice));
         // Gone: the team as it was.
@@ -1003,6 +1034,7 @@ mod tests {
             header: Header { name: id, color: Some(Color::Cyan), state: State::Idle, ..Header::default() },
             focused,
             selection: None,
+            bare: false,
         };
         [view("a", a, 0, focus == 0), view("b", b, 80, focus == 1)]
     }
@@ -1035,7 +1067,7 @@ mod tests {
         let (a, b) = (Fill('a', Some(1)), Fill('b', Some(1)));
         let notice = waiting("dev-saisie");
         let area = notice_at(&notice);
-        let tabs = [Tab { title: "t", active: true, state: State::Idle, zoomed: None }];
+        let tabs = [Tab { title: "t", active: true, state: State::Idle, zoomed: None, switch: None }];
         let mut screen = Screen::default();
         let views = wide(&a, &b, 0);
         let zones =
@@ -1052,7 +1084,7 @@ mod tests {
             assert_eq!(zones.notice, Some(area));
             let dimmed = (area.x..area.x + area.width)
                 .flat_map(|x| (area.y..area.y + area.height).map(move |y| (x, y)))
-                .filter(|&(x, y)| screen.canvas().style(x, y) == DIMMED)
+                .filter(|&(x, y)| screen.canvas().style(x, y) == dimmed())
                 .count();
             assert!(dimmed < area.width * area.height / 2, "{dimmed} dimmed cells in the notice under {over:?}");
             same_as_whole_with(&screen, &views, &tabs, WIDE_BAR, over, Some(&notice));
@@ -1175,8 +1207,8 @@ mod tests {
     fn a_hover_sends_its_rows_only() {
         let (a, b) = (Fill('a', Some(1)), Fill('b', Some(1)));
         let tabs = [
-            Tab { title: "one", active: true, state: State::Idle, zoomed: None },
-            Tab { title: "two", active: false, state: State::Idle, zoomed: None },
+            Tab { title: "one", active: true, state: State::Idle, zoomed: None, switch: None },
+            Tab { title: "two", active: false, state: State::Idle, zoomed: None, switch: None },
         ];
         let frame = |screen: &mut Screen, painter: &mut Painter, part: Option<Part>, target: Option<Target>| {
             let mut views = wide(&a, &b, 0);
@@ -1228,5 +1260,94 @@ mod tests {
         assert!(zones.parts.is_empty());
         let zones = screen.compose(160, 12, &views, "t", &[], WIDE_BAR, None, Look::default(), Over::LastView, None);
         assert!(!zones.parts.is_empty() && zones.parts.iter().all(|(_, index, _)| *index == 1), "{:?}", zones.parts);
+    }
+
+    #[test]
+    fn a_bare_view_is_all_cells() {
+        let (a, b) = (Fill('a', Some(1)), Fill('b', Some(1)));
+        let mut views = wide(&a, &b, 0);
+        // The second one, over the first, with no frame: its `area` is exactly its cells.
+        views[1].area = Rect { x: 10, y: 2, width: 6, height: 3 };
+        views[1].bare = true;
+        let mut screen = Screen::default();
+        let zones = screen.compose(160, 12, &views, "t", &[], WIDE_BAR, None, Look::default(), Over::Nothing, None);
+        let canvas = screen.canvas();
+        for (x, y) in [(10, 2), (15, 2), (10, 4), (15, 4)] {
+            assert_eq!(canvas.cell(x, y), "b", "({x}, {y})");
+        }
+        // Just outside it, the first view's.
+        for (x, y) in [(9, 2), (16, 2), (10, 5), (10, 1)] {
+            assert_ne!(canvas.cell(x, y), "b", "({x}, {y})");
+        }
+        assert!(zones.parts.iter().all(|(_, index, _)| *index == 0));
+        assert_eq!(views[1].inside(), views[1].area);
+    }
+
+    /// An engine that counts how many times it is drawn, with a fixed generation.
+    struct Counted(std::cell::Cell<usize>);
+
+    impl Engine for Counted {
+        fn feed(&mut self, _: &[u8], _: &mut Vec<u8>) {}
+        fn deadline(&self) -> Option<Instant> {
+            None
+        }
+        fn expire(&mut self, _: Instant, _: &mut Vec<u8>) -> bool {
+            false
+        }
+        fn relays(&mut self, _: &mut Vec<Relay>) {}
+        fn resize(&mut self, _: u16, _: u16) {}
+        fn set_colors(&mut self, _: Option<Rgb>, _: Option<Rgb>) {}
+        fn modes(&self) -> Modes {
+            Modes::default()
+        }
+        fn draw(&self, _: &mut Canvas, _: Rect) {
+            self.0.set(self.0.get() + 1);
+        }
+        fn cursor(&self) -> Option<Cursor> {
+            None
+        }
+        fn history(&self) -> usize {
+            0
+        }
+        fn scroll(&mut self, _: isize) {}
+        fn scrolled(&self) -> usize {
+            0
+        }
+        fn generation(&self) -> Option<u64> {
+            Some(1)
+        }
+    }
+
+    #[test]
+    fn a_new_theme_or_a_redraw_draws_the_kept_cells_again() {
+        let engine = Counted(std::cell::Cell::new(0));
+        let bar = Rect { x: 0, y: 10, width: 20, height: 1 };
+        let view = || {
+            [View {
+                id: "a",
+                engine: &engine,
+                area: Rect { x: 0, y: 0, width: 20, height: 10 },
+                header: header("a"),
+                focused: false,
+                selection: None,
+                bare: false,
+            }]
+        };
+        let mut screen = Screen::default();
+        let frame = |screen: &mut Screen| {
+            screen.compose(20, 11, &view(), "t", &[], bar, None, Look::default(), Over::Nothing, None);
+            engine.0.get()
+        };
+        assert_eq!(frame(&mut screen), 1);
+        // Nothing changed: kept.
+        assert_eq!(frame(&mut screen), 1);
+        // The dimmed color of another theme: everything is drawn, for the cells kept under a layer.
+        screen.faded = Some(Color::AnsiValue(1));
+        assert_eq!(frame(&mut screen), 2);
+        assert_eq!(frame(&mut screen), 2);
+        // Asked for.
+        screen.redraw();
+        assert_eq!(frame(&mut screen), 3);
+        assert_eq!(frame(&mut screen), 3);
     }
 }

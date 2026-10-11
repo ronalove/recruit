@@ -35,7 +35,11 @@ Une équipe a sa propre langue, `lang` dans son fichier, fixée à sa création 
 
 ### Ce que coûte une équipe
 
-Chaque membre est une session Claude Code sur ton compte, et l'utilise comme n'importe quelle autre. En plus, avec le mod, Haiku résume chaque nouvelle demande en un court appel pour le tableau de bord, et compacter une conversation depuis le tableau de bord coûte ce que coûte la compaction de Claude Code. La ligne du bas du tableau de bord montre ton usage sur 5 heures et sur 7 jours.
+Chaque membre est une session Claude Code sur ton compte, et l'utilise comme n'importe quelle autre. En plus, avec le mod, Haiku résume chaque nouvelle demande en un court appel pour le tableau de bord, et compacter une conversation coûte ce que coûte la compaction de Claude Code : depuis le tableau de bord, et d'elle-même pour un membre au repos avec un gros contexte ([compaction automatique](/recruit/fr/guides/dashboard/#compaction-automatique), activée par défaut, `auto_compact = false` pour la désactiver). La ligne du bas du tableau de bord montre ton usage sur 5 heures et sur 7 jours.
+
+### Une police plus petite par panneau
+
+Impossible : un terminal n'a qu'une taille de police pour toute sa fenêtre. Pour faire tenir plus de membres, ou donner plus de place à chacun, règle la [grille](/recruit/fr/guides/contacts-and-agents/#onglets) des onglets, ou montre un onglet chargé en [focus](/recruit/fr/guides/contacts-and-agents/#focus) (`⌥l`) : un membre en grand, les plus occupés à côté, les autres en cartes.
 
 ### Tes réglages de Claude Code
 

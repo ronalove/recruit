@@ -18,10 +18,12 @@
 use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
 
+pub(crate) mod cards;
 pub(crate) mod chrome;
 pub(crate) mod client;
 pub(crate) mod ctl;
 pub(crate) mod engine;
+pub(crate) mod focus;
 pub(crate) mod input;
 pub(crate) mod keys;
 pub(crate) mod native;

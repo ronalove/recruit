@@ -27,6 +27,8 @@ pub(crate) enum Action {
     Zoom,
     /// ⌥g: to the member who has waited the longest.
     Waiting,
+    /// ⌥l: the current tab from the grid to the focus layout, and back, until detached.
+    ToggleLayout,
 }
 
 /// A key the multiplexer keeps.
@@ -49,6 +51,7 @@ pub(crate) fn shortcut(key: &Key) -> Option<Shortcut> {
         (Mods::ALT, KeyCode::Char('q')) => Action::Quit,
         (Mods::ALT, KeyCode::Char('z')) => Action::Zoom,
         (Mods::ALT, KeyCode::Char('g')) => Action::Waiting,
+        (Mods::ALT, KeyCode::Char('l')) => Action::ToggleLayout,
         (mods, KeyCode::Left) if mods == Mods::ALT | Mods::SHIFT => Action::PreviousTab,
         (mods, KeyCode::Right) if mods == Mods::ALT | Mods::SHIFT => Action::NextTab,
         _ => return None,
@@ -91,10 +94,17 @@ mod tests {
             (key(Char('q'), A), Some(Quit)),
             (key(Char('z'), A), Some(Zoom)),
             (key(Char('g'), A), Some(Waiting)),
+            (key(Char('l'), A), Some(ToggleLayout)),
             // The pane's.
             (key(Char('0'), A), None),
             (key(Char('Z'), A), None),
             (key(Char('G'), A), None),
+            (key(Char('L'), A), None),
+            (key(Char('l'), N), None),
+            (key(Char('l'), C), None),
+            (key(Char('l'), A | C), None),
+            (key(Char('l'), A | S), None),
+            (key(Char('l'), A | Mods::SUPER), None),
             (key(Char('z'), C), None),
             (key(Char('g'), C), None),
             (key(Char('z'), A | C), None),
@@ -165,6 +175,7 @@ mod tests {
             (key(KeyCode::Char('9'), A), Tab(8), false),
             (key(KeyCode::Char('z'), A), Zoom, false),
             (key(KeyCode::Char('g'), A), Waiting, false),
+            (key(KeyCode::Char('l'), A), ToggleLayout, false),
         ];
         for (pressed, action, repeats) in table {
             let held = Key { kind: KeyKind::Repeat, ..pressed };
@@ -187,7 +198,7 @@ mod tests {
             [crate::mux::input::Event::Key(key)] => *key,
             other => panic!("{bytes:?}: {other:?}"),
         };
-        let table: [(&[u8], Option<Action>); 13] = [
+        let table: [(&[u8], Option<Action>); 17] = [
             (b"\x1b1", Some(Action::Tab(0))),
             (b"\x1b[49;3u", Some(Action::Tab(0))),
             (b"\x1bj", Some(Action::Journal)),
@@ -198,6 +209,10 @@ mod tests {
             (b"\x1b[122;3u", Some(Action::Zoom)),
             (b"\x1bg", Some(Action::Waiting)),
             (b"\x1b[103;3u", Some(Action::Waiting)),
+            (b"\x1bl", Some(Action::ToggleLayout)),
+            (b"\x1b[108;3u", Some(Action::ToggleLayout)),
+            (b"\x1bL", None),
+            (b"\x0c", None),
             (b"\x1bJ", None),
             (b"\x1b[1;3C", None),
             (b"\x1a", None),

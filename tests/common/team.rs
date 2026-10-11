@@ -29,6 +29,8 @@ pub struct Team {
     recruit: PathBuf,
     run: tempfile::TempDir,
     settings: Option<Vec<u8>>,
+    /// More environment for every command and terminal of the team (`Team::env`), the server's included.
+    extra_env: Vec<(String, OsString)>,
     stopped: bool,
     /// A real Claude Code (the user's profile, and its `~/.claude.json` told the folder): only `settings.json` is
     /// checked untouched.
@@ -110,7 +112,27 @@ impl Team {
         let recruit = super::recruit_copy(&root);
         let run = tempfile::Builder::new().prefix("rt.").tempdir_in("/tmp").expect("short run dir");
         let settings = std::fs::read(user_file(".claude/settings.json")).ok();
-        Team { root, _dir: dir, proj, profile, name: name.into(), lang, recruit, run, settings, stopped: false, real }
+        Team {
+            root,
+            _dir: dir,
+            proj,
+            profile,
+            name: name.into(),
+            lang,
+            recruit,
+            run,
+            settings,
+            extra_env: Vec::new(),
+            stopped: false,
+            real,
+        }
+    }
+
+    /// Sets `key` for every command and terminal of the team from now on, and so for the server `recruit` starts.
+    /// Before `launch`.
+    pub fn env(&mut self, key: &str, value: impl AsRef<OsStr>) {
+        self.extra_env.retain(|(k, _)| k != key);
+        self.extra_env.push((key.to_string(), value.as_ref().to_os_string()));
     }
 
     /// The copy of recruit, in the project, with the test's environment.
@@ -127,6 +149,7 @@ impl Team {
             .env("RECRUIT_LANG", self.lang)
             .env("SHELL", "/bin/sh")
             .stdin(Stdio::null());
+        command.envs(self.extra_env.iter().map(|(k, v)| (k, v)));
         command
     }
 
@@ -332,7 +355,8 @@ impl Team {
             ("RECRUIT_LANG", self.lang.into()),
             ("SHELL", "/bin/sh".into()),
         ];
-        let env: Vec<(&str, &OsStr)> = env.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
+        let mut env: Vec<(&str, &OsStr)> = env.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
+        env.extend(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_os_str())));
         TestTerm::spawn_in(Some(&self.proj), recruit.as_os_str(), args, &env, cols, rows, profile)
     }
 

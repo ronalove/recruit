@@ -8,8 +8,8 @@ use std::collections::HashMap;
 
 use crossterm::style::Color;
 
-use crate::config::{self, Edit, Field, Layered, MAX_CONTACTS, Member, MemberLayers, Origin, Source};
-use crate::look::State;
+use crate::config::{self, Edit, Field, Layered, MAX_CONTACTS, Member, MemberLayers, Origin, Source, TeamLayers};
+use crate::look::{self, State};
 use crate::{bridge, i18n, t};
 
 pub(crate) const MODELS: [(&str, &str); 4] =
@@ -46,6 +46,8 @@ pub(crate) struct Team {
     /// The team as its files give it: who is in it, who the contacts are.
     pub config: config::Team,
     pub dashboard: bool,
+    /// The team's other settings, with where each comes from; None while its files do not read.
+    pub layers: Option<TeamLayers>,
     /// A client to detach: the one the menu was opened from.
     pub detach: bool,
     /// The file a new member goes into, as the user knows it.
@@ -170,6 +172,8 @@ impl Setting {
     fn label(self, value: &str) -> String {
         match self {
             Setting::Model => model_label(value),
+            // Its sign and its name, as the user reads an effort everywhere (the files keep `xhigh`).
+            Setting::Effort if bridge::EFFORTS.contains(&value) => look::effort_label(value),
             _ => value.to_string(),
         }
     }
@@ -250,18 +254,30 @@ pub(crate) struct Choice {
     pub detail: Option<String>,
     /// Another one, typed.
     pub other: bool,
+    /// Taking it starts the member again (known only in the quick list).
+    pub restarts: bool,
+    /// The effort level its label shows (sign and name), for its colors.
+    pub level: Option<String>,
 }
 
 impl Choice {
     fn new(value: Option<&str>, label: impl Into<String>) -> Self {
-        Choice { value: value.map(String::from), label: label.into(), detail: None, other: false }
+        Choice {
+            value: value.map(String::from),
+            label: label.into(),
+            detail: None,
+            other: false,
+            restarts: false,
+            level: None,
+        }
     }
 }
 
 /// A list of values open under a row.
 #[derive(Clone, Debug)]
 pub(crate) struct Dropdown {
-    pub field: Fid,
+    /// The row it opens under; None for a team setting, which opens above its button.
+    pub field: Option<Fid>,
     pub items: Vec<Choice>,
     pub at: usize,
     /// The one in place now.
@@ -269,9 +285,19 @@ pub(crate) struct Dropdown {
     pub purpose: Purpose,
 }
 
+impl Dropdown {
+    fn empty() -> Self {
+        Dropdown { field: None, items: Vec::new(), at: 0, current: None, purpose: Purpose::Value }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Purpose {
     Value,
+    /// The grid of the agents' tabs; the values are `columns x rows`.
+    Grid,
+    /// The share for the automatic compaction; the values are a percentage, or `off`.
+    Compaction,
     /// Who becomes a contact in place of the only one, which leaves or becomes an agent.
     Replacement {
         leaving: String,
@@ -300,13 +326,15 @@ pub(crate) struct Confirm {
     /// Red rather than cyan: it removes or stops.
     pub danger: bool,
     pub then: Vec<Effect>,
+    /// The keys that answer « yes » and « cancel » (the quick list's restart question).
+    pub letters: Option<(char, char)>,
     /// On « yes » (0) or « cancel » (1): « cancel » at first, as the old menu's « no ».
     pub at: usize,
 }
 
 impl Confirm {
     fn new(title: String, lines: Vec<String>, yes: String, then: Vec<Effect>) -> Self {
-        Confirm { title, lines, busy: Vec::new(), yes, danger: false, then, at: 1 }
+        Confirm { title, lines, busy: Vec::new(), yes, danger: false, then, letters: None, at: 1 }
     }
 
     fn busy(self, busy: Vec<(State, String)>) -> Self {
@@ -423,20 +451,42 @@ pub(crate) enum Key {
 pub(crate) enum Action {
     New,
     Dashboard,
+    /// A tab of members as a grid of panes, or as « focus ».
+    Layout,
+    /// The most panes a tab of working agents shows.
+    Grid,
+    /// The share of its window from which a member at rest is compacted.
+    AutoCompact,
     RestartAll,
     Detach,
     Stop,
 }
 
 impl Action {
-    pub(crate) const ALL: [Action; 5] =
-        [Action::New, Action::Dashboard, Action::RestartAll, Action::Detach, Action::Stop];
+    pub(crate) const ALL: [Action; 8] = [
+        Action::New,
+        Action::Dashboard,
+        Action::Layout,
+        Action::Grid,
+        Action::AutoCompact,
+        Action::RestartAll,
+        Action::Detach,
+        Action::Stop,
+    ];
+
+    /// Whether it sets something of the team (rather than doing something): they go on their own row.
+    pub(crate) fn is_setting(self) -> bool {
+        matches!(self, Action::Dashboard | Action::Layout | Action::Grid | Action::AutoCompact)
+    }
 
     /// Its key, the same in both languages.
     pub(crate) fn key(self) -> char {
         match self {
             Action::New => 'n',
             Action::Dashboard => 't',
+            Action::Layout => 'l',
+            Action::Grid => 'g',
+            Action::AutoCompact => 'c',
             Action::RestartAll => 'R',
             Action::Detach => 'd',
             Action::Stop => 'q',
@@ -479,7 +529,20 @@ pub(crate) struct Draft {
     pub base: Member,
 }
 
+/// The menu as a list only (`recruit _menu … --field f --list`): the values of one field of one member, under its
+/// pane's header. It ends with the first answer; a refused write keeps it open.
+#[derive(Clone, Debug)]
+pub(crate) struct Quick {
+    pub field: Fid,
+    /// The list as opened, kept under a question or a text typed in place.
+    pub list: Dropdown,
+    /// Whether the values that start the member again are marked: asked of the files after the first image, never
+    /// before it.
+    pub marked: bool,
+}
+
 pub(crate) struct Sheet {
+    pub quick: Option<Quick>,
     pub team: Team,
     /// Each member's state and since when (seconds since the epoch), as last seen.
     pub states: HashMap<String, (State, i64)>,
@@ -512,6 +575,7 @@ impl Sheet {
         let entry = team.order().first().map_or(Entry::New, |&i| Entry::Member(team.people[i].name.clone()));
         let said = team.unreadable.as_ref().map(|error| Said::Failed(unreadable(error)));
         Sheet {
+            quick: None,
             team,
             states: HashMap::new(),
             states_known: false,
@@ -570,6 +634,69 @@ impl Sheet {
         self.clamp();
     }
 
+    /// The quick list: `member`'s `field` (its model or its effort), its values open. A member or a field that is
+    /// not there leaves it closed, which ends it.
+    pub(crate) fn open_list(&mut self, member: &str, field: Fid, env: &dyn Env) {
+        if !matches!(field, Fid::Model | Fid::Effort) {
+            return;
+        }
+        self.open_on(member, Some(field));
+        if self.field() == Some(field) {
+            self.quick = Some(Quick { field, list: Dropdown::empty(), marked: false });
+            self.reopen_list(env);
+        }
+    }
+
+    /// The quick list open again, on the member's values as they are now: after a write refused.
+    pub(crate) fn reopen_list(&mut self, env: &dyn Env) {
+        let Some((field, chosen)) = self.quick.as_ref().map(|q| (q.field, q.list.at)) else { return };
+        self.overlay = Overlay::None;
+        self.pending = None;
+        self.enter(field, env);
+        let Overlay::List(mut list) = std::mem::replace(&mut self.overlay, Overlay::None) else { return };
+        // The cursor stays on the value chosen, not back on the one in place.
+        list.at = chosen.min(list.items.len().saturating_sub(1));
+        if let Some(quick) = self.quick.as_mut() {
+            quick.list = list.clone();
+            quick.marked = false;
+        }
+        self.overlay = Overlay::List(list);
+    }
+
+    /// Whether the quick list waits for its ↻ marks.
+    pub(crate) fn unmarked(&self) -> bool {
+        self.quick.as_ref().is_some_and(|q| !q.marked)
+    }
+
+    /// The values that start the member again, marked (↻): read from the files, so after the first image.
+    pub(crate) fn mark_restarts(&mut self, env: &dyn Env) {
+        let Some(field) = self.quick.as_ref().map(|q| q.field) else { return };
+        let name = self.name();
+        let Some((setting, _)) = self.setting(field) else { return };
+        let marks = |list: &Dropdown| -> Vec<bool> {
+            list.items
+                .iter()
+                .map(|item| !item.other && env.restarts(&self.edits(setting, item)).contains(&name))
+                .collect()
+        };
+        let marks = match &self.quick {
+            Some(quick) => marks(&quick.list),
+            None => return,
+        };
+        let apply = |list: &mut Dropdown| {
+            for (item, mark) in list.items.iter_mut().zip(&marks) {
+                item.restarts = *mark;
+            }
+        };
+        if let Some(quick) = self.quick.as_mut() {
+            apply(&mut quick.list);
+            quick.marked = true;
+        }
+        if let Overlay::List(list) = &mut self.overlay {
+            apply(list);
+        }
+    }
+
     /// The errors the members whose turn failed stopped on, as last seen.
     pub(crate) fn failed(&mut self, errors: HashMap<String, String>) {
         self.errors = errors;
@@ -621,6 +748,12 @@ impl Sheet {
             .into_iter()
             .filter(|a| *a != Action::Detach || self.team.detach)
             .filter(|a| self.team.unreadable.is_none() || matches!(a, Action::Detach | Action::Stop))
+            .filter(|a| self.team.layers.is_some() || !matches!(a, Action::Layout | Action::Grid | Action::AutoCompact))
+            // One tab per member: no grid, no focus to set.
+            .filter(|a| {
+                !matches!(a, Action::Grid | Action::Layout)
+                    || self.team.layers.as_ref().is_none_or(|l| l.layout.value != config::Layout::Tabs)
+            })
             .collect()
     }
 
@@ -716,13 +849,23 @@ impl Sheet {
                 let is_default = |value: &str| fallback == Some(Some(value));
                 let mut list = Vec::new();
                 if let Some(text) = self.default_text(setting, layered) {
-                    list.push(Choice::new(None, text));
+                    // An effort's default says its level, in its colors: the layers' or what Claude Code applies.
+                    let level = (setting == Setting::Effort)
+                        .then(|| match fallback {
+                            Some(Some(value)) => Some(value.to_string()),
+                            _ => self.person().and_then(|p| p.effort.clone()),
+                        })
+                        .flatten()
+                        .filter(|level| bridge::EFFORTS.contains(&level.as_str()));
+                    list.push(Choice { level, ..Choice::new(None, text) });
                 }
                 let values = setting.values(&self.team);
                 let current = layered.value.clone().filter(|v| !values.contains(v));
                 for value in values.iter().chain(current.iter()).filter(|v| !is_default(v)) {
                     list.push(Choice {
                         detail: setting.detail(value),
+                        level: (setting == Setting::Effort && bridge::EFFORTS.contains(&value.as_str()))
+                            .then(|| value.clone()),
                         ..Choice::new(Some(value), setting.label(value))
                     });
                 }
@@ -739,7 +882,16 @@ impl Sheet {
         let (value, source) = layered.fallback.as_ref()?;
         Some(match value {
             Some(value) => t!("défaut : {} ({})", "default: {} ({})", setting.label(value), self.source_name(*source)),
-            None => setting.back(),
+            // No layer gives one: what Claude Code applies, as the member's mod reported it, when the member runs on it.
+            None => match (setting, layered.value.is_none(), self.person()) {
+                (Setting::Model, true, Some(Person { model: Some(model), .. })) => {
+                    t!("défaut : {} (Claude Code)", "default: {} (Claude Code)", model)
+                }
+                (Setting::Effort, true, Some(Person { effort: Some(effort), .. })) => {
+                    t!("défaut : {} (Claude Code)", "default: {} (Claude Code)", setting.label(effort))
+                }
+                _ => setting.back(),
+            },
         })
     }
 
@@ -791,7 +943,11 @@ impl Sheet {
             };
         };
         if let Some((setting, layered)) = self.setting(fid) {
-            return layered.value.as_deref().map_or_else(|| setting.nobody(p), |v| setting.label(v));
+            // No layer gives one: what Claude Code applies, when it said (as the default's line of the list does).
+            return layered.value.as_deref().map_or_else(
+                || self.applied(setting, p).map_or_else(|| setting.nobody(p), |value| setting.label(&value)),
+                |v| setting.label(v),
+            );
         }
         if fid == Fid::Resume {
             return match self.resuming.as_ref().filter(|(name, _)| *name == p.name).map(|(_, how)| how) {
@@ -815,11 +971,41 @@ impl Sheet {
         }
     }
 
+    /// What Claude Code applies to a member for `setting` when no layer gives it, as its mod reported it: its model's
+    /// family, an effort's level; None when it did not say yet or for another setting.
+    fn applied(&self, setting: Setting, p: &Person) -> Option<String> {
+        match setting {
+            Setting::Model => p.model.clone(),
+            Setting::Effort => p.effort.clone().filter(|e| bridge::EFFORTS.contains(&e.as_str())),
+            _ => None,
+        }
+    }
+
+    /// The effort level the sheet's row shows, for its colors: the one prepared, else the one a layer gives, else the
+    /// one Claude Code applies.
+    pub(crate) fn effort_level(&self) -> Option<String> {
+        let known = |level: &String| bridge::EFFORTS.contains(&level.as_str());
+        if let Some((Fid::Effort, at)) = self.pending {
+            return self.choices(Fid::Effort, false).get(at).and_then(|c| c.level.clone());
+        }
+        let p = self.person()?;
+        let layered = &p.layers.as_ref()?.effort;
+        layered
+            .value
+            .clone()
+            .filter(known)
+            .or_else(|| layered.value.is_none().then(|| p.effort.clone()).flatten().filter(known))
+    }
+
     /// Where a row's value comes from, as the user knows the file or the layer.
     pub(crate) fn origin(&self, fid: Fid) -> Option<String> {
         if let Some((setting, layered)) = self.setting(fid) {
             if setting == Setting::Tab && layered.value.is_none() {
                 return Some(t!("défaut de recruit", "recruit's default"));
+            }
+            // What Claude Code applies, known: it is where the value comes from.
+            if layered.value.is_none() && self.person().and_then(|p| self.applied(setting, p)).is_some() {
+                return Some("Claude Code".to_string());
             }
             return Some(self.source_name(layered.source));
         }
@@ -1010,6 +1196,19 @@ impl Sheet {
     // -- Keys and clicks ----------------------------------------------------------------------------------------
 
     pub(crate) fn key(&mut self, key: Key, env: &dyn Env) -> Vec<Effect> {
+        let effects = self.key_in(key, env);
+        self.settled(effects)
+    }
+
+    /// In the quick list, the first answer ends it: a list, a question or a text given up, with nothing to carry out.
+    fn settled(&mut self, effects: Vec<Effect>) -> Vec<Effect> {
+        if self.quick.is_some() && effects.is_empty() && matches!(self.overlay, Overlay::None) {
+            return vec![Effect::Quit];
+        }
+        effects
+    }
+
+    fn key_in(&mut self, key: Key, env: &dyn Env) -> Vec<Effect> {
         match std::mem::replace(&mut self.overlay, Overlay::None) {
             Overlay::Confirm(confirm) => return self.confirm_key(confirm, key),
             Overlay::List(list) => return self.list_key(list, key, env),
@@ -1201,7 +1400,8 @@ impl Sheet {
                 }
                 let current = self.current(fid);
                 let at = current.unwrap_or(0);
-                self.overlay = Overlay::List(Dropdown { field: fid, items, at, current, purpose: Purpose::Value });
+                self.overlay =
+                    Overlay::List(Dropdown { field: Some(fid), items, at, current, purpose: Purpose::Value });
             }
             Fid::How => {}
             Fid::Name => self.type_in(Fid::Name, &self.name()),
@@ -1279,7 +1479,7 @@ impl Sheet {
         fid: Fid,
     ) -> Vec<Effect> {
         let effect = Effect::Apply { edits, said, select };
-        let busy = self.interrupted(restarts);
+        let mut busy = self.interrupted(restarts);
         if busy.is_empty() {
             return vec![effect];
         }
@@ -1309,7 +1509,28 @@ impl Sheet {
             _ => t!("Relancer {} ?", "Restart {}?", quoted(restarts)),
         };
         let again = t!("{} repartira sur sa conversation.", "{} starts again on its conversation.", quoted(restarts));
-        let confirm = Confirm::new(title, vec![why, again], t!("Relancer maintenant", "Restart now"), vec![effect]);
+        let mut confirm = Confirm::new(title, vec![why, again], t!("Relancer maintenant", "Restart now"), vec![effect]);
+        if self.quick.is_some() {
+            // In the quick list: one note, short buttons, each with its key.
+            let note = match busy.first().map(|(state, _)| *state) {
+                Some(State::Waiting) => t!(
+                    "Il attend ta réponse : sa demande sera interrompue. Il repartira sur sa conversation.",
+                    "It waits for your answer: its request will be interrupted. It starts again on its conversation."
+                ),
+                Some(State::Working) => t!(
+                    "Il est au travail : sa tâche en cours sera interrompue. Il repartira sur sa conversation.",
+                    "It is at work: its current task will be interrupted. It starts again on its conversation."
+                ),
+                _ => t!(
+                    "Son état est inconnu : sa tâche en cours peut être interrompue. Il repartira sur sa conversation.",
+                    "Its state is unknown: its current task may be interrupted. It starts again on its conversation."
+                ),
+            };
+            confirm.lines = vec![note];
+            busy = Vec::new();
+            confirm.yes = t!("Relancer", "Restart");
+            confirm.letters = Some(('r', t!("a", "c").chars().next().unwrap_or('a')));
+        }
         self.overlay = Overlay::Confirm(confirm.busy(busy));
         Vec::new()
     }
@@ -1374,7 +1595,7 @@ impl Sheet {
             leaving
         )));
         self.overlay = Overlay::List(Dropdown {
-            field: if removed { Fid::Remove } else { Fid::Contact },
+            field: Some(if removed { Fid::Remove } else { Fid::Contact }),
             items,
             at: 0,
             current: None,
@@ -1585,6 +1806,17 @@ impl Sheet {
                     select: None,
                 }];
             }
+            Action::Layout => {
+                let focus = self.team.layers.as_ref().is_some_and(|l| l.layout.value == config::Layout::Focus);
+                let (layout, said) = if focus {
+                    (config::Layout::Auto, t!("Disposition : grille.", "Layout: grid."))
+                } else {
+                    (config::Layout::Focus, t!("Disposition : focus.", "Layout: focus."))
+                };
+                return vec![Effect::Apply { edits: vec![Edit::Layout(layout)], said: Done::Text(said), select: None }];
+            }
+            Action::Grid => self.open_grid(),
+            Action::AutoCompact => self.open_compaction(),
             Action::RestartAll => {
                 let everyone: Vec<String> = self.team.people.iter().map(|p| p.name.clone()).collect();
                 let confirm = Confirm::new(
@@ -1616,8 +1848,118 @@ impl Sheet {
         Vec::new()
     }
 
+    /// The grids offered, the current one among them.
+    const GRIDS: [(usize, usize); 5] = [(4, 2), (3, 2), (2, 2), (3, 1), (2, 1)];
+    /// The shares offered for the automatic compaction; `off` first.
+    const SHARES: [u8; 5] = [50, 60, 70, 80, 90];
+
+    /// Opens the list of grids under the button.
+    fn open_grid(&mut self) {
+        let Some(layers) = &self.team.layers else { return };
+        let now = (layers.columns.value, layers.rows.value);
+        let default = (
+            layers.columns.fallback.as_ref().map_or(3, |(v, _)| *v),
+            layers.rows.fallback.as_ref().map_or(2, |(v, _)| *v),
+        );
+        // The default and the one in place, offered even when they are not among the usual: else there is no way back.
+        let mut grids = Self::GRIDS.to_vec();
+        for extra in [default, now] {
+            if !grids.contains(&extra) {
+                grids.insert(0, extra);
+            }
+        }
+        let items: Vec<Choice> = grids
+            .iter()
+            .map(|&(columns, rows)| {
+                let mut choice = Choice::new(Some(&format!("{columns}x{rows}")), format!("{columns} × {rows}"));
+                let per_tab = t!("{} par onglet", "{} per tab", columns * rows);
+                choice.detail = Some(if (columns, rows) == default {
+                    format!("{per_tab} · {}", t!("défaut", "default"))
+                } else {
+                    per_tab
+                });
+                choice
+            })
+            .collect();
+        let current = grids.iter().position(|g| *g == now);
+        self.overlay =
+            Overlay::List(Dropdown { field: None, items, at: current.unwrap_or(0), current, purpose: Purpose::Grid });
+    }
+
+    fn apply_grid(&mut self, choice: &Choice) -> Vec<Effect> {
+        self.said = None;
+        let parsed = choice.value.as_deref().and_then(|v| v.split_once('x'));
+        let Some((Ok(columns), Ok(rows))) = parsed.map(|(c, r)| (c.parse::<usize>(), r.parse::<usize>())) else {
+            return Vec::new();
+        };
+        vec![Effect::Apply {
+            edits: vec![Edit::Grid { columns, rows }],
+            said: Done::Text(t!("Grille des onglets : {} × {}.", "Grid of the tabs: {} × {}.", columns, rows)),
+            select: None,
+        }]
+    }
+
+    /// Opens the list of shares under the button.
+    fn open_compaction(&mut self) {
+        let Some(layers) = &self.team.layers else { return };
+        let now = layers.auto_compact.value;
+        let default = layers.auto_compact.fallback.as_ref().map_or(Some(config::AUTO_COMPACT_AT), |(v, _)| *v);
+        let mut shares: Vec<Option<u8>> = std::iter::once(None).chain(Self::SHARES.map(Some)).collect();
+        // The default and the one in place, offered even when they are not among the usual: else there is no way back.
+        for at in [default, now].into_iter().flatten().filter(|at| !Self::SHARES.contains(at)) {
+            if shares.contains(&Some(at)) {
+                continue;
+            }
+            let place = shares.iter().position(|s| s.is_some_and(|s| s > at)).unwrap_or(shares.len());
+            shares.insert(place, Some(at));
+        }
+        let items: Vec<Choice> = shares
+            .iter()
+            .map(|share| {
+                let (value, label) = match share {
+                    None => ("off".to_string(), t!("non", "off")),
+                    Some(at) => (at.to_string(), t!("{} %", "{}%", at)),
+                };
+                let mut choice = Choice::new(Some(&value), label);
+                if *share == default {
+                    choice.detail = Some(t!("défaut", "default"));
+                }
+                choice
+            })
+            .collect();
+        let current = shares.iter().position(|s| *s == now);
+        self.overlay = Overlay::List(Dropdown {
+            field: None,
+            items,
+            at: current.unwrap_or(0),
+            current,
+            purpose: Purpose::Compaction,
+        });
+    }
+
+    fn apply_compaction(&mut self, choice: &Choice) -> Vec<Effect> {
+        self.said = None;
+        let share = match choice.value.as_deref() {
+            Some("off") => None,
+            Some(at) => match at.parse::<u8>() {
+                Ok(at) => Some(at),
+                Err(_) => return Vec::new(),
+            },
+            None => return Vec::new(),
+        };
+        let said = match share {
+            None => t!("Compaction automatique : non.", "Automatic compaction: off."),
+            Some(at) => {
+                t!("Compaction automatique à {} % de la fenêtre.", "Automatic compaction at {}% of the window.", at)
+            }
+        };
+        vec![Effect::Apply { edits: vec![Edit::AutoCompact(share)], said: Done::Text(said), select: None }]
+    }
+
     fn confirm_key(&mut self, mut confirm: Confirm, key: Key) -> Vec<Effect> {
         match key {
+            Key::Char(c) if confirm.letters.is_some_and(|(yes, _)| yes == c) => return confirm.then,
+            Key::Char(c) if confirm.letters.is_some_and(|(_, no)| no == c) => return Vec::new(),
             Key::Left | Key::Right | Key::Tab => confirm.at = 1 - confirm.at,
             Key::Enter if confirm.at == 0 => return confirm.then,
             Key::Enter | Key::Esc => return Vec::new(),
@@ -1635,7 +1977,7 @@ impl Sheet {
             Key::Home | Key::PageUp => list.at = 0,
             Key::End | Key::PageDown => list.at = last,
             Key::Esc => {
-                if matches!(list.purpose, Purpose::Replacement { .. }) {
+                if !matches!(list.purpose, Purpose::Value) {
                     self.said = None;
                 }
                 return Vec::new();
@@ -1649,9 +1991,14 @@ impl Sheet {
 
     /// The item highlighted in an open list, taken.
     fn picked(&mut self, list: Dropdown, env: &dyn Env) -> Vec<Effect> {
+        if let Some(quick) = self.quick.as_mut() {
+            quick.list = list.clone();
+        }
         let Some(choice) = list.items.get(list.at).cloned() else { return Vec::new() };
         match list.purpose {
-            Purpose::Value => self.apply_choice(list.field, &choice, env),
+            Purpose::Value => list.field.map_or_else(Vec::new, |field| self.apply_choice(field, &choice, env)),
+            Purpose::Grid => self.apply_grid(&choice),
+            Purpose::Compaction => self.apply_compaction(&choice),
             Purpose::Replacement { leaving, removed } => {
                 self.said = None;
                 let other = choice.value.unwrap_or_default();
@@ -1834,6 +2181,21 @@ impl Sheet {
 
     /// A click on what `target` names.
     pub(crate) fn click(&mut self, target: Target, env: &dyn Env) -> Vec<Effect> {
+        let effects = self.click_in(target, env);
+        self.settled(effects)
+    }
+
+    /// The pointer over `target`: in an open list, its cursor follows; under a question, so does the button.
+    pub(crate) fn hover(&mut self, target: Option<Target>) {
+        match (&mut self.overlay, target) {
+            (Overlay::List(list), Some(Target::Item(at))) if at < list.items.len() => list.at = at,
+            (Overlay::Confirm(confirm), Some(Target::Yes)) => confirm.at = 0,
+            (Overlay::Confirm(confirm), Some(Target::No)) => confirm.at = 1,
+            _ => {}
+        }
+    }
+
+    fn click_in(&mut self, target: Target, env: &dyn Env) -> Vec<Effect> {
         match (&self.overlay, target) {
             (Overlay::Confirm(_), Target::Yes) => {
                 if let Overlay::Confirm(confirm) = std::mem::replace(&mut self.overlay, Overlay::None) {
@@ -2057,6 +2419,13 @@ pub(crate) mod fixture {
             people,
             config: config::Team { members, ..Default::default() },
             dashboard: true,
+            layers: Some(TeamLayers {
+                dashboard: Layered { value: true, source: Source::Default, fallback: None },
+                auto_compact: Layered { value: Some(70), source: Source::Default, fallback: None },
+                columns: Layered { value: 3, source: Source::Default, fallback: None },
+                rows: Layered { value: 2, source: Source::Default, fallback: None },
+                layout: Layered { value: config::Layout::Auto, source: Source::Default, fallback: None },
+            }),
             detach: true,
             file: ".recruit/settings.toml".into(),
             unreadable: None,
@@ -2243,14 +2612,14 @@ mod tests {
         let env = Fake::restarting(&["coordinateur"]);
         to_row(&mut s, Fid::Effort);
         assert!(keys(&mut s, &[Key::Right], &env).is_empty(), "prepared, not written");
-        assert_eq!(s.value(Fid::Effort), "low");
+        assert_eq!(s.value(Fid::Effort), look::effort_label("low"));
         keys(&mut s, &[Key::Right], &env);
         assert_eq!(s.pending, Some((Fid::Effort, 2)));
         // Another row: given up.
         keys(&mut s, &[Key::Down, Key::Up], &env);
         assert!(s.pending.is_none());
         keys(&mut s, &[Key::Left], &env);
-        assert_eq!(s.value(Fid::Effort), "max", "round from the default");
+        assert_eq!(s.value(Fid::Effort), look::effort_label("max"), "round from the default");
         let effects = keys(&mut s, &[Key::Enter], &env);
         let [Effect::Apply { said: Done::Text(said), .. }] = effects.as_slice() else { panic!("{effects:?}") };
         assert!(said.ends_with(&t!(" : relancé sur sa conversation.", ": restarted on its conversation.")));
@@ -2595,6 +2964,169 @@ mod tests {
         assert_eq!(model_label("claude-opus-4-1"), "claude-opus-4-1");
         let global = Origin::Global { file: "/c/recruit/web.toml".into() };
         assert_eq!(source_name(Source::Shared, &global), "web.toml");
+    }
+
+    /// No layer gives the effort: the sheet shows what Claude Code applies, with « Claude Code » as its origin, as the list's
+    /// default line says it; when that is not known, as before (« défaut de Claude Code »). A layer's value keeps its
+    /// file.
+    #[test]
+    fn what_claude_code_applies_is_shown_with_its_origin() {
+        let mut s = sheet();
+        // The fixture's coordinateur runs on Opus at high, nothing in the files for the effort.
+        assert_eq!(s.value(Fid::Effort), look::effort_label("high"));
+        assert_eq!(s.origin(Fid::Effort).as_deref(), Some("Claude Code"));
+        assert_eq!(s.effort_level().as_deref(), Some("high"));
+        // The model a layer gives is a layer's: its file.
+        assert_eq!(s.value(Fid::Model), "Opus");
+        assert_eq!(s.origin(Fid::Model).as_deref(), Some(t!("équipe", "team").as_str()));
+        // No model in the files either: Opus all the same, from Claude Code.
+        s.team.people[0].layers.as_mut().unwrap().model = layered(None, Source::Default, Some((None, Source::Default)));
+        assert_eq!((s.value(Fid::Model).as_str(), s.origin(Fid::Model).as_deref()), ("Opus", Some("Claude Code")));
+        // Not known yet: as before.
+        s.team.people[0].effort = None;
+        s.team.people[0].model = None;
+        assert_eq!(s.value(Fid::Effort), t!("défaut de Claude Code", "Claude Code's default"));
+        assert_eq!(s.value(Fid::Model), t!("défaut de Claude Code", "Claude Code's default"));
+        assert_eq!(s.origin(Fid::Effort).as_deref(), Some(t!("défaut", "default").as_str()));
+        assert_eq!(s.effort_level(), None);
+        // A level a layer gives: its own color and its file.
+        s.team.people[0].layers.as_mut().unwrap().effort = layered(Some("xhigh"), Source::Shared, None);
+        assert_eq!(s.effort_level().as_deref(), Some("xhigh"));
+        assert_eq!(s.origin(Fid::Effort).as_deref(), Some(config::SETTINGS));
+    }
+
+    #[test]
+    fn the_grid_is_chosen_from_a_list() {
+        let mut s = Sheet::new(team(&[("dev", false)]));
+        keys(&mut s, &[Key::Char(Action::Grid.key())], &quiet());
+        let Overlay::List(list) = &s.overlay else { panic!("no list") };
+        let labels: Vec<&str> = list.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["4 × 2", "3 × 2", "2 × 2", "3 × 1", "2 × 1"]);
+        assert_eq!(list.current, Some(1), "the grid in place is marked");
+        assert_eq!(list.items[0].detail, Some(t!("{} par onglet", "{} per tab", 8)), "how many it holds, beside it");
+        keys(&mut s, &[Key::Down], &quiet());
+        let effects = s.key(Key::Enter, &quiet());
+        assert!(
+            matches!(&effects[..], [Effect::Apply { edits, .. }] if edits == &[Edit::Grid { columns: 2, rows: 2 }]),
+            "{effects:?}"
+        );
+        assert!(matches!(s.overlay, Overlay::None) && s.said.is_none());
+        // Escape gives up, and says nothing.
+        keys(&mut s, &[Key::Char(Action::Grid.key())], &quiet());
+        assert!(s.said.is_none());
+        assert!(s.key(Key::Esc, &quiet()).is_empty() && s.said.is_none() && matches!(s.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn a_grid_from_the_files_is_offered_too() {
+        let mut s = Sheet::new(team(&[("dev", false)]));
+        let layers = s.team.layers.as_mut().unwrap();
+        (layers.columns.value, layers.rows.value) = (4, 3);
+        keys(&mut s, &[Key::Char(Action::Grid.key())], &quiet());
+        let Overlay::List(list) = &s.overlay else { panic!("no list") };
+        assert_eq!((list.items[0].label.as_str(), list.current), ("4 × 3", Some(0)));
+        assert_eq!(list.items.len(), 6);
+        // The default is told apart, whatever the current one.
+        let default = t!("défaut", "default");
+        assert_eq!(list.items.iter().filter(|i| i.detail.as_deref().is_some_and(|d| d.contains(&default))).count(), 1);
+    }
+
+    #[test]
+    fn the_default_is_always_offered() {
+        let mut s = Sheet::new(team(&[("dev", false)]));
+        let layers = s.team.layers.as_mut().unwrap();
+        // The shared file says 4 columns, the local one 2 rows: the default under the local layer is 4 × 2.
+        layers.columns.fallback = Some((4, Source::Shared));
+        layers.rows.fallback = Some((2, Source::Shared));
+        layers.auto_compact.value = Some(85);
+        layers.auto_compact.fallback = Some((Some(75), Source::Shared));
+        keys(&mut s, &[Key::Char(Action::Grid.key())], &quiet());
+        let Overlay::List(list) = &s.overlay else { panic!("no list") };
+        let word = t!("défaut", "default");
+        let default = list.items.iter().find(|i| i.detail.as_deref().is_some_and(|d| d.contains(&word)));
+        assert_eq!(default.expect("the default is there").label, "4 × 2");
+        s.overlay = Overlay::None;
+        keys(&mut s, &[Key::Char(Action::AutoCompact.key())], &quiet());
+        let Overlay::List(list) = &s.overlay else { panic!("no list") };
+        let default = list.items.iter().find(|i| i.detail.is_some()).expect("the default is there");
+        assert_eq!(default.label, t!("{} %", "{}%", 75));
+        assert!(list.items.iter().any(|i| i.label == t!("{} %", "{}%", 85)), "and the one in place");
+        let places: Vec<u8> = list.items.iter().filter_map(|i| i.value.as_deref()?.parse().ok()).collect();
+        assert!(places.is_sorted(), "in order: {places:?}");
+    }
+
+    #[test]
+    fn the_compaction_share_is_chosen_from_a_list() {
+        let mut s = Sheet::new(team(&[("dev", false)]));
+        keys(&mut s, &[Key::Char(Action::AutoCompact.key())], &quiet());
+        let Overlay::List(list) = &s.overlay else { panic!("no list") };
+        let labels: Vec<String> = list.items.iter().map(|i| i.label.clone()).collect();
+        let at = |n: u8| t!("{} %", "{}%", n);
+        assert_eq!(labels, [t!("non", "off"), at(50), at(60), at(70), at(80), at(90)]);
+        assert_eq!(list.current, Some(3), "70 % in place");
+        assert_eq!(list.items[3].detail, Some(t!("défaut", "default")));
+        keys(&mut s, &[Key::Down], &quiet());
+        let effects = s.key(Key::Enter, &quiet());
+        assert!(
+            matches!(&effects[..], [Effect::Apply { edits, .. }] if edits == &[Edit::AutoCompact(Some(80))]),
+            "{effects:?}"
+        );
+        // Off is the first: None.
+        keys(&mut s, &[Key::Char(Action::AutoCompact.key()), Key::Home], &quiet());
+        let effects = s.key(Key::Enter, &quiet());
+        assert!(matches!(&effects[..], [Effect::Apply { edits, .. }] if edits == &[Edit::AutoCompact(None)]));
+    }
+
+    #[test]
+    fn a_share_from_the_files_finds_its_place() {
+        let mut s = Sheet::new(team(&[("dev", false)]));
+        s.team.layers.as_mut().unwrap().auto_compact.value = Some(75);
+        keys(&mut s, &[Key::Char(Action::AutoCompact.key())], &quiet());
+        let Overlay::List(list) = &s.overlay else { panic!("no list") };
+        let labels: Vec<&str> = list.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels[4], t!("{} %", "{}%", 75));
+        assert_eq!(list.current, Some(4));
+        s.team.layers.as_mut().unwrap().auto_compact.value = None;
+        s.overlay = Overlay::None;
+        keys(&mut s, &[Key::Char(Action::AutoCompact.key())], &quiet());
+        let Overlay::List(list) = &s.overlay else { panic!("no list") };
+        assert_eq!(list.current, Some(0), "off in place");
+    }
+
+    #[test]
+    fn no_grid_with_a_tab_per_member() {
+        let mut s = Sheet::new(team(&[("dev", false)]));
+        assert!(s.actions().contains(&Action::Grid));
+        s.team.layers.as_mut().unwrap().layout.value = config::Layout::Tabs;
+        assert!(!s.actions().contains(&Action::Grid) && s.actions().contains(&Action::AutoCompact));
+        assert!(!s.actions().contains(&Action::Layout), "nor a focus");
+        keys(&mut s, &[Key::Char(Action::Grid.key())], &quiet());
+        assert!(matches!(s.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn the_layout_goes_from_grid_to_focus_and_back() {
+        let mut s = Sheet::new(team(&[("dev", false)]));
+        let effects = s.key(Key::Char(Action::Layout.key()), &quiet());
+        assert!(
+            matches!(&effects[..], [Effect::Apply { edits, .. }] if edits == &[Edit::Layout(config::Layout::Focus)]),
+            "{effects:?}"
+        );
+        s.team.layers.as_mut().unwrap().layout.value = config::Layout::Focus;
+        let effects = s.key(Key::Char(Action::Layout.key()), &quiet());
+        assert!(
+            matches!(&effects[..], [Effect::Apply { edits, .. }] if edits == &[Edit::Layout(config::Layout::Auto)])
+        );
+    }
+
+    #[test]
+    fn the_settings_wait_for_readable_files() {
+        let mut s = Sheet::new(team(&[("dev", false)]));
+        s.team.unreadable = Some("boom".into());
+        s.team.layers = None;
+        assert_eq!(s.actions(), [Action::Detach, Action::Stop]);
+        s.team.unreadable = None;
+        assert!(!s.actions().contains(&Action::Grid), "no layers, no setting to show");
     }
 
     #[test]

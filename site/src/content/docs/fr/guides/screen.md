@@ -47,21 +47,30 @@ Le bord du haut dit l'essentiel du membre, de gauche à droite :
 
 - son état : un indicateur qui tourne pendant qu'il travaille, ⚑ quand il t'attend, ◷ au repos, ❯ quand une commande qu'il a lancée tourne encore ;
 - son nom, à sa couleur, la même qu'au tableau de bord et dans le journal ;
-- à droite, son modèle, son effort, son contexte et le temps dans son état, par exemple `Opus ▆ high · 29 % · 6m`. Le contexte passe en orange quand la conversation approche de sa compaction automatique, en rouge à l'avertissement de Claude Code ;
+- à droite, son modèle, son effort, son contexte et le temps dans son état, par exemple `Opus ● élevé · 29 % · 6m`. Le signe de l'effort dit son niveau comme sous la saisie de Claude Code : ○ faible, ◐ moyen, ● élevé, ◉ extra, ◈ max. Le contexte passe en orange quand la conversation approche de sa compaction automatique, en rouge à l'avertissement de Claude Code ;
 - ⤢ dans le coin.
 
-Dans un cadre étroit, les détails partent d'abord : le mot de l'effort, puis le modèle, puis le temps. Les cadres de même largeur montrent les mêmes détails, en colonnes.
+Dans un cadre étroit, les détails partent d'abord : le mot de l'effort, puis le nom du modèle laisse place à son initiale (O, S, H, F), puis le temps, l'initiale, le signe de l'effort et le contexte. Les cadres de même largeur montrent les mêmes détails, en colonnes.
 
 Ce que fait un clic :
 
 | Clic sur | Effet |
 |---|---|
-| le nom, le modèle ou l'effort d'un membre | ouvre sa fiche dans le [menu de l'équipe](/recruit/fr/guides/menu/), sur ce réglage |
+| le nom d'un membre | ouvre sa fiche dans le [menu de l'équipe](/recruit/fr/guides/menu/) |
+| son modèle ou son effort | ouvre la liste de ses valeurs juste en dessous |
 | ⟳ devant le contexte d'un membre au repos | propose de compacter sa conversation, après confirmation |
 | ⤢ | montre ce membre sur tout l'onglet ; ⤡ ramène les autres |
 | n'importe où dans un cadre | t'y place |
 
 Sous le pointeur, un nom se souligne et « réglages › » apparaît à côté.
+
+### Le modèle et l'effort d'un clic
+
+La liste sous le modèle ou l'effort commence par « défaut : … », ce que reçoit le membre quand rien ne le fixe, avec d'où ça vient (« défaut : high (settings.toml) », ou « (Claude Code) »). « actuel » marque la valeur en place, et ↻ une valeur qui relancera le membre sur sa conversation, parce que ses requêtes ne peuvent pas la porter. Choisis-en une avec les flèches et `⏎`, ou d'un clic : elle s'écrit dans les fichiers de l'équipe, comme depuis le [menu](/recruit/fr/guides/menu/#où-sécrivent-les-changements), et arrive tout de suite au membre. Quand le membre travaille et que la valeur le relancerait, la liste demande d'abord, sur « Annuler ». `Échap`, un clic dehors ou un second clic sur le texte la ferment.
+
+## Quand un tour rate
+
+Quand le tour d'un membre finit sur une erreur d'API (une API surchargée, une connexion perdue), son cadre passe en orange et son bord du haut donne une raison courte après son nom, comme « API surchargée (529) ». Son onglet montre ✗, après ⚑ quand quelqu'un y attend aussi. Hors de vue, une notification en orange te prévient, et `⌥g` y mène après les membres qui t'attendent. Le membre reste ainsi jusqu'à son tour suivant. « Reprendre », sur sa fiche dans le [menu de l'équipe](/recruit/fr/guides/menu/), lui envoie « continue », sauf si son invite contient un texte que tu étais en train de taper.
 
 ![Le membre « lead » sur tout son onglet : l'onglet, dans la barre, dit ⤢ lead](../../../../assets/screenshots/zoom.png)
 
@@ -69,7 +78,11 @@ Sous le pointeur, un nom se souligne et « réglages › » apparaît à côté.
 
 La dernière ligne porte le nom de l'équipe, ses onglets et deux boutons. L'onglet courant est en surbrillance. Chaque onglet montre l'état de son membre le plus pressé : un indicateur qui tourne quand quelqu'un y travaille, ⚑ quand quelqu'un t'y attend. Quand un membre est en plein écran, son onglet le dit : `2 Agents (1)  ⤢ dev-saisie`.
 
-À droite, « menu » ouvre le [menu de l'équipe](/recruit/fr/guides/menu/) et « quitter » propose de te détacher ou de quitter. Dans une fenêtre étroite, les autres onglets ne gardent que leur numéro, et les boutons que leur touche.
+À droite, « focus (⌥l) » ou « grille (⌥l) » change la disposition de l'onglet courant (voir [Focus](/recruit/fr/guides/contacts-and-agents/#focus)), « menu » ouvre le [menu de l'équipe](/recruit/fr/guides/menu/) et « quitter » propose de te détacher ou de quitter. Dans une fenêtre étroite, les autres onglets ne gardent que leur numéro, et les boutons que leur touche.
+
+## Clair ou sombre
+
+Les couleurs de recruit (celles des membres, des efforts, des lignes en surbrillance et des boutons) suivent le fond de ton terminal : un jeu clair sur un fond clair, le sombre sinon. Les couleurs de ton terminal restent les siennes. Les programmes des membres apprennent aussi le thème, quand ils le demandent.
 
 ## Quand un membre t'attend
 
@@ -101,9 +114,10 @@ Chaque membre garde son historique. Là où son programme ne prend pas la souris
 |---|---|
 | `⌥1`…`⌥9` | aller à un onglet |
 | `⌥⇧←` / `⌥⇧→` | onglet précédent / suivant |
-| `⌥n` | membre suivant de l'onglet |
+| `⌥n` | membre suivant de l'onglet ; dans un onglet en focus, il passe à gauche ; montré sur tout l'onglet, il prend la place |
 | `⌥z` | ce membre sur tout l'onglet, puis retour |
-| `⌥g` | aller au membre qui t'attend |
+| `⌥l` | l'onglet courant en [focus](/recruit/fr/guides/contacts-and-agents/#focus), ou retour à sa grille, jusqu'à ce que tu te détaches |
+| `⌥g` | aller au membre qui t'attend, sinon à un membre dont le tour a raté |
 | `⌥j` | journal complet, réduit, puis masqué (ou `/equipe`, `/team` dans une équipe en anglais, dans l'invite d'un membre) |
 | `⌥r` | le [menu de l'équipe](/recruit/fr/guides/menu/), sur la fiche du membre où tu es (ou `/recruit` dans l'invite d'un membre) |
 | `⌥q` | se détacher, quitter ou annuler |

@@ -38,6 +38,7 @@ layout = "auto"
 columns = 3
 rows = 2
 dashboard = true
+auto_compact = 70
 
 [teams.web.members.coordinator]
 role = "The user's entry point: hands out work, tracks progress"
@@ -82,12 +83,13 @@ Ignored. recruit 1 ran its teams in tmux, and this section set up tmux. Since re
 | `instructions` | string | none | Rules shared by every member, added to each one's prompt. |
 | `permission_mode` | string | Claude Code's | Claude Code permission mode of every member: `default`, `acceptEdits`, `auto`, `plan`, `bypassPermissions`… |
 | `model` | string | Claude Code's | Claude model of every member: an alias (`opus`, `sonnet`, `haiku`, `fable`) or a full model name. |
-| `effort` | string | Claude Code's | Effort of every member: `low`, `medium`, `high`, `xhigh` or `max`. |
+| `effort` | string | Claude Code's | Effort of every member: `low`, `medium`, `high`, `xhigh` or `max`. recruit shows `xhigh` as "extra", as Claude Code does. |
 | `args` | list of strings | `[]` | Extra arguments given to `claude` for every member. |
-| `layout` | `"auto"` or `"tabs"` | `"auto"` | `auto`: contacts in a first tab, then the working agents in tabs of `columns × rows` at most. `tabs`: one tab per member. See [Tabs](/recruit/guides/contacts-and-agents/#tabs). |
+| `layout` | `"auto"`, `"focus"` or `"tabs"` | `"auto"` | `auto`: contacts in a first tab, then the working agents in tabs of `columns × rows` at most, each tab a grid. `focus`: the same tabs, but those of working agents show one member large on the left and the best placed on the right. `tabs`: one tab per member. See [Tabs](/recruit/guides/contacts-and-agents/#tabs) and [Focus](/recruit/guides/contacts-and-agents/#focus). |
 | `columns` | integer | `3` | Most columns in a tab. |
 | `rows` | integer | `2` | Most rows in a tab. |
 | `dashboard` | boolean | `true` | The [dashboard and the journal](/recruit/guides/dashboard/), on the right of the contacts. With `false`, the contacts sit side by side. |
+| `auto_compact` | boolean or integer | `true` | [Automatic compaction](/recruit/guides/dashboard/#automatic-compaction): a member at rest for 15 minutes is compacted when its context reaches this share of its window, in percent, from 1 to 100. `true` is 70, `false` turns it off. |
 
 ## Members
 
@@ -117,6 +119,7 @@ recruit checks the files each time it reads them (to launch a team, list, attach
 - a team's or a member's name breaks the [rules for names](/recruit/guides/teams/#names), or two members of a team differ only by case;
 - a member has no role;
 - a team has more than two contacts;
+- `auto_compact` is a number outside 1 to 100;
 - `config_dir` is a relative path;
 - a member's `tab` takes the name of one of recruit's tabs.
 

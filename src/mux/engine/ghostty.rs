@@ -25,6 +25,7 @@ use libghostty_vt::terminal::{
 use super::sniff::{Sniffed, Sniffer};
 use super::{Engine, Line, Modes, MouseTracking, Relay, State};
 use crate::canvas::{self, Canvas, Cursor, Style};
+use crate::look::light_background;
 use crate::mux::{Rect, Rgb};
 
 /// What the terminal answers when the real one's colors are unknown: a dark theme, as most are.
@@ -74,8 +75,13 @@ const NAMED: [Paint; 16] = [
 struct Shared {
     replies: Vec<u8>,
     relays: Vec<Relay>,
-    /// The real terminal's background, for the color scheme report.
-    bg: Option<Rgb>,
+    /// Whether the real terminal's theme is light, for the color scheme report (`CSI ? 996 n`): that of the client
+    /// attached now ([`Engine::set_colors`], [`Engine::color_scheme`]); `None` while no client told its background
+    /// (a dark one is answered, and nothing is said unasked).
+    light: Option<bool>,
+    /// The theme the program was last told, by an answer to `CSI ? 996 n` or a report (mode 2031); `None` before
+    /// any.
+    told: Option<bool>,
 }
 
 fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
@@ -205,8 +211,10 @@ impl Ghostty {
         term.on_xtversion(|_| Some(VERSION))?;
         let to = Arc::clone(&shared);
         term.on_color_scheme(move |_| {
-            let bg = lock(&to).bg.unwrap_or(DEFAULT_BG);
-            Some(if luminance(bg) < 0.5 { ColorScheme::Dark } else { ColorScheme::Light })
+            let mut shared = lock(&to);
+            let light = shared.light.unwrap_or(false);
+            shared.told = Some(light);
+            Some(scheme(light))
         })?;
         term.on_size(|term| {
             Some(SizeReportSize {
@@ -281,12 +289,43 @@ impl Ghostty {
                 // Claude Code's own `clear` (no `app`) may come with its statuses going on after it.
                 let left = status.state == State::Clear && status.app.as_deref() == Some("recruit");
                 self.armed = !left;
+                if left {
+                    self.forget_theme();
+                }
                 self.relays.push(Relay::Status(status));
             }
             Sniffed::Status(_) => {}
-            Sniffed::Reset => self.armed = false,
+            Sniffed::Reset => {
+                self.armed = false;
+                self.forget_theme();
+            }
             Sniffed::SyncEnd => self.sync_ended(),
+            Sniffed::ThemeReports => self.theme_asked(replies),
+            // The engine does nothing with it: the server decides.
+            Sniffed::Resize { rows, cols } => self.relays.push(Relay::Resize { rows, cols }),
         }
+    }
+
+    /// The program turned mode 2031 on: if it was never told the theme (it did not ask with `CSI ? 996 n`) and the
+    /// client's is known, it is told now, where the mode was set in what it wrote. Later changes come with
+    /// [`Engine::color_scheme`].
+    fn theme_asked(&mut self, replies: &mut Vec<u8>) {
+        let mut shared = lock(&self.shared);
+        if let Some(light) = shared.light
+            && shared.told.is_none()
+            && self.term.mode(Mode::COLOR_SCHEME_REPORT).unwrap_or(false)
+        {
+            tell_theme(&mut shared, light, replies);
+        }
+    }
+
+    /// The program that was told the theme is gone (a reset, or `recruit _member` saying its Claude stopped): the next
+    /// one knows nothing, and is told where the theme stands when it turns mode 2031 on, even if it never asks. Its
+    /// mode goes with it: a Claude that was killed did not turn it off, and the shell that takes the pane over must
+    /// never be sent a report it did not ask for (a reset has already turned it off).
+    fn forget_theme(&mut self) {
+        lock(&self.shared).told = None;
+        let _ = self.term.set_mode(Mode::COLOR_SCHEME_REPORT, false);
     }
 
     /// The program ended a synchronized update, maybe in the middle of a read: the frame it made is shown whole, and
@@ -633,7 +672,19 @@ impl Engine for Ghostty {
     fn set_colors(&mut self, fg: Option<Rgb>, bg: Option<Rgb>) {
         let _ = self.term.set_default_fg_color(Some(rgb_color(fg.unwrap_or(DEFAULT_FG))));
         let _ = self.term.set_default_bg_color(Some(rgb_color(bg.unwrap_or(DEFAULT_BG))));
-        lock(&self.shared).bg = bg;
+        // The theme follows the background, by the interface's own measure.
+        lock(&self.shared).light = bg.map(light_background);
+    }
+
+    fn color_scheme(&mut self, light: bool, replies: &mut Vec<u8>) {
+        let mut shared = lock(&self.shared);
+        shared.light = Some(light);
+        // Told only to a program that asked for it (mode 2031), and only a change: an attach that finds the theme it
+        // left tells nothing.
+        if shared.told == Some(light) || !self.term.mode(Mode::COLOR_SCHEME_REPORT).unwrap_or(false) {
+            return;
+        }
+        tell_theme(&mut shared, light, replies);
     }
 
     fn modes(&self) -> Modes {
@@ -759,9 +810,17 @@ fn rgb_color((r, g, b): Rgb) -> RgbColor {
     RgbColor { r, g, b }
 }
 
-/// Relative luminance, 0 to 1.
-fn luminance((r, g, b): Rgb) -> f64 {
-    (0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64) / 255.0
+fn scheme(light: bool) -> ColorScheme {
+    if light { ColorScheme::Light } else { ColorScheme::Dark }
+}
+
+/// The report of a theme (`CSI ? 997 ; 1|2 n`), appended to `replies`: the program now knows it.
+fn tell_theme(shared: &mut Shared, light: bool, replies: &mut Vec<u8>) {
+    let mut report = [0u8; 16];
+    if let Ok(len) = scheme(light).encode_report(&mut report) {
+        replies.extend_from_slice(&report[..len]);
+        shared.told = Some(light);
+    }
 }
 
 #[cfg(test)]
@@ -832,6 +891,204 @@ mod tests {
         assert_eq!(canvas.style(0, 0).bg, Some(Paint::Rgb { r: 1, g: 2, b: 3 }));
     }
 
+    const DARK_REPORT: &str = "\x1b[?997;1n";
+    const LIGHT_REPORT: &str = "\x1b[?997;2n";
+
+    /// What a program that asks for the theme (`CSI ? 996 n`) is told.
+    fn theme(engine: &mut Ghostty) -> &'static str {
+        match answer(engine, b"\x1b[?996n").as_str() {
+            DARK_REPORT => "dark",
+            LIGHT_REPORT => "light",
+            other => panic!("not a color scheme report: {other:?}"),
+        }
+    }
+
+    /// The theme asked for is that of the client attached now: a second client, with another background, is not
+    /// answered with the first one's.
+    #[test]
+    fn the_theme_follows_the_client_attached_now() {
+        let mut engine = engine();
+        let (dark, light, grey) = (Some((0x1c, 0x1e, 0x22)), Some((0xf6, 0xf6, 0xef)), Some((0x80, 0x80, 0x80)));
+        assert_eq!(theme(&mut engine), "dark", "no client colors yet");
+        engine.set_colors(None, light);
+        assert_eq!(theme(&mut engine), "light");
+        engine.set_colors(None, dark);
+        assert_eq!(theme(&mut engine), "dark");
+        engine.set_colors(None, light);
+        assert_eq!(theme(&mut engine), "light");
+        // A client that does not tell its background: dark, whoever came before.
+        engine.set_colors(None, None);
+        assert_eq!(theme(&mut engine), "dark");
+        // The interface's own measure (look::light_background), so that a program and the interface agree: a mid
+        // grey is dark, not light.
+        engine.set_colors(None, grey);
+        assert_eq!(theme(&mut engine), "dark");
+        // What the program sets for itself (OSC 11) is not the terminal's theme.
+        engine.set_colors(None, light);
+        answer(&mut engine, b"\x1b]11;rgb:00/00/00\x1b\\");
+        assert_eq!(theme(&mut engine), "light");
+    }
+
+    #[test]
+    fn a_theme_change_is_told_to_a_program_that_asked() {
+        let mut engine = engine();
+        let told = |engine: &mut Ghostty, light| {
+            let mut replies = Vec::new();
+            engine.color_scheme(light, &mut replies);
+            String::from_utf8(replies).unwrap()
+        };
+        // Mode 2031 off: nothing is said, but the theme asked for later is the new one.
+        assert_eq!(told(&mut engine, true), "");
+        assert_eq!(theme(&mut engine), "light");
+        // On: a change is told, in the form of the answer to the query; the same theme again is not.
+        assert_eq!(answer(&mut engine, b"\x1b[?2031h"), "");
+        assert_eq!(told(&mut engine, false), DARK_REPORT);
+        assert_eq!(told(&mut engine, false), "");
+        assert_eq!(told(&mut engine, true), LIGHT_REPORT);
+        assert_eq!(told(&mut engine, true), "");
+        assert_eq!(theme(&mut engine), "light");
+        // Off again: nothing is said, and the program keeps what it was last told (light); on again, the next call
+        // tells it where the theme stands.
+        answer(&mut engine, b"\x1b[?2031l");
+        assert_eq!(told(&mut engine, false), "");
+        answer(&mut engine, b"\x1b[?2031h");
+        assert_eq!(told(&mut engine, false), DARK_REPORT);
+        // Its own query counts as being told: it learns the theme that changed while the mode was off.
+        answer(&mut engine, b"\x1b[?2031l");
+        assert_eq!(told(&mut engine, true), "");
+        assert_eq!(theme(&mut engine), "light");
+        answer(&mut engine, b"\x1b[?2031h");
+        assert_eq!(told(&mut engine, true), "");
+        // A reset turns the mode off.
+        assert_eq!(told(&mut engine, false), DARK_REPORT);
+        answer(&mut engine, b"\x1bc");
+        assert_eq!(told(&mut engine, true), "");
+    }
+
+    /// The theme a program was told is not told to the next one, in the same pane: a reset (RIS), or `recruit _member`
+    /// saying its Claude stopped, makes the pane start from nothing.
+    #[test]
+    fn a_new_program_is_told_the_theme_its_predecessor_knew() {
+        let told = |engine: &mut Ghostty, light| {
+            let mut replies = Vec::new();
+            engine.color_scheme(light, &mut replies);
+            String::from_utf8(replies).unwrap()
+        };
+        let ends: [(&str, &[u8]); 2] =
+            [("reset", b"\x1bc"), ("recruit's clear", b"\x1b]7501;state=clear:app=recruit\x07")];
+        for (name, end) in ends {
+            let mut engine = engine();
+            // A Claude that asks for statuses and for the theme, and is told.
+            answer(&mut engine, b"\x1b]7501;?\x1b\\\x1b[?2031h");
+            assert_eq!(told(&mut engine, true), LIGHT_REPORT, "{name}");
+            assert_eq!(told(&mut engine, true), "", "{name}");
+            answer(&mut engine, end);
+            // Its successor turns the mode on without asking: it is told, once, at that point.
+            assert_eq!(answer(&mut engine, b"\x1b[?2031h"), LIGHT_REPORT, "{name}");
+            assert_eq!(told(&mut engine, true), "", "{name}");
+        }
+        // A status that is not recruit's clear leaves it as it was.
+        let mut engine = engine();
+        answer(&mut engine, b"\x1b]7501;?\x1b\\\x1b[?2031h");
+        assert_eq!(told(&mut engine, true), LIGHT_REPORT);
+        answer(&mut engine, b"\x1b]7501;state=clear\x07\x1b]7501;state=done:app=claude-code\x07");
+        assert_eq!(told(&mut engine, true), "");
+    }
+
+    /// A Claude that was killed leaves mode 2031 on: once recruit says it stopped, the shell that takes the pane over
+    /// is sent nothing when a client attaches, whatever its theme.
+    #[test]
+    fn a_shell_after_a_killed_claude_is_told_nothing() {
+        let (dark, light) = (Some((0x1c, 0x1e, 0x22)), Some((0xf6, 0xf6, 0xef)));
+        let attach = |engine: &mut Ghostty, bg| {
+            let mut replies = Vec::new();
+            engine.set_colors(None, bg);
+            engine.color_scheme(bg.is_some_and(light_background), &mut replies);
+            String::from_utf8(replies).unwrap()
+        };
+        let mut engine = engine();
+        engine.set_colors(None, light);
+        assert_eq!(answer(&mut engine, b"\x1b]7501;?\x1b\\\x1b[?2031h"), format!("\x1b]7501;?\x1b\\{LIGHT_REPORT}"));
+        assert_eq!(answer(&mut engine, b"\x1b[?2031$p"), "\x1b[?2031;1$y");
+        // It dies without turning the mode off; recruit says so; the shell starts.
+        answer(&mut engine, b"\x1b]7501;state=clear:app=recruit\x07$ ");
+        assert_eq!(answer(&mut engine, b"\x1b[?2031$p"), "\x1b[?2031;2$y");
+        // A client with another theme attaches, then one with the same theme again, then the first one's.
+        assert_eq!(attach(&mut engine, dark), "");
+        assert_eq!(attach(&mut engine, dark), "");
+        assert_eq!(attach(&mut engine, light), "");
+        // The next Claude turns it on itself, and is told.
+        assert_eq!(answer(&mut engine, b"\x1b[?2031h"), LIGHT_REPORT);
+        assert_eq!(attach(&mut engine, dark), DARK_REPORT);
+    }
+
+    /// A program that turns mode 2031 on and never asks (`CSI ? 996 n`) is told the theme there and then, without a
+    /// call to [`Engine::color_scheme`]: a Claude started in a pane with a client attached all along learns it at once.
+    #[test]
+    fn a_program_turning_the_mode_on_is_told_where_the_theme_stands() {
+        let (dark, light) = (Some((0x1c, 0x1e, 0x22)), Some((0xf6, 0xf6, 0xef)));
+        let on = |bg, bytes: &[u8]| {
+            let mut engine = engine();
+            engine.set_colors(None, bg);
+            answer(&mut engine, bytes)
+        };
+        assert_eq!(on(light, b"\x1b[?2031h"), LIGHT_REPORT);
+        assert_eq!(on(dark, b"\x1b[?2031h"), DARK_REPORT);
+        // Among other modes; in its place in what the program wrote.
+        assert_eq!(on(light, b"\x1b[?1004;2031;2004h"), LIGHT_REPORT);
+        assert_eq!(on(light, b"\x1b[5n\x1b[?2031h\x1b[6n"), format!("\x1b[0n{LIGHT_REPORT}\x1b[1;1R"));
+        // Not before the client's background is known, and not for another mode, or a mode turned off.
+        assert_eq!(on(None, b"\x1b[?2031h"), "");
+        assert_eq!(on(light, b"\x1b[?2031l\x1b[?2004h\x1b[?2026h\x1b[?2026l"), "");
+        // Cut between two reads: told once.
+        let mut engine = Ghostty::new(20, 5, 100).unwrap();
+        engine.set_colors(None, light);
+        assert_eq!(answer(&mut engine, b"\x1b[?20"), "");
+        assert_eq!(answer(&mut engine, b"31h"), LIGHT_REPORT);
+        // Once: a program that turns it on again, or asks, hears nothing more of it unasked.
+        assert_eq!(answer(&mut engine, b"\x1b[?2031h"), "");
+        assert_eq!(answer(&mut engine, b"\x1b[?2031l\x1b[?2031h"), "");
+        assert_eq!(answer(&mut engine, b"\x1b[?996n"), LIGHT_REPORT);
+        // Having asked first, it is not told again when it turns the mode on.
+        let mut engine = Ghostty::new(20, 5, 100).unwrap();
+        engine.set_colors(None, dark);
+        assert_eq!(answer(&mut engine, b"\x1b[?996n\x1b[?2031h"), DARK_REPORT);
+        // The client shows up after the program turned the mode on: told by the attach (`color_scheme`), as before.
+        let mut engine = Ghostty::new(20, 5, 100).unwrap();
+        assert_eq!(answer(&mut engine, b"\x1b[?2031h"), "");
+        let mut replies = Vec::new();
+        engine.set_colors(None, light);
+        engine.color_scheme(true, &mut replies);
+        assert_eq!(replies, LIGHT_REPORT.as_bytes());
+    }
+
+    /// What the program was told is what it is compared with: an attach that moved the colors first
+    /// ([`Engine::set_colors`]) still tells a change, and one that finds the theme the program knows tells nothing.
+    #[test]
+    fn an_attach_tells_a_program_only_what_changed() {
+        let mut engine = engine();
+        let (dark, light) = (Some((0, 0, 0)), Some((0xff, 0xff, 0xff)));
+        let attach = |engine: &mut Ghostty, bg| {
+            let mut replies = Vec::new();
+            engine.set_colors(None, bg);
+            engine.color_scheme(bg.is_some_and(light_background), &mut replies);
+            String::from_utf8(replies).unwrap()
+        };
+        engine.set_colors(None, dark);
+        answer(&mut engine, b"\x1b[?2031h");
+        assert_eq!(theme(&mut engine), "dark");
+        assert_eq!(attach(&mut engine, dark), "", "the same theme");
+        assert_eq!(attach(&mut engine, light), LIGHT_REPORT);
+        assert_eq!(theme(&mut engine), "light");
+        assert_eq!(attach(&mut engine, light), "");
+        assert_eq!(attach(&mut engine, dark), DARK_REPORT);
+        // Never asked, never told: a program that only turned the mode on is told where it stands, once.
+        let mut engine = Ghostty::new(20, 5, 100).unwrap();
+        answer(&mut engine, b"\x1b[?2031h");
+        assert_eq!(attach(&mut engine, light), LIGHT_REPORT);
+        assert_eq!(attach(&mut engine, light), "");
+    }
+
     #[test]
     fn relayed() {
         let mut engine = engine();
@@ -847,6 +1104,16 @@ mod tests {
             ]
         );
         assert!(relays(&mut engine).is_empty(), "given once");
+    }
+
+    #[test]
+    fn a_requested_size_is_relayed_not_applied() {
+        let mut engine = engine();
+        answer(&mut engine, b"\x1b[8;12;40t\x1b[18t\x1b[8;0;40t\x1b[8;2000;40tab");
+        assert_eq!(relays(&mut engine), [Relay::Resize { rows: 12, cols: 40 }]);
+        // Never written back, and the screen keeps its size.
+        assert_eq!(answer(&mut engine, b"\x1b[8;12;40t"), "");
+        assert_eq!((engine.term.cols().unwrap(), engine.term.rows().unwrap()), (20, 5));
     }
 
     #[test]

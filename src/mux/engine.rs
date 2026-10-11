@@ -46,6 +46,17 @@ pub(crate) trait Engine: Send {
     /// The real terminal's colors, for the OSC 10 and 11 queries; unknown, the engine answers its defaults.
     fn set_colors(&mut self, fg: Option<Rgb>, bg: Option<Rgb>);
 
+    /// The real terminal's theme changed, or an attach says it again: `light` is whether its background is light
+    /// (`look::light_background`). From now on `CSI ? 996 n` is answered with it (as [`Engine::set_colors`] does, from
+    /// the background it is given: the last of the two calls counts). If the program asked to be told
+    /// (mode 2031) and does not know this theme yet, `CSI ? 997 ; 1 n` (dark) or `CSI ? 997 ; 2 n` (light) is
+    /// appended to `replies`, for the PTY; nothing otherwise, so that an attach to the theme the program last heard
+    /// costs it nothing. A program that turns mode 2031 on without ever asking, while a client's theme is known, is
+    /// told it by [`Engine::feed`] there and then, in its `replies`.
+    fn color_scheme(&mut self, light: bool, replies: &mut Vec<u8>) {
+        let _ = (light, replies);
+    }
+
     /// The modes the program asked for, which decide how its input is encoded (`input.rs`).
     fn modes(&self) -> Modes;
 
@@ -196,6 +207,9 @@ pub(crate) enum Relay {
     /// `OSC 7501 ; ?`, which the engine does: idle, working, blocked (and why), done, failed. The program's own
     /// status only: those of its tasks (an `id`) are not relayed.
     Status(Status),
+    /// XTWINOPS 8 (`CSI 8 ; rows ; cols t`): the program asks for a screen of this size. Only the server's own lists
+    /// under a header (`recruit _menu --list`) are given it; never relayed.
+    Resize { rows: u16, cols: u16 },
 }
 
 /// A program's status (OSC 7501: `state=…:app=…:id=…:kind=…:progress=…:title=…:msg=…`, title and message in
@@ -274,7 +288,7 @@ impl Relay {
                 Progress::Paused(None) => "9;4;4".to_string(),
             }),
             // For the interface only.
-            Relay::Status(_) => None,
+            Relay::Status(_) | Relay::Resize { .. } => None,
         }
     }
 }

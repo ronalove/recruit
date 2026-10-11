@@ -44,8 +44,9 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Command::Server { state }) => mux::server::run(&state),
         Some(Command::Ctl { state, action }) => mux::ctl::run(&state, action),
         Some(Command::Member { state, member, resume }) => member::run(&state, &member, resume),
-        Some(Command::Menu { state, client, nerd, member, field, .. }) => {
-            menu::run(&state, client.as_deref(), nerd, member.as_deref(), field.as_deref())
+        Some(Command::Menu { state, client, nerd, light, member, field, list }) => {
+            crate::look::set_light(light);
+            menu::run(&state, client.as_deref(), nerd, member.as_deref(), field.as_deref(), list)
         }
         Some(Command::EditRunning { state, edits, restart, fresh, restart_all, dismiss }) => {
             edit_running(&state, edits.as_deref(), restart.as_deref(), fresh, restart_all, dismiss.as_deref())

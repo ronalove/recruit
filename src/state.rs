@@ -17,7 +17,7 @@ use crate::t;
 const FILE: &str = "team.json";
 const LOCK: &str = "team.lock";
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub team: String,
     pub session: String,
@@ -43,6 +43,35 @@ pub struct Snapshot {
     /// The members' settings give a status line (`claude::status_line`).
     #[serde(default)]
     pub status_line: bool,
+    /// The share of its window, in percent, from which the server compacts a member at rest for a while
+    /// (`Team::auto_compact_at`); None when it is off. A team.json from before it: the default share.
+    #[serde(default = "auto_compact_at")]
+    pub auto_compact: Option<u8>,
+}
+
+fn auto_compact_at() -> Option<u8> {
+    Some(crate::config::AUTO_COMPACT_AT)
+}
+
+/// As serde reads a team.json that says nothing: the automatic compaction at its default share.
+impl Default for Snapshot {
+    fn default() -> Self {
+        Snapshot {
+            team: String::new(),
+            session: String::new(),
+            dir: PathBuf::new(),
+            claude: PathBuf::new(),
+            config_dir: None,
+            lang: Lang::default(),
+            members: Vec::new(),
+            dashboard: Vec::new(),
+            journal: Vec::new(),
+            origin: None,
+            plugin_dir: None,
+            status_line: false,
+            auto_compact: auto_compact_at(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -165,6 +194,7 @@ mod tests {
             origin: Some(Origin::Local { root: "/tmp/web".into() }),
             plugin_dir: None,
             status_line: true,
+            auto_compact: Some(70),
         };
         let lead = MemberInfo {
             name: "lead".into(),
@@ -189,7 +219,7 @@ mod tests {
         // A team.json from before `quiet`, the origin and the configured model: its members keep their bars.
         let mut old: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(dir.path().join(FILE)).unwrap()).unwrap();
-        for key in ["origin", "plugin_dir", "status_line"] {
+        for key in ["origin", "plugin_dir", "status_line", "auto_compact"] {
             old.as_object_mut().unwrap().remove(key);
         }
         for member in old["members"].as_array_mut().unwrap() {
@@ -200,7 +230,7 @@ mod tests {
         fs::write(dir.path().join(FILE), old.to_string()).unwrap();
         let old = Snapshot::read(dir.path()).unwrap();
         assert!(old.members.iter().all(|m| !m.quiet && m.model.is_none()));
-        assert_eq!(old.origin, None);
+        assert_eq!((old.origin, old.auto_compact), (None, Some(70)));
         // Written in one go, nothing left beside it.
         let _lock = lock(dir.path()).unwrap();
         snapshot.write(dir.path()).unwrap();

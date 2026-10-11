@@ -3,6 +3,8 @@
 //! How a member looks, on the dashboard and in the menu: its state's color and sign, its effort's, its model's
 //! family, its own color, and the stroke down the left of its card. Nothing here reads or writes anything.
 
+#[cfg(not(test))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossterm::style::Color;
@@ -17,21 +19,137 @@ pub(crate) const FRAME: Duration = Duration::from_millis(100);
 /// A working member's spinner, one image per frame.
 pub(crate) const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-/// The members' own colors, the journal's too: no yellow, green or red, which tell the states.
-pub(crate) const COLORS: [Color; 8] = [
-    Color::Cyan,
-    Color::Magenta,
-    Color::Blue,
-    Color::AnsiValue(209),
-    Color::AnsiValue(147),
-    Color::AnsiValue(80),
-    Color::AnsiValue(218),
-    Color::AnsiValue(111),
-];
+/// The colors recruit picks itself, for a dark terminal or a light one (decision of 2026-10-11, palette
+/// https://claude.ai/artifact/PfAoSzSTwbhZEV5LELyyNj): all in the 256-color palette. Those the terminal gives (cyan,
+/// magenta, blue, red, its greys) stay its own, and follow its theme already.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Palette {
+    /// The chosen line of a list, the clicked text of a header.
+    pub selected: Color,
+    /// The chosen card of the menu.
+    pub chosen: Color,
+    pub button: Color,
+    /// A text edited in place.
+    pub input: Color,
+    /// What a layer dims around it.
+    pub faded: Color,
+    /// The members' own colors after the terminal's cyan, magenta and blue (`COLORS`).
+    pub members: [Color; 5],
+    /// Efforts low, medium, high and xhigh.
+    pub low: Color,
+    pub medium: Color,
+    pub high: Color,
+    /// `max`'s rainbow.
+    pub rainbow: [Color; 6],
+    /// A failed turn, a context near compaction.
+    pub orange: Color,
+    /// At work: the terminal's yellow on a dark one, too faint on white.
+    pub working: Color,
+}
+
+pub(crate) const DARK: Palette = Palette {
+    selected: Color::AnsiValue(237),
+    chosen: Color::AnsiValue(235),
+    button: Color::AnsiValue(236),
+    input: Color::AnsiValue(233),
+    faded: Color::AnsiValue(239),
+    members: [
+        Color::AnsiValue(209),
+        Color::AnsiValue(147),
+        Color::AnsiValue(80),
+        Color::AnsiValue(218),
+        Color::AnsiValue(111),
+    ],
+    low: Color::AnsiValue(179),
+    medium: Color::AnsiValue(114),
+    high: Color::AnsiValue(141),
+    rainbow: [
+        Color::AnsiValue(203),
+        Color::AnsiValue(209),
+        Color::AnsiValue(221),
+        Color::AnsiValue(114),
+        Color::AnsiValue(75),
+        Color::AnsiValue(141),
+    ],
+    orange: Color::AnsiValue(208),
+    working: Color::Yellow,
+};
+
+pub(crate) const LIGHT: Palette = Palette {
+    selected: Color::AnsiValue(253),
+    chosen: Color::AnsiValue(254),
+    button: Color::AnsiValue(252),
+    input: Color::AnsiValue(255),
+    faded: Color::AnsiValue(248),
+    members: [
+        Color::AnsiValue(167),
+        Color::AnsiValue(61),
+        Color::AnsiValue(30),
+        Color::AnsiValue(162),
+        Color::AnsiValue(26),
+    ],
+    low: Color::AnsiValue(136),
+    medium: Color::AnsiValue(28),
+    high: Color::AnsiValue(98),
+    rainbow: [
+        Color::AnsiValue(160),
+        Color::AnsiValue(166),
+        Color::AnsiValue(136),
+        Color::AnsiValue(28),
+        Color::AnsiValue(32),
+        Color::AnsiValue(98),
+    ],
+    orange: Color::AnsiValue(166),
+    working: Color::AnsiValue(136),
+};
+
+#[cfg(not(test))]
+static LIGHT_THEME: AtomicBool = AtomicBool::new(false);
+
+// In the tests, each test thread has its own theme: one that draws in the light palette leaves the others in the dark.
+#[cfg(test)]
+thread_local! {
+    static LIGHT_THEME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This process's palette: the dark one until told otherwise.
+pub(crate) fn palette() -> &'static Palette {
+    #[cfg(not(test))]
+    let light = LIGHT_THEME.load(Ordering::Relaxed);
+    #[cfg(test)]
+    let light = LIGHT_THEME.with(std::cell::Cell::get);
+    if light { &LIGHT } else { &DARK }
+}
+
+/// Whether this process draws with the light palette.
+pub(crate) fn is_light() -> bool {
+    std::ptr::eq(palette(), &LIGHT)
+}
+
+/// Draws with the light palette from now on, or the dark one: the server from its client's background (OSC 11), the
+/// menu from `--light`, the panels from the multiplexer's answer to `CSI ? 996 n` and its `CSI ? 997` notices.
+pub(crate) fn set_light(light: bool) {
+    #[cfg(not(test))]
+    LIGHT_THEME.store(light, Ordering::Relaxed);
+    #[cfg(test)]
+    LIGHT_THEME.with(|theme| theme.set(light));
+}
+
+/// Whether a terminal's background (OSC 11) is light: its relative luminance over a half.
+pub(crate) fn light_background((r, g, b): (u8, u8, u8)) -> bool {
+    let linear = |v: u8| {
+        let v = f64::from(v) / 255.0;
+        if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b) > 0.5
+}
 
 /// The `index`-th member's own color, in the order of the team.
 pub(crate) fn member_color(index: usize) -> Color {
-    COLORS[index % COLORS.len()]
+    // The terminal's own cyan, magenta and blue, then five of ours: no yellow, green or red, which tell the states.
+    let own = palette().members;
+    let all = [Color::Cyan, Color::Magenta, Color::Blue, own[0], own[1], own[2], own[3], own[4]];
+    all[index % all.len()]
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -82,10 +200,10 @@ impl State {
 
     pub(crate) fn color(self) -> Color {
         match self {
-            State::Working => Color::Yellow,
+            State::Working => palette().working,
             State::Idle => Color::DarkGrey,
             State::Waiting => Color::Red,
-            State::Error => ORANGE,
+            State::Error => palette().orange,
             State::Other => Color::DarkGrey,
         }
     }
@@ -338,37 +456,73 @@ impl Pressure {
     }
 }
 
-/// A context near compaction.
-pub(crate) const ORANGE: Color = Color::AnsiValue(208);
-
-/// An effort's sign of level.
+/// An effort's sign, those Claude Code puts under its prompt (decision of 2026-10-11): ○ low, ◐ medium, ● high, ◉ extra,
+/// ◈ max; the same with or without Nerd Font. Of ambiguous width: counted for one column, as Claude Code does.
 pub(crate) fn effort_sign(level: &str) -> char {
     match level {
-        "low" => '▂',
-        "medium" => '▄',
-        "high" => '▆',
-        _ => '█',
+        "low" => '○',
+        "medium" => '◐',
+        "high" => '●',
+        "xhigh" => '◉',
+        "max" => '◈',
+        // A level of a later Claude Code, or a slip in a file: neutral.
+        _ => '?',
     }
 }
 
-/// An effort's color, as in Claude Code; none for `max`, in a rainbow.
+/// An effort's name as the user reads it, Claude Code's own (it calls `xhigh` « Extra »); the files keep `xhigh`. A
+/// value Claude Code does not know is shown as it is.
+pub(crate) fn effort_name(level: &str) -> String {
+    match level {
+        "low" => t!("faible", "low"),
+        "medium" => t!("moyen", "medium"),
+        "high" => t!("élevé", "high"),
+        "xhigh" => t!("extra", "extra"),
+        "max" => "max".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// An effort as a label: its sign, then its name (`◉ extra`).
+pub(crate) fn effort_label(level: &str) -> String {
+    format!("{} {}", effort_sign(level), effort_name(level))
+}
+
+/// The columns of the widest effort name, in the current language.
+pub(crate) fn effort_name_width() -> usize {
+    ["low", "medium", "high", "xhigh", "max"].iter().map(|l| effort_name(l).chars().count()).max().unwrap_or(0)
+}
+
+/// An effort's color, as in Claude Code; none for `max`, in a rainbow; the terminal's grey for a level not known.
 pub(crate) fn effort_color(level: &str) -> Option<Color> {
     match level {
-        "low" => Some(Color::AnsiValue(179)),
-        "medium" => Some(Color::AnsiValue(114)),
-        "high" | "xhigh" => Some(Color::AnsiValue(141)),
-        _ => None,
+        "low" => Some(palette().low),
+        "medium" => Some(palette().medium),
+        "high" | "xhigh" => Some(palette().high),
+        "max" => None,
+        _ => Some(Color::DarkGrey),
     }
 }
 
-pub(crate) const RAINBOW: [Color; 6] = [
-    Color::AnsiValue(203),
-    Color::AnsiValue(209),
-    Color::AnsiValue(221),
-    Color::AnsiValue(114),
-    Color::AnsiValue(75),
-    Color::AnsiValue(141),
-];
+/// An effort's characters with their colors: its sign, and with `word` a blank then its name; those of a level in the
+/// level's own color; for `max` the sign in the rainbow's first color and its name letter by letter, all turned by `turn`
+/// as the spinners turn. The blank has no color.
+pub(crate) fn effort_cells(level: &str, word: bool, turn: usize) -> Vec<(char, Option<Color>)> {
+    let rainbow = &palette().rainbow;
+    let color = |i: usize| Some(effort_color(level).unwrap_or(rainbow[(i + turn) % rainbow.len()]));
+    let mut cells = vec![(effort_sign(level), color(0))];
+    if word {
+        cells.push((' ', None));
+        cells.extend(effort_name(level).chars().enumerate().map(|(i, c)| (c, color(i + 1))));
+    }
+    cells
+}
+
+/// A model's initial, for where its name does not fit: the family's first letter in capitals (`O`, `S`, `H`, `F`; an
+/// unknown family's first letter too), `?` when the model is not known yet.
+pub(crate) fn model_initial(model: Option<&str>) -> char {
+    model.and_then(|m| m.chars().next()).map_or('?', |c| c.to_uppercase().next().unwrap_or(c))
+}
 
 /// The families Claude Code names its models by.
 pub(crate) const FAMILIES: [&str; 4] = ["haiku", "sonnet", "opus", "fable"];
@@ -400,6 +554,56 @@ pub(crate) fn duration(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The efforts as Claude Code names and signs them (decision of 2026-10-11): ○ ◐ ● ◉ ◈, extra for xhigh, the files'
+    /// values untouched; a model's initial.
+    #[test]
+    fn efforts_and_models_in_the_users_words() {
+        let levels = ["low", "medium", "high", "xhigh", "max"];
+        assert_eq!(levels.map(effort_sign), ['○', '◐', '●', '◉', '◈']);
+        assert_eq!(
+            levels.map(effort_name),
+            [t!("faible", "low"), t!("moyen", "medium"), t!("élevé", "high"), "extra".into(), "max".into()]
+        );
+        assert_eq!(effort_label("xhigh"), "◉ extra");
+        // A value Claude Code does not know is shown as it is.
+        assert_eq!(effort_name("turbo"), "turbo");
+        assert_eq!(effort_name_width(), levels.iter().map(|l| effort_name(l).chars().count()).max().unwrap());
+        // A level in its own color, sign and name; `max` the sign in the rainbow's first color, its name letter by
+        // letter after it, turned by the spinner.
+        let cells = effort_cells("high", true, 0);
+        assert_eq!(cells.iter().map(|(c, _)| *c).collect::<String>(), effort_label("high"));
+        assert!(cells.iter().filter(|(c, _)| *c != ' ').all(|(_, color)| *color == Some(palette().high)));
+        assert_eq!(cells[1], (' ', None));
+        let max = effort_cells("max", true, 0);
+        let rainbow = palette().rainbow;
+        assert_eq!([max[0].1, max[2].1, max[3].1], [Some(rainbow[0]), Some(rainbow[1]), Some(rainbow[2])]);
+        // A level not known: a neutral « ? » and its name in grey, no rainbow.
+        assert_eq!(effort_sign("turbo"), '?');
+        assert_eq!(effort_color("turbo"), Some(Color::DarkGrey));
+        assert!(
+            effort_cells("turbo", true, 3).iter().filter(|(c, _)| *c != ' ').all(|(_, c)| *c == Some(Color::DarkGrey))
+        );
+        assert_eq!(effort_cells("max", false, 2).len(), 1);
+        assert_eq!(effort_cells("max", false, 2)[0].1, Some(rainbow[2]));
+        assert_eq!(
+            ["Opus", "Sonnet", "Haiku", "Fable", "mistral"].map(|m| model_initial(Some(m))),
+            ['O', 'S', 'H', 'F', 'M']
+        );
+        assert_eq!(model_initial(None), '?');
+        assert_eq!(model_initial(Some("")), '?');
+    }
+
+    #[test]
+    fn light_backgrounds() {
+        for (bg, light) in [((255, 255, 255), true), ((246, 246, 239), true), ((0, 0, 0), false), ((28, 30, 34), false)]
+        {
+            assert_eq!(light_background(bg), light, "{bg:?}");
+        }
+        // The light palette only moves what recruit picks itself.
+        assert_eq!((DARK.working, LIGHT.working), (Color::Yellow, Color::AnsiValue(136)));
+        assert_ne!(DARK.selected, LIGHT.selected);
+    }
 
     /// A failed turn's reason, from the text Claude Code gives (mock-up C), in the language of the run.
     #[test]

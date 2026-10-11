@@ -32,8 +32,10 @@ use anyhow::{Context, Result, bail};
 
 use self::choice::{Open, Outcome, Purpose};
 use self::pane::{Broken, Command, Gate, Pane, TurnError, Wires};
+use super::cards::{self, Panel};
 use super::chrome::{self, Target};
 use super::engine::{self, MouseTracking, Relay, State};
+use super::focus::{self, Focus, Places, Seen, Standing};
 use super::input::{self, Button, Event, Mods, Mouse, MouseKind};
 use super::keys::{self, Action, Shortcut};
 use super::proto::{
@@ -48,7 +50,7 @@ use crate::canvas::{Canvas, Painter};
 use crate::layout::{self, SidePanes};
 use crate::look::{self, Glyphs};
 use crate::state::Snapshot;
-use crate::{board, t};
+use crate::{board, bridge, t};
 
 /// One frame at most per this long (spec §5.3).
 const FRAME: Duration = Duration::from_millis(16);
@@ -103,6 +105,13 @@ enum Msg {
     Command(Request, Sender<Reply>, Receiver<()>),
     /// The members' looks for their headers, changed (`watch_looks`).
     Looks(BTreeMap<String, board::MemberLook>),
+    /// The team's share of the window from which a member at rest is compacted, as `team.json` says it now (`None`:
+    /// off).
+    AutoCompact(Option<u8>),
+    /// A member's automatic compaction request was written (its id), or could not be (`Err`): `auto_compaction`.
+    Requested(String, u64, Result<String, String>),
+    /// How the requests asked went, by member, as their reports say it (`watch_looks`).
+    Outcomes(BTreeMap<String, bridge::Compaction>),
 }
 
 /// Who asked the team to stop: where its answer goes, and where the connection says it wrote it.
@@ -204,7 +213,7 @@ impl Relays {
                 }
                 self.notifications.push_back(relay);
             }
-            Relay::Status(_) => {}
+            Relay::Status(_) | Relay::Resize { .. } => {}
         }
     }
 
@@ -230,6 +239,10 @@ struct Tab {
     last: Option<String>,
     /// The member's pane that takes the tab's room (⌥z, ⤢), the others hidden.
     zoomed: Option<String>,
+    /// ⌥l: the tab in « focus » (true) or in its grid (false) whatever the team says, until the client leaves.
+    mode: Option<bool>,
+    /// The places of a tab in « focus », kept from one look to the next; none for a tab in its grid.
+    focus: Option<Focus>,
 }
 
 /// The panels' column: the dashboard over the journal, by pane ids.
@@ -241,7 +254,7 @@ struct Side {
 
 impl Tab {
     fn new(title: String, panes: Vec<String>) -> Tab {
-        Tab { title, panes, side: None, last: None, zoomed: None }
+        Tab { title, panes, side: None, last: None, zoomed: None, mode: None, focus: None }
     }
 
     /// Every pane of the tab: the members', then the panels'.
@@ -345,6 +358,8 @@ struct Server {
     lang: String,
     /// The menu's floating pane, over the team, and the pane that had the focus before it.
     menu: Option<(String, Option<String>)>,
+    /// The menu is a list under a header's text, not the whole menu.
+    list: Option<List>,
     /// A choice open over the team (⌥q, a compaction's confirmation): it takes the keys and the clicks.
     choice: Option<Open>,
     /// Quit was picked: the team stops at the end of this turn.
@@ -370,6 +385,56 @@ struct Server {
     parts: Vec<(Rect, String, chrome::Part)>,
     /// What the pointer is over, among what a click reaches (F3).
     hover: Option<Hover>,
+    /// The share of its window, in percent, from which a member at rest is compacted on its own; `None`: off, or not
+    /// read yet (`watch_looks` tells it).
+    auto_compact: Option<u8>,
+    /// How long a member rests before that, in seconds: [`crate::config::AUTO_COMPACT_IDLE`], or [`AUTO_IDLE`].
+    auto_idle: u64,
+    /// The members asked to compact in their rest, by member (see [`Asked`]).
+    asked: BTreeMap<String, Asked>,
+    /// How those requests went, as the members' reports last said it.
+    outcomes: BTreeMap<String, bridge::Compaction>,
+    /// The members whose outcome `watch_looks` reads: those asked and not closed.
+    watched: Arc<Mutex<Vec<String>>>,
+    /// Something the automatic compaction and the tabs in « focus » depend on may have changed (a state, the looks, an
+    /// answer, a client, a tab, a key, the pointer): they look again at the end of this turn, not at each frame.
+    look_again: bool,
+    /// The client's terminal has a light background (its OSC 11 answer), so the light palette: as of its attach.
+    light: bool,
+    /// The team's tabs of agents are in « focus » (`layout = "focus"`), as `Build` and `Arrange` say.
+    focus_layout: bool,
+    /// The cards of the members left out of the tab shown in « focus », best placed first, with their panes and the
+    /// time each began its state (`since` ticks in them); rebuilt when the looks, a state or the places change.
+    cards: Vec<board::CardData>,
+    card_ids: Vec<String>,
+    card_epoch: Vec<Option<u64>>,
+    cards_stale: bool,
+    /// When the tabs in « focus » next look at their places, for a place that comes due; `None` when none does.
+    focus_wake: Option<Instant>,
+    /// Where the pointer last was, on the screen, and when it last moved: nothing moves in a tab under it ([`POINTER_HOLD`]).
+    pointer: Option<(usize, usize)>,
+    pointer_at: Option<Instant>,
+    /// The last key typed, the last click: nothing moves for a second after them.
+    last_key: Option<Instant>,
+    last_click: Option<Instant>,
+    /// The last press on the header of a pane on the right of a tab in « focus »: a second one brings it to the left.
+    header_click: Option<(Instant, String)>,
+    /// When the automatic compaction next looks, for the rest that is not long enough yet; `None` when none waits.
+    compaction: Option<Instant>,
+}
+
+/// The menu in its list mode (lot of 2026-10-11, direction A): the values of a member's model or effort, in a pane
+/// floating under the text of the header clicked, nothing dimmed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct List {
+    /// The member's pane whose header was clicked.
+    pane: String,
+    /// The part of its header: the model or the effort. Kept in inverse video while the list is open.
+    part: chrome::Part,
+    /// Where that text is on the screen.
+    anchor: Rect,
+    /// The list's size, its own frame included (it draws it): estimated at first, then as the menu tells it (`CSI 8 ; rows ; cols t`).
+    size: (usize, usize),
 }
 
 /// What the pointer can be over, lit (F3).
@@ -381,8 +446,50 @@ enum Hover {
     Bar(Target),
 }
 
+/// How long before a compaction asked is asked again, when it was refused for a subagent or a teammate at work, or got
+/// no answer (decision of 2026-10-11).
+const AUTO_AGAIN: Duration = Duration::from_secs(5 * 60);
+
+/// How long a request is waited for, in seconds' worth of time, before it counts as unanswered: it lapses after
+/// `COMPACTION_LAPSE` (10 s), its mod answers at its next tick, and `watch_looks` reads the report every [`LOOKS`].
+const AUTO_PENDING: Duration = Duration::from_secs(30);
+
+/// How long a member stays at rest after it was asked to compact on its own, at most, whatever its program says
+/// (decision of 2026-10-11): its answer, `done`, `skip` or `error`, ends it sooner.
+const COMPACTING: Duration = Duration::from_secs(3 * 60);
+
+/// A member asked to compact on its own, in the rest that began at `since`.
+struct Asked {
+    /// The rest it was asked in: a new turn starts another.
+    since: u64,
+    /// The request's id, once written: its report's `compaction` answers with it.
+    id: Option<String>,
+    /// When it was asked last.
+    at: Instant,
+    /// Its program said another state than `working` since: the compaction is over, a `working` is a turn's again.
+    ended: bool,
+    /// The earlier requests of this rest that got no answer, failed, or were refused for another reason than a
+    /// subagent or a teammate at work (those do not count).
+    failures: u8,
+}
+
+/// Set, in seconds, the time a member rests before its context is compacted on its own (tests). Not documented.
+const AUTO_IDLE: &str = "RECRUIT_AUTO_COMPACT_IDLE";
+
+/// A list's size before the menu tells its own: six values and the frame, columns and rows.
+const LIST_SIZE: (usize, usize) = (26, 8);
+
 /// How often the members' looks are read for their headers.
 const LOOKS: Duration = Duration::from_secs(2);
+
+/// How long a tab in « focus » stays as it is after the pointer moved over a pane on the right or the cards.
+const POINTER_HOLD: Duration = Duration::from_secs(5);
+
+/// The id of the cards' frame among the views: no pane has it.
+const CARDS: &str = "cards";
+
+/// Two presses on a header this close are a double click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// How long a notice shows (F5).
 const NOTICE: Duration = Duration::from_secs(6);
@@ -569,8 +676,8 @@ fn prepare(state: &Path, session: &str) -> Result<Ready> {
     let signals = tx.clone();
     std::thread::Builder::new().name("signals".into()).spawn(move || wait_signals(&signals))?;
     accept(listener, tx.clone(), Arc::clone(&welcome))?;
-    watch_looks(state.to_path_buf(), tx.clone())?;
-    let server = Server::new(state, session, (path, socket_id), tx, welcome);
+    let server = Server::new(state, session, (path, socket_id), tx.clone(), welcome);
+    watch_looks(state.to_path_buf(), tx, Arc::clone(&server.watched))?;
     Ok((server, rx, lock))
 }
 
@@ -622,6 +729,7 @@ impl Server {
             exe: None,
             lang: crate::i18n::lang().code().to_string(),
             menu: None,
+            list: None,
             choice: None,
             quitting: false,
             frames: 0,
@@ -635,6 +743,28 @@ impl Server {
             notice_zone: None,
             parts: Vec::new(),
             hover: None,
+            auto_compact: None,
+            auto_idle: std::env::var(AUTO_IDLE)
+                .ok()
+                .and_then(|secs| secs.parse().ok())
+                .unwrap_or(crate::config::AUTO_COMPACT_IDLE),
+            asked: BTreeMap::new(),
+            outcomes: BTreeMap::new(),
+            watched: Arc::new(Mutex::new(Vec::new())),
+            look_again: false,
+            cards: Vec::new(),
+            card_ids: Vec::new(),
+            card_epoch: Vec::new(),
+            cards_stale: false,
+            light: false,
+            focus_layout: false,
+            focus_wake: None,
+            pointer: None,
+            pointer_at: None,
+            last_key: None,
+            last_click: None,
+            header_click: None,
+            compaction: None,
         }
     }
 }
@@ -670,20 +800,42 @@ fn now() -> u64 {
 }
 
 /// Every [`LOOKS`], the members' looks for their headers (`board::looks`: a few small files), to the loop when they
-/// changed: never on the way to a frame, and no message while nothing changes.
-fn watch_looks(state: PathBuf, tx: Sender<Msg>) -> io::Result<()> {
+/// changed: never on the way to a frame, and no message while nothing changes. The team's automatic compaction goes
+/// with them (`team.json`, which a change from the menu rewrites).
+fn watch_looks(state: PathBuf, tx: Sender<Msg>, watched: Arc<Mutex<Vec<String>>>) -> io::Result<()> {
     std::thread::Builder::new().name("looks".into()).spawn(move || {
         let mut last = BTreeMap::new();
+        let mut compact = None;
+        let mut outcomes = BTreeMap::new();
         loop {
             // A panic in its reading would end the server (the hook): caught, and tried again later.
-            match super::caught(|| board::looks(&state)) {
-                Ok(looks) if looks != last => {
-                    if tx.send(Msg::Looks(looks.clone())).is_err() {
-                        return;
+            match super::caught(|| (board::looks(&state), Snapshot::read(&state).ok().map(|s| s.auto_compact))) {
+                Ok((looks, share)) => {
+                    if share.is_some() && share != compact {
+                        compact = share;
+                        if tx.send(Msg::AutoCompact(share.flatten())).is_err() {
+                            return;
+                        }
                     }
-                    last = looks;
+                    if looks != last {
+                        if tx.send(Msg::Looks(looks.clone())).is_err() {
+                            return;
+                        }
+                        last = looks;
+                    }
+                    // How the compactions asked went: their reports, for the members asked only.
+                    let asked = watched.lock().unwrap_or_else(PoisonError::into_inner).clone();
+                    let said: BTreeMap<_, _> = asked
+                        .into_iter()
+                        .filter_map(|member| Some((member.clone(), bridge::report(&state, &member)?.compaction?)))
+                        .collect();
+                    if said != outcomes {
+                        if tx.send(Msg::Outcomes(said.clone())).is_err() {
+                            return;
+                        }
+                        outcomes = said;
+                    }
                 }
-                Ok(_) => {}
                 Err(why) => log(&format!("looks: {why}")),
             }
             std::thread::sleep(LOOKS);
@@ -695,6 +847,41 @@ fn watch_looks(state: PathBuf, tx: Sender<Msg>) -> io::Result<()> {
 /// A line in `server.log`.
 fn log(text: &str) {
     eprintln!("{} recruit[{}]: {text}", now(), std::process::id());
+}
+
+/// Where a list goes on a screen of `screen` columns and rows (the bar left out), under the text at `anchor`, its
+/// values aligned on it (they start four columns inside the frame: the frame goes four columns to the left, the
+/// mock-up's): moved left just enough to end at the screen's edge; above the text when there is no room below; never
+/// out of the screen.
+fn list_area(anchor: Rect, size: (usize, usize), screen: (usize, usize)) -> Rect {
+    let width = size.0.min(screen.0).max(1);
+    let x = anchor.x.saturating_sub(4).min(screen.0.saturating_sub(width));
+    let below = screen.1.saturating_sub(anchor.y + 1);
+    let above = anchor.y.min(screen.1);
+    let (y, height) = if size.1 <= below {
+        (anchor.y + 1, size.1)
+    } else if size.1 <= above {
+        (anchor.y - size.1, size.1)
+    } else if below >= above {
+        (anchor.y + 1, below.max(1))
+    } else {
+        (anchor.y - above, above.max(1))
+    };
+    let height = height.min(screen.1).max(1);
+    Rect { x, y: y.min(screen.1.saturating_sub(height)), width, height }
+}
+
+/// A compaction skipped because the member was not in a state to be compacted (a subagent or a teammate at work, a turn
+/// running): not a failed try, the member is asked again later. Any other skip (a hook that refuses) is one.
+fn not_a_failure(outcome: &bridge::Compaction) -> bool {
+    matches!(outcome.skip.as_deref(), Some(bridge::SKIP_HELPERS | bridge::SKIP_BUSY))
+}
+
+/// Writes a member's automatic compaction request (`bridge::request_auto_compaction`: a small file, which its mod takes
+/// at its next tick) and tells the loop its id, or why not.
+fn ask_compaction(state: &Path, tx: &Sender<Msg>, member: &str, percent: u8, since: u64) {
+    let id = bridge::request_auto_compaction(state, member, percent).map_err(|error| format!("{error:#}"));
+    let _ = tx.send(Msg::Requested(member.to_string(), since, id));
 }
 
 /// The signals the server takes (§1.5): blocked in every thread, waited for by one.
@@ -889,7 +1076,8 @@ impl Server {
             let frame_due =
                 self.dirty.then(|| if self.echo { now } else { self.last_frame.map_or(now, |at| at + FRAME) });
             let notice = self.notice.as_ref().map(|(_, until)| *until);
-            let first = match [frame_due, self.deadline, self.animate, self.clock, notice].into_iter().flatten().min() {
+            let due = [frame_due, self.deadline, self.animate, self.clock, notice, self.compaction, self.focus_wake];
+            let first = match due.into_iter().flatten().min() {
                 Some(at) => match rx.recv_timeout(at.saturating_duration_since(now)) {
                     Ok(msg) => Some(msg),
                     Err(RecvTimeoutError::Timeout) => None,
@@ -910,6 +1098,7 @@ impl Server {
                         stop = Some((Bye::Stopped, Some((reply, written))));
                     }
                     Msg::Command(request, reply, _) => {
+                        self.look_again = true;
                         let answer = self.request(request);
                         let _ = reply.send(answer);
                     }
@@ -943,11 +1132,24 @@ impl Server {
             self.expire();
             self.repair();
             self.frame();
+            // After the frame: the programs' states are noted as it takes their relays (`take_relays`).
+            let again = std::mem::take(&mut self.look_again);
+            if again || self.compaction.is_some_and(|at| at <= Instant::now()) {
+                self.auto_compaction();
+            }
+            if again || self.focus_wake.is_some_and(|at| at <= Instant::now()) {
+                self.update_focus();
+            }
+            if std::mem::take(&mut self.cards_stale) {
+                self.refresh_cards();
+            }
         }
     }
 
     /// A message that is not a command nor a signal.
     fn message(&mut self, msg: Msg) {
+        // Output is the frames' business; all else may change who is to be compacted.
+        self.look_again |= !matches!(msg, Msg::Output(_));
         match msg {
             Msg::Output(id) => {
                 if self.focus.as_deref() == Some(id.as_str()) && self.typed.take().is_some_and(|at| at.elapsed() < ECHO)
@@ -975,9 +1177,10 @@ impl Server {
             }
             Msg::Broken => self.dirty = true,
             Msg::Looks(looks) => {
+                self.cards_stale = true;
                 // A member whose program says nothing, gone waiting or failed out of sight by the dashboard: a notice,
                 // as by its program (`take_relays`).
-                let shown = self.shown_ids();
+                let shown = self.in_view_ids();
                 let mut called = Vec::new();
                 for pane in self.panes.iter().filter(|pane| pane.role.is_empty() && !shown.contains(&pane.id)) {
                     let state = pane_state(pane, &looks);
@@ -989,6 +1192,16 @@ impl Server {
                 self.dirty = true;
                 self.call(called);
             }
+            Msg::AutoCompact(share) => self.auto_compact = share,
+            Msg::Requested(member, since, id) => {
+                if let Some(asked) = self.asked.get_mut(&member).filter(|asked| asked.since == since) {
+                    match id {
+                        Ok(id) => asked.id = Some(id),
+                        Err(error) => log(&format!("auto-compaction: {member}: {error}")),
+                    }
+                }
+            }
+            Msg::Outcomes(outcomes) => self.outcomes = outcomes,
             Msg::Attach(attaching) => self.attach(*attaching),
             Msg::Client(id, message) => {
                 if self.client.as_ref().is_some_and(|client| client.id == id) {
@@ -1025,9 +1238,21 @@ impl Server {
             .iter()
             .map(|name| (name.to_string(), env.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone())))
             .collect();
+        // Its background tells the palette (dark when it said none), and the programs that ask it the theme (`CSI ? 996 n`,
+        // mode 2031): told the one they do not know yet.
+        let light = caps.bg.is_some_and(look::light_background);
         for pane in &self.panes {
-            pane.with(|engine| engine.set_colors(caps.fg, caps.bg));
+            let mut replies = Vec::new();
+            pane.with(|engine| {
+                engine.set_colors(caps.fg, caps.bg);
+                engine.color_scheme(light, &mut replies);
+            });
+            if !replies.is_empty() {
+                pane.send(replies);
+            }
         }
+        look::set_light(light);
+        self.theme(light);
         out.message(&ServerMsg::Attached { client: id.clone() });
         let painter = Painter::new(caps.output);
         self.client = Some(Client {
@@ -1048,6 +1273,18 @@ impl Server {
         self.resize(size);
     }
 
+    /// The client's theme is `light` (or dark). Changed since the client before: the whole image is drawn again, the
+    /// cells kept by the screen were painted with the other palette. True when it changed.
+    fn theme(&mut self, light: bool) -> bool {
+        if light == self.light {
+            return false;
+        }
+        self.light = light;
+        self.screen.borrow_mut().redraw();
+        self.dirty = true;
+        true
+    }
+
     /// Lets the client go: told why, when it is still there to hear it.
     /// Returns its outbox, to wait for its writer to leave.
     fn drop_client(&mut self, bye: Option<Bye>) -> Option<Arc<Outbox>> {
@@ -1056,8 +1293,15 @@ impl Server {
             self.close_pane(&menu);
         }
         self.choice = None;
-        // Its pointer with it.
+        // Its pointer with it, and what it chose with ⌥l: the tabs go back to what the team says.
         self.hover = None;
+        self.pointer = None;
+        if self.tabs.iter().any(|tab| tab.mode.is_some()) {
+            for tab in &mut self.tabs {
+                tab.mode = None;
+            }
+            self.layout();
+        }
         let client = self.client.take()?;
         self.set_attached();
         let Client { out, stream, .. } = client;
@@ -1160,6 +1404,7 @@ impl Server {
         }
         match event {
             Event::Key(key) => {
+                self.last_key = Some(Instant::now());
                 match keys::shortcut(&key) {
                     Some(Shortcut::Run(action)) => {
                         self.act(action);
@@ -1172,7 +1417,7 @@ impl Server {
                 let Some(pane) = self.focused() else { return };
                 let modes = pane.modes();
                 // Shift with Page Up, Page Down, Home, End scroll the history rather than go to the program.
-                let rows = screen::content(pane.area).height.max(1);
+                let rows = self.cells(&pane.id, pane.area).height.max(1);
                 if let Some(lines) = select::scroll_key(&key, rows, modes.alt_screen) {
                     pane.with(|engine| engine.scroll(lines));
                     self.dirty = true;
@@ -1233,7 +1478,27 @@ impl Server {
             // The members' panes only: the dashboard and the journal are reached by a click (user's decision).
             Action::NextPane => {
                 let Some(tab) = self.tabs.get(self.active) else { return };
+                // In « focus »: the next member of the tab comes to the left, with the focus.
+                if tab.focus.is_some() && tab.zoomed.is_none() {
+                    let order = tab.panes.clone();
+                    let left = self.tabs[self.active].focus.as_mut().and_then(|focus| {
+                        focus.next(&order, Instant::now());
+                        focus.places().left.clone()
+                    });
+                    if let Some(left) = left {
+                        self.focus_on(&left);
+                    }
+                    self.unselect();
+                    self.layout();
+                    return;
+                }
                 if let Some(id) = next_member(&tab.panes, self.focus.as_deref()) {
+                    // A zoomed tab keeps its zoom: on the next member (F4, decision of 2026-10-11). ⌥z and ⤡ give
+                    // the grid back.
+                    if tab.zoomed.is_some() {
+                        self.tabs[self.active].zoomed = Some(id.clone());
+                        self.unselect();
+                    }
                     self.focus_on(&id);
                 }
             }
@@ -1254,6 +1519,7 @@ impl Server {
                 }
             }
             Action::Waiting => self.go_waiting(),
+            Action::ToggleLayout => self.toggle_layout(),
         }
     }
 
@@ -1282,8 +1548,19 @@ impl Server {
         };
         let field = match part {
             chrome::Part::Name => MenuField::Name,
-            chrome::Part::Model => MenuField::Model,
-            chrome::Part::Effort => MenuField::Effort,
+            chrome::Part::Model | chrome::Part::Effort => {
+                let field = if part == chrome::Part::Model { MenuField::Model } else { MenuField::Effort };
+                // Under the text clicked, a list of the values; the whole menu if the text is not found.
+                let anchor = self.parts.iter().find(|(_, of, p)| of == id && *p == part).map(|(zone, _, _)| *zone);
+                if let Some(anchor) = anchor {
+                    let list = List { pane: id.to_string(), part, anchor, size: LIST_SIZE };
+                    if let Err(error) = self.open_menu_as(None, Some((&member, Some(field))), Some(list)) {
+                        log(&format!("menu: {error:#}"));
+                    }
+                    return;
+                }
+                field
+            }
             chrome::Part::Context => {
                 // As the header shows it: no file read here.
                 let percent = self.looks.get(&member).and_then(|looks| looks.context);
@@ -1412,6 +1689,37 @@ impl Server {
         }
     }
 
+    /// Where pane `id`'s cells are in its `area`: inside its frame, but for the menu's list, which draws its own.
+    fn cells(&self, id: &str, area: Rect) -> Rect {
+        if self.list.is_some() && self.menu.as_ref().is_some_and(|(menu, _)| menu == id) {
+            area
+        } else {
+            screen::content(area)
+        }
+    }
+
+    /// The list under a header's text closed, the focus back where it was.
+    fn close_list(&mut self) {
+        if self.list.is_some()
+            && let Some(menu) = self.menu.as_ref().map(|(menu, _)| menu.clone())
+        {
+            self.close_pane(&menu);
+        }
+        self.list = None;
+        self.dirty = true;
+    }
+
+    /// The list asks for `rows` × `cols`, its own frame included (`CSI 8 ; rows ; cols t`): its place changes with it,
+    /// within the screen.
+    fn list_resize(&mut self, rows: u16, cols: u16) {
+        let Some(list) = self.list.as_mut() else { return };
+        let size = (usize::from(cols), usize::from(rows));
+        if list.size != size {
+            list.size = size;
+            self.layout();
+        }
+    }
+
     /// Gives the focus to pane `id`, showing its tab; the panes that asked are told (1004).
     fn focus_on(&mut self, id: &str) {
         if let Some(tab) = self.tabs.iter().position(|tab| tab.has(id)) {
@@ -1452,8 +1760,25 @@ impl Server {
             return;
         }
         let (col, row) = (mouse.col as usize, mouse.row as usize);
+        // Nothing moves in a tab under the pointer, nor right after a click (« focus »).
+        self.pointer = Some((col, row));
+        self.pointer_at = Some(Instant::now());
+        if let MouseKind::Down(_) = mouse.kind {
+            self.last_click = Some(Instant::now());
+        }
         if mouse.kind == MouseKind::Moved {
             self.hover_at(col, row);
+        }
+        // A list under a header's text: a press outside it closes it (on the same text too: a second click), and is
+        // all it does; inside, it is the list's, whatever header part lies under it.
+        let in_list = self.list.is_some() && self.menu_area().contains(col, row);
+        if let MouseKind::Down(_) = mouse.kind
+            && self.list.is_some()
+            && !in_list
+        {
+            self.close_list();
+            self.swallowing = true;
+            return;
         }
         // The notice over everything: a click on it goes to its member.
         if let MouseKind::Down(_) = mouse.kind
@@ -1472,6 +1797,7 @@ impl Server {
             return;
         }
         if let MouseKind::Down(Button::Left) = mouse.kind
+            && !in_list
             && let Some((id, part)) =
                 self.parts.iter().find(|(zone, _, _)| zone.contains(col, row)).map(|(_, id, part)| (id.clone(), *part))
         {
@@ -1487,10 +1813,44 @@ impl Server {
             self.unselect();
             match target {
                 Target::Tab(tab) => self.show_tab(tab),
+                Target::Layout if self.menu.is_some() => {}
+                Target::Layout => self.toggle_layout(),
                 Target::Menu => self.menu_here(),
                 Target::Quit if self.menu.is_some() => {}
                 Target::Quit => self.ask_quit(),
             }
+            self.dirty = true;
+            return;
+        }
+        // The cards of the members left out of a tab in « focus »: a card brings its member to the left.
+        if let MouseKind::Down(Button::Left) = mouse.kind
+            && !in_list
+            && self.card_click(col, row)
+        {
+            self.unselect();
+            self.swallowing = true;
+            self.dirty = true;
+            return;
+        }
+        // The header of a pane on the right of a tab in « focus »: a press gives it the focus, a second one brings it to
+        // the left.
+        if let MouseKind::Down(Button::Left) = mouse.kind
+            && !in_list
+            && let Some(id) = self.right_header_at(col, row)
+        {
+            self.unselect();
+            let now = Instant::now();
+            let again = self.header_click.take().is_some_and(|(at, prev)| prev == id && at.elapsed() < DOUBLE_CLICK);
+            if again {
+                if let Some(focus) = self.tabs.get_mut(self.active).and_then(|tab| tab.focus.as_mut()) {
+                    focus.bring(&id, now);
+                }
+            } else {
+                self.header_click = Some((now, id.clone()));
+            }
+            self.focus_on(&id);
+            self.layout();
+            self.swallowing = true;
             self.dirty = true;
             return;
         }
@@ -1503,7 +1863,7 @@ impl Server {
             .panes
             .iter()
             .filter(|pane| shown.contains(&pane.id))
-            .find(|pane| screen::content(pane.area).contains(col, row))
+            .find(|pane| self.cells(&pane.id, pane.area).contains(col, row))
             .map(|pane| pane.id.clone());
         let held = matches!(mouse.kind, MouseKind::Drag(_) | MouseKind::Up(_));
         let Some(id) = (if held { self.grab.clone().or(under) } else { under }) else { return };
@@ -1521,7 +1881,7 @@ impl Server {
             }
         }
         let Some(area) = self.pane(&id).map(|pane| pane.area) else { return };
-        let content = screen::content(area);
+        let content = self.cells(&id, area);
         let x = col.clamp(content.x, content.x + content.width.saturating_sub(1)) - content.x;
         let y = row.clamp(content.y, content.y + content.height.saturating_sub(1)) - content.y;
         if matches!(mouse.kind, MouseKind::Down(_) | MouseKind::Drag(_)) && self.grab.as_deref() == Some(id.as_str()) {
@@ -1643,6 +2003,8 @@ impl Server {
 
     fn resize(&mut self, size: (u16, u16)) {
         self.unselect();
+        // A list under a header's text would stay where the text was: closed, as by a click outside.
+        self.close_list();
         self.size = size;
         if let Some(client) = self.client.as_mut() {
             client.size = size;
@@ -1650,12 +2012,236 @@ impl Server {
         self.layout();
     }
 
+    /// The room of a tab: the screen less the bar.
+    fn tab_room(&self) -> (usize, usize) {
+        (self.size.0 as usize, (self.size.1 as usize).saturating_sub(1))
+    }
+
+    /// Whether tab `t` shows its members in « focus »: a tab of agents (no panels beside it) of two members or more,
+    /// the team's choice or ⌥l's, and a screen with room for it (`layout::focus_room`).
+    fn in_focus(&self, t: usize) -> bool {
+        let Some(tab) = self.tabs.get(t) else { return false };
+        let (width, height) = self.tab_room();
+        tab.side.is_none()
+            && tab.panes.len() >= 2
+            && tab.mode.unwrap_or(self.focus_layout)
+            && layout::focus_room(width, height).is_some()
+    }
+
+    /// The panes of tab `t` as the places of « focus » see them: how well placed each one is, and since when.
+    fn focus_seen(&self, t: usize, now: Instant) -> Vec<Seen> {
+        let epoch = self::now();
+        let Some(tab) = self.tabs.get(t) else { return Vec::new() };
+        tab.panes
+            .iter()
+            .filter_map(|id| self.pane(id))
+            .map(|pane| {
+                let standing = match pane_state(pane, &self.looks) {
+                    look::State::Waiting => Standing::Waiting,
+                    look::State::Error => Standing::Failed,
+                    look::State::Working => Standing::Working,
+                    look::State::Idle | look::State::Other => Standing::Resting,
+                };
+                let since = pane_since(pane, &self.looks)
+                    .and_then(|since| now.checked_sub(Duration::from_secs(epoch.saturating_sub(since))))
+                    .unwrap_or(self.born);
+                Seen { id: pane.id.clone(), standing, since }
+            })
+            .collect()
+    }
+
+    /// The places of every tab in « focus » brought up to date with its panes, and dropped for a tab in its grid.
+    /// Only what the panes' coming and going and the room force: nothing is reordered here ([`Server::update_focus`]).
+    /// The pane with the focus is always one of those shown: a card that gets it comes to the left.
+    fn ensure_focus(&mut self) {
+        let (width, height) = self.tab_room();
+        let room = layout::focus_room(width, height).unwrap_or(0);
+        let now = Instant::now();
+        for t in 0..self.tabs.len() {
+            if !self.in_focus(t) {
+                self.tabs[t].focus = None;
+                continue;
+            }
+            let seen = self.focus_seen(t, now);
+            let focused = self.focus.clone();
+            let Tab { last, panes, focus, .. } = &mut self.tabs[t];
+            // A tab that opens in « focus » fills its right column at once; after, only what is forced.
+            let opening = focus.is_none();
+            let focus = focus.get_or_insert_with(|| {
+                Focus::new(last.clone().filter(|id| panes.contains(id)).or_else(|| panes.first().cloned()))
+            });
+            focus.update(&seen, room, now, !opening);
+            if let Some(id) = focused.filter(|id| focus.places().others.contains(id)) {
+                focus.bring(&id, now);
+            }
+        }
+    }
+
+    /// The tabs in « focus » look at their places again: a member that began to wait, to work, a place that came due
+    /// (`Focus::deadline`). Nothing moves in the tab shown while the pointer is on it, a key was just typed, or a click
+    /// was just made; the places catch up when that ends. Moved places lay the tab out again.
+    fn update_focus(&mut self) {
+        self.update_focus_at(Instant::now());
+    }
+
+    /// [`Server::update_focus`] as of `now`.
+    fn update_focus_at(&mut self, now: Instant) {
+        if self.tabs.iter().all(|tab| tab.focus.is_none()) {
+            self.focus_wake = None;
+            return;
+        }
+        let (width, height) = self.tab_room();
+        let room = layout::focus_room(width, height).unwrap_or(0);
+        let (held, ends) = self.holding(now);
+        let mut changed = false;
+        let mut wake: Option<Instant> = ends;
+        for t in 0..self.tabs.len() {
+            if self.tabs[t].focus.is_none() {
+                continue;
+            }
+            let seen = self.focus_seen(t, now);
+            let hold = held && t == self.active;
+            if let Some(focus) = self.tabs[t].focus.as_mut() {
+                changed |= focus.update(&seen, room, now, hold);
+                wake = [wake, focus.deadline()].into_iter().flatten().min();
+            }
+        }
+        self.focus_wake = wake;
+        if changed {
+            self.layout();
+        }
+    }
+
+    /// Whether the tab shown is held in place, and when the hold that has an end ends: the pointer is on a pane on the
+    /// right or on the cards and moved less than [`POINTER_HOLD`] ago, a key was typed or a click made less than a
+    /// second ago (nothing tells that either is over: the wake-up is for the end of the hold).
+    fn holding(&self, now: Instant) -> (bool, Option<Instant>) {
+        let mut ends: Vec<Instant> =
+            [self.last_key, self.last_click].into_iter().flatten().map(|at| at + focus::HOLD_AFTER_CLICK).collect();
+        if let (Some((col, row)), Some(at)) = (self.pointer, self.pointer_at)
+            && self.client.is_some()
+            && self.under_pointer(col, row)
+        {
+            ends.push(at + POINTER_HOLD);
+        }
+        let ends: Vec<Instant> = ends.into_iter().filter(|end| *end > now).collect();
+        (!ends.is_empty(), ends.into_iter().max())
+    }
+
+    /// Whether `col`, `row` is on a pane on the right of the tab shown in « focus », or on its cards.
+    fn under_pointer(&self, col: usize, row: usize) -> bool {
+        let Some(focus) = self.tabs.get(self.active).and_then(|tab| tab.focus.as_ref()) else { return false };
+        let right = focus.places().right.iter().filter_map(|id| self.pane(id));
+        right.into_iter().any(|pane| pane.area.contains(col, row))
+            || self.cards_rect().is_some_and(|rect| rect.contains(col, row))
+    }
+
+    /// Where the cards of the members left out go in the tab shown in « focus »: their frame, in the room that
+    /// `layout::focus_rects` leaves under the panes on the right. The same room, the same call, as `layout`.
+    fn cards_rect(&self) -> Option<Rect> {
+        let tab = self.tabs.get(self.active).filter(|tab| tab.zoomed.is_none())?;
+        let places = tab.focus.as_ref()?.places();
+        let (width, height) = self.tab_room();
+        layout::focus_rects(width, height, places.left.as_deref()?, &places.right, places.others.len()).1
+    }
+
+    /// The cards of the tab shown, made again from the looks, the panes' states and the places: a card has what the
+    /// dashboard last wrote of its member (what it does, its curve), and none of it with no dashboard.
+    fn refresh_cards(&mut self) {
+        let (mut cards, mut ids, mut epochs) = (Vec::new(), Vec::new(), Vec::new());
+        if self.cards_rect().is_some() {
+            let places = self.tabs[self.active].focus.as_ref().map(|focus| focus.places().clone()).unwrap_or_default();
+            let epoch = now();
+            for pane in places.others.iter().filter_map(|id| self.pane(id)) {
+                let state = pane_state(pane, &self.looks);
+                let look = self.looks.get(&pane.member);
+                let began = pane_since(pane, &self.looks);
+                cards.push(board::CardData {
+                    name: pane.member.clone(),
+                    color: member_color(&self.order, &pane.member),
+                    state,
+                    since: began.map_or(0, |began| epoch.saturating_sub(began)),
+                    shell: look.is_some_and(|look| look.shell)
+                        && !matches!(state, look::State::Working | look::State::Waiting | look::State::Error),
+                    context: look.and_then(|look| look.context).map(f64::from),
+                    pressure: look.map(|look| look.pressure).unwrap_or_default(),
+                    model: look.and_then(|look| look.model.clone()),
+                    effort: look.and_then(|look| look.effort.clone()),
+                    doing: look.and_then(|look| look.doing.clone()),
+                    activity: look.map(|look| look.activity.clone()).unwrap_or_default(),
+                    failed: (state == look::State::Error)
+                        .then(|| pane.error.as_ref().map_or(self.unknown_error.clone(), |error| error.label.clone())),
+                    compacted: look.and_then(|look| look.compacted),
+                });
+                ids.push(pane.id.clone());
+                epochs.push(began);
+            }
+        }
+        if !cards.is_empty() || !self.cards.is_empty() {
+            self.dirty = true;
+        }
+        (self.cards, self.card_ids, self.card_epoch) = (cards, ids, epochs);
+    }
+
+    /// A press on the cards' frame: on a card, that member comes to the left. True when the press was in the frame.
+    fn card_click(&mut self, col: usize, row: usize) -> bool {
+        let Some(rect) = self.cards_rect().filter(|rect| rect.contains(col, row)) else { return false };
+        let wide = self.tab_room().0 >= layout::FOCUS_WIDE;
+        let placed = cards::place(chrome::inside(rect), &self.cards, wide);
+        let hit = placed.shown.iter().find(|(_, at)| at.contains(col, row)).map(|(i, _)| *i);
+        if let Some(id) = hit.and_then(|i| self.card_ids.get(i).cloned()) {
+            if let Some(focus) = self.tabs.get_mut(self.active).and_then(|tab| tab.focus.as_mut()) {
+                focus.bring(&id, Instant::now());
+            }
+            self.focus_on(&id);
+            self.layout();
+        }
+        true
+    }
+
+    /// The bar's layout button for tab `t`: where ⌥l would take it. None for a tab it cannot go to « focus » in (panels
+    /// beside it, a single member, a screen too small).
+    fn switch(&self, t: usize) -> Option<chrome::Switch> {
+        let tab = self.tabs.get(t)?;
+        let (width, height) = self.tab_room();
+        if tab.side.is_some() || tab.panes.len() < 2 || layout::focus_room(width, height).is_none() {
+            return None;
+        }
+        Some(if self.in_focus(t) { chrome::Switch::ToGrid } else { chrome::Switch::ToFocus })
+    }
+
+    /// ⌥l and the bar's button: the tab shown goes from its grid to « focus », or back, until the client leaves.
+    fn toggle_layout(&mut self) {
+        let t = self.active;
+        let Some(tab) = self.tabs.get(t) else { return };
+        if tab.side.is_some() || tab.panes.len() < 2 {
+            return;
+        }
+        let focus = self.in_focus(t);
+        self.tabs[t].mode = Some(!focus);
+        self.unselect();
+        self.layout();
+    }
+
+    /// The pane on the right of the tab shown whose header row is at `col`, `row`.
+    fn right_header_at(&self, col: usize, row: usize) -> Option<String> {
+        let places = self.tabs.get(self.active)?.focus.as_ref()?.places();
+        places
+            .right
+            .iter()
+            .find(|id| self.pane(id).is_some_and(|pane| row == pane.area.y && pane.area.contains(col, row)))
+            .cloned()
+    }
+
     /// Every tab laid out on the screen, less the bar: a shown tab's panes get their place, the others their size.
     fn layout(&mut self) {
+        self.ensure_focus();
         if let Some((menu, _)) = self.menu.clone() {
             let area = self.menu_area();
+            // A list draws its own frame: its cells are all its place.
+            let inside = if self.list.is_some() { area } else { screen::content(area) };
             if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == menu) {
-                pane.place(area, screen::content(area));
+                pane.place(area, inside);
             }
         }
         let (width, height) = (self.size.0 as usize, (self.size.1 as usize).saturating_sub(1));
@@ -1667,7 +2253,21 @@ impl Server {
             // Zoomed, one pane takes the tab's room, the others keep their size, hidden (their programs are not
             // resized for nothing); in a tab not shown too, so that going back to it resizes nothing.
             let zoomed = tab.zoomed.as_deref();
-            for (id, area) in layout::rects(width, height, &tab.panes, self.columns, side.as_ref()) {
+            // In « focus »: the left pane, those on the right, and the room of the cards (left empty for now).
+            let places = tab.focus.as_ref().map(Focus::places).filter(|places| places.left.is_some());
+            let rects = match places {
+                Some(Places { left: Some(left), right, others }) => {
+                    layout::focus_rects(width, height, left, right, others.len()).0
+                }
+                _ => layout::rects(width, height, &tab.panes, self.columns, side.as_ref()),
+            };
+            // A card is no pane on the screen: hidden, its size kept.
+            for id in tab.panes.iter().filter(|id| !rects.iter().any(|(placed, _)| placed == *id)) {
+                if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == *id) {
+                    pane.area = Rect::default();
+                }
+            }
+            for (id, area) in rects {
                 let area = if zoomed == Some(id.as_str()) { Rect { x: 0, y: 0, width, height } } else { area };
                 if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id) {
                     let shown = t == self.active && zoomed.is_none_or(|zoomed| zoomed == id);
@@ -1676,6 +2276,7 @@ impl Server {
                 }
             }
         }
+        self.refresh_cards();
         self.dirty = true;
     }
 
@@ -1714,9 +2315,19 @@ impl Server {
     /// later would surprise); the states noted, and since when; a member gone waiting out of sight noticed (F5).
     fn take_relays(&mut self) {
         let focus = self.focus.clone();
-        let shown = self.shown_ids();
+        let shown = self.in_view_ids();
         let mut relays = Vec::new();
         let mut called = Vec::new();
+        let mut resized = None;
+        // The members compacting on their own, by pane: their `working` is held back.
+        let compacting: Vec<String> = self
+            .panes
+            .iter()
+            .filter(|pane| pane.role.is_empty() && self.compacting(&pane.member, pane.since))
+            .map(|pane| pane.id.clone())
+            .collect();
+        let mut ended = Vec::new();
+        let list_pane = self.list.as_ref().and(self.menu.as_ref()).map(|(menu, _)| menu.as_str());
         let held = self.gate.hold();
         let looks = &self.looks;
         for pane in &mut self.panes {
@@ -1726,7 +2337,26 @@ impl Server {
                 continue;
             }
             for relay in relays.drain(..) {
+                // The size a list asks for: honoured for the menu's list alone, relayed to no one.
+                if let Relay::Resize { rows, cols } = relay {
+                    if list_pane == Some(pane.id.as_str()) {
+                        resized = Some((rows, cols));
+                    }
+                    continue;
+                }
                 if let Relay::Status(status) = &relay {
+                    // Compacting on its own: a `working` is not a turn, the member stays at rest; another state is
+                    // the end of the compaction (or of the turn it was in).
+                    if status.id.is_none() && compacting.contains(&pane.id) {
+                        if status.state == State::Working {
+                            pane.held = Some((status.clone(), now()));
+                            continue;
+                        }
+                        ended.push(pane.member.clone());
+                    }
+                    if status.id.is_none() {
+                        pane.held = None;
+                    }
                     let state = look_state(Some(status.state));
                     // So already, by its program or by the dashboard: no second notice.
                     if calls(state)
@@ -1737,6 +2367,8 @@ impl Server {
                         called.push((pane.id.clone(), state));
                     }
                     note_status(pane, status);
+                    self.look_again = true;
+                    self.cards_stale = true;
                 }
                 if matches!(relay, Relay::Title(_)) && focus.as_deref() != Some(pane.id.as_str()) {
                     continue;
@@ -1747,6 +2379,14 @@ impl Server {
             }
         }
         drop(held);
+        for member in ended {
+            if let Some(asked) = self.asked.get_mut(&member) {
+                asked.ended = true;
+            }
+        }
+        if let Some((rows, cols)) = resized {
+            self.list_resize(rows, cols);
+        }
         self.call(called);
     }
 
@@ -1838,7 +2478,7 @@ impl Server {
             Some((_, members)) if notice.state == look::State::Error => members.clone(),
             _ => vec![notice.member.clone()],
         };
-        let shown = self.shown_ids();
+        let shown = self.in_view_ids();
         let calling = self
             .panes
             .iter()
@@ -1851,13 +2491,190 @@ impl Server {
         }
     }
 
+    /// The panes in a client's view, for the notices: those the tab shown shows, and its cards (a card turns red, then
+    /// its member comes in: no notice). Not for the compaction, to which a card is no pane on the screen.
+    fn in_view_ids(&self) -> Vec<String> {
+        let mut ids = self.shown_ids();
+        ids.extend(self.card_ids.iter().cloned());
+        ids
+    }
+
     /// The panes the active tab shows: the zoomed one alone, else all of them.
     fn shown_ids(&self) -> Vec<String> {
         let Some(tab) = self.tabs.get(self.active) else { return Vec::new() };
-        match &tab.zoomed {
-            Some(id) => vec![id.clone()],
-            None => tab.ids(),
+        match (&tab.zoomed, tab.focus.as_ref()) {
+            (Some(id), _) => vec![id.clone()],
+            // In « focus »: the left pane and those on the right; the others are cards.
+            (None, Some(focus)) => {
+                let places = focus.places();
+                places.left.iter().chain(&places.right).cloned().collect()
+            }
+            (None, None) => tab.ids(),
         }
+    }
+
+    /// The members to compact on their own, as of `now` (seconds since the epoch), and how long before looking again
+    /// for the rest not long enough yet, or the request to renew (decision of 2026-10-11). A member qualifies when the
+    /// team has the compaction on, it is at rest (by its program, else the dashboard) since `auto_idle` seconds with no
+    /// command running, its context is at the team's share, it is on no client's screen (the panes of the tab shown, or
+    /// the zoomed one alone), and [`Server::renewal`] allows a request. Whether a subagent or a teammate works, the
+    /// bridge says. What else changes it (a state, the looks, a tab shown) comes through the loop, which looks again.
+    fn compaction_due(&self, now: u64) -> (Vec<(String, u8, u64)>, Option<Duration>) {
+        let Some(share) = self.auto_compact else { return (Vec::new(), None) };
+        let shown = if self.client.is_some() { self.shown_ids() } else { Vec::new() };
+        let mut due = Vec::new();
+        let mut wait: Option<Duration> = None;
+        let mut later = |left: Duration| wait = Some(wait.map_or(left, |wait| wait.min(left)));
+        for pane in self.panes.iter().filter(|pane| pane.role.is_empty() && !pane.exited) {
+            if pane_state(pane, &self.looks) != look::State::Idle {
+                continue;
+            }
+            let Some(look) = self.looks.get(&pane.member) else { continue };
+            let Some(context) = look.context.filter(|context| *context >= share) else { continue };
+            let Some(since) = pane_since(pane, &self.looks) else { continue };
+            if look.shell {
+                continue;
+            }
+            let Some(left) = self.renewal(&pane.member, since) else { continue };
+            let rested = now.saturating_sub(since);
+            if rested < self.auto_idle {
+                later(Duration::from_secs(self.auto_idle - rested).max(left));
+            } else if !left.is_zero() {
+                later(left);
+            } else if !shown.contains(&pane.id) {
+                due.push((pane.member.clone(), context, since));
+            }
+        }
+        (due, wait)
+    }
+
+    /// Whether `member`'s compaction, asked on its own, is under way: asked in the rest it is in, not answered (`done`,
+    /// `skip`, `error` for its request's id), its program not back to another state than `working`, and not for more
+    /// than [`COMPACTING`]. The `working` that Claude Code says for it is no turn: the member stays at rest.
+    fn compacting(&self, member: &str, since: Option<u64>) -> bool {
+        let Some(asked) = self.asked.get(member).filter(|asked| Some(asked.since) == since) else { return false };
+        let answered = asked.id.as_ref().and_then(|id| self.outcomes.get(member).filter(|outcome| outcome.id == *id));
+        let answered =
+            answered.is_some_and(|outcome| outcome.done || outcome.skip.is_some() || outcome.error.is_some());
+        !asked.ended && !answered && asked.at.elapsed() < COMPACTING
+    }
+
+    /// The `working` still held back for a member whose compaction is over (no other state said since): told as a
+    /// turn's. When the compaction was not made (refused, failed, no answer in time), since the `working` began. When
+    /// it was, the program said no end of it (its `done` comes after the turn queued behind it, which begins right
+    /// after the compaction: Claude Code 2.1.296, a message received meanwhile): the turn began when the mod answered,
+    /// and the member stays at work until its next state. A compaction on its own says `done` at its end, before the
+    /// mod answers: nothing is held then, and nothing changes here.
+    fn settle_compactions(&mut self) {
+        for i in 0..self.panes.len() {
+            let pane = &self.panes[i];
+            if pane.held.is_none() || self.compacting(&pane.member, pane.since) {
+                continue;
+            }
+            let answered =
+                self.outcomes.get(&pane.member).zip(self.asked.get(&pane.member)).and_then(|(outcome, asked)| {
+                    (asked.id.as_deref() == Some(outcome.id.as_str()) && outcome.done).then_some(outcome.at)
+                });
+            if let Some((status, when)) = self.panes[i].held.take() {
+                note_status(&mut self.panes[i], &status);
+                let began = answered.and_then(|at| u64::try_from(at).ok()).filter(|at| *at > 0);
+                self.panes[i].since = Some(began.unwrap_or(when));
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Whether a member at rest since `since` may be asked to compact, and when: `None` when the rest is closed,
+    /// else the wait before it may be asked (zero: now). Not asked yet in this rest: now. Asked: closed once the
+    /// compaction is done; asked again, 5 minutes after, while a subagent or a teammate worked (as often as that
+    /// lasts, those refusals count for nothing); a request that got no answer (lapsed, its mod not running), failed or
+    /// was refused for another reason is asked once more, 5 minutes after, then the rest is closed. The answer to the
+    /// last request is waited for [`AUTO_PENDING`]: the rest stays open, and watched, until it is read.
+    fn renewal(&self, member: &str, since: u64) -> Option<Duration> {
+        let Some(asked) = self.asked.get(member).filter(|asked| asked.since == since) else {
+            return Some(Duration::ZERO);
+        };
+        let elapsed = asked.at.elapsed();
+        let again = AUTO_AGAIN.saturating_sub(elapsed);
+        let answer = asked.id.as_ref().and_then(|id| self.outcomes.get(member).filter(|outcome| outcome.id == *id));
+        let waiting = answer.is_none_or(|a| !a.done && a.skip.is_none() && a.error.is_none());
+        match answer {
+            Some(outcome) if outcome.done => None,
+            Some(outcome) if not_a_failure(outcome) => Some(again),
+            _ if waiting && elapsed < AUTO_PENDING => {
+                Some(if asked.failures == 0 { again } else { AUTO_PENDING - elapsed })
+            }
+            // Failed, refused, or unanswered: the one more try is left to the first of them.
+            _ => (asked.failures == 0).then_some(again),
+        }
+    }
+
+    /// Whether the request of `asked` was refused for a subagent or a teammate at work.
+    fn refused_for_helpers(&self, member: &str, asked: &Asked) -> bool {
+        let answer = asked.id.as_ref().and_then(|id| self.outcomes.get(member).filter(|outcome| outcome.id == *id));
+        answer.is_some_and(not_a_failure)
+    }
+
+    /// Asks the members that [`Server::compaction_due`] names: logged, the request written off the loop
+    /// ([`ask_compaction`]), its id told back to the loop.
+    fn auto_compaction(&mut self) {
+        self.settle_compactions();
+        for (member, percent, since) in self.plan_compaction(now()) {
+            let (state, tx) = (self.state.clone(), self.tx.clone());
+            let name = member.clone();
+            let spawned = std::thread::Builder::new()
+                .name("compaction".into())
+                .spawn(move || ask_compaction(&state, &tx, &name, percent, since));
+            if let Err(error) = spawned {
+                log(&format!("auto-compaction: {member}: {error}"));
+            }
+        }
+    }
+
+    /// What [`Server::auto_compaction`] decides as of `now` (seconds since the epoch): the members to ask, with the
+    /// context seen and the start of their rest, noted as asked (and logged); the next look due; the reports to read.
+    fn plan_compaction(&mut self, now: u64) -> Vec<(String, u8, u64)> {
+        if self.auto_compact.is_none() {
+            self.compaction = None;
+            self.asked.clear();
+            self.watched.lock().unwrap_or_else(PoisonError::into_inner).clear();
+            return Vec::new();
+        }
+        let (due, mut wait) = self.compaction_due(now);
+        // A compaction under way ends within [`COMPACTING`] at the latest: the `working` held back is told then.
+        for pane in self.panes.iter().filter(|pane| pane.held.is_some() && self.compacting(&pane.member, pane.since)) {
+            let left = self
+                .asked
+                .get(&pane.member)
+                .map_or(Duration::ZERO, |asked| COMPACTING.saturating_sub(asked.at.elapsed()));
+            wait = Some(wait.map_or(left, |wait| wait.min(left)));
+        }
+        self.compaction = wait.map(|wait| Instant::now() + wait);
+        for (member, percent, since) in &due {
+            let before = self.asked.get(member).filter(|asked| asked.since == *since);
+            let failures = before
+                .map_or(0, |asked| asked.failures.saturating_add(u8::from(!self.refused_for_helpers(member, asked))));
+            log(&format!(
+                "auto-compaction: {member} asked (after {failures} failed), context at {percent} %, at rest since {since}"
+            ));
+            let asked = Asked { since: *since, id: None, at: Instant::now(), ended: false, failures };
+            self.asked.insert(member.clone(), asked);
+        }
+        // The outcomes of the requests still open are the reports to read.
+        let open: Vec<String> = self
+            .asked
+            .iter()
+            .filter(|(member, asked)| {
+                self.looks.contains_key(*member)
+                    && (self.renewal(member, asked.since).is_some() || self.compacting(member, Some(asked.since)))
+            })
+            .map(|(member, _)| member.clone())
+            .collect();
+        let mut watched = self.watched.lock().unwrap_or_else(PoisonError::into_inner);
+        if *watched != open {
+            *watched = open;
+        }
+        due
     }
 
     /// The next frame, if one is due and the client can take it.
@@ -1978,6 +2795,8 @@ impl Server {
             since: since.map(|since| epoch.saturating_sub(since)),
             zoom: Some(if zoomed == Some(pane.id.as_str()) { chrome::Zoom::Out } else { chrome::Zoom::In }),
             hover,
+            // The text a list is open under stays lit.
+            open: self.list.as_ref().filter(|list| list.pane == pane.id).map(|list| list.part),
             ..base
         }
     }
@@ -2003,6 +2822,13 @@ impl Server {
     /// is broken.
     fn compose(&mut self) -> bool {
         let (width, height) = (self.size.0 as usize, self.size.1 as usize);
+        // The cards' times in their states tick.
+        let secs = now();
+        for (card, began) in self.cards.iter_mut().zip(&self.card_epoch) {
+            if let Some(began) = began {
+                card.since = secs.saturating_sub(*began);
+            }
+        }
         let held = self.gate.hold();
         let mut shown: Vec<&Pane> = self.shown_ids().into_iter().filter_map(|id| self.pane(&id)).collect();
         let zoomed = self.tabs.get(self.active).and_then(|tab| tab.zoomed.as_deref());
@@ -2030,9 +2856,22 @@ impl Server {
                     .as_ref()
                     .filter(|(selection, _)| selection.pane == pane.id)
                     .and_then(|(selection, _)| selection.range()),
+                // The menu's list draws its own frame.
+                bare: self.list.is_some() && self.menu.as_ref().is_some_and(|(menu, _)| *menu == pane.id),
             })
             .collect();
         common_forms(&mut views);
+        // The cards' frame, under the menu if it is open (the menu is the last view).
+        let glyphs = self.client.as_ref().map_or(Glyphs::Unicode, glyphs);
+        let card_clock = board::Clock { now: secs as i64, frame: look::frame(self.born.elapsed()), glyphs };
+        let panel = Panel { cards: &self.cards, wide: width >= layout::FOCUS_WIDE, clock: card_clock };
+        let title = cards::title();
+        if let Some(area) = self.cards_rect().filter(|_| !self.cards.is_empty()) {
+            let at = views.len() - usize::from(self.menu.is_some());
+            let header = chrome::Header { name: &title, hint: Some(cards::counts(&self.cards)), ..Default::default() };
+            let frame = View { id: CARDS, engine: &panel, area, header, focused: false, selection: None, bare: false };
+            views.insert(at, frame);
+        }
         let tabs: Vec<chrome::Tab<'_>> = self
             .tabs
             .iter()
@@ -2040,22 +2879,30 @@ impl Server {
             .map(|(i, tab)| {
                 let states = tab.panes.iter().filter_map(|id| self.pane(id)).map(|pane| pane_state(pane, &self.looks));
                 let zoomed = tab.zoomed.as_deref().and_then(|id| self.pane(id)).map(|pane| pane.member.as_str());
-                chrome::Tab { title: &tab.title, active: i == self.active, state: urgent(states), zoomed }
+                chrome::Tab {
+                    title: &tab.title,
+                    active: i == self.active,
+                    state: urgent(states),
+                    zoomed,
+                    switch: if i == self.active { self.switch(i) } else { None },
+                }
             })
             .collect();
         // The spinner turns while a member at work shows, in a header or a tab.
         let working = views.iter().map(|view| view.header.state).chain(tabs.iter().map(|tab| tab.state));
-        let working = working.into_iter().any(|state| state == look::State::Working);
-        let glyphs = self.client.as_ref().map_or(Glyphs::Unicode, glyphs);
+        let working = working.into_iter().any(|state| state == look::State::Working)
+            || views.iter().any(|view| view.id == CARDS)
+                && self.cards.iter().any(|card| card.state == look::State::Working);
         let bar = Rect { x: 0, y: height.saturating_sub(1), width, height: usize::from(height > 0) };
         let look = chrome::Look { glyphs, frame: look::frame(self.born.elapsed()) };
         let team = self.team.as_str();
         let screen = &self.screen;
         // Over the team, the rest dimmed: a choice, else the menu (the last view).
+        // A list under a header's text dims nothing: the team stays as it is around it.
         let over = match (&self.choice, &self.menu) {
             (Some(open), _) => screen::Over::Choice(&open.choice),
-            (None, Some(_)) => screen::Over::LastView,
-            (None, None) => screen::Over::Nothing,
+            (None, Some(_)) if self.list.is_none() => screen::Over::LastView,
+            _ => screen::Over::Nothing,
         };
         let hover = match &self.hover {
             Some(Hover::Bar(target)) => Some(*target),
@@ -2073,18 +2920,21 @@ impl Server {
             view.header.since.filter(|secs| *secs >= 60 || chrome::shows_since(&view.header, view.area.width))
         };
         let ticks = views.iter().filter_map(shows).map(|secs| tick(secs, epoch.subsec_nanos()));
+        // The cards' times change every second, the spinner aside.
+        let cards = self.cards.iter().filter(|_| views.iter().any(|view| view.id == CARDS));
+        let ticks = ticks.chain(cards.map(|card| tick(card.since, epoch.subsec_nanos())));
         let clock = if covered { None } else { ticks.min().map(|after| Instant::now() + after) };
-        let ids: Vec<String> = shown.iter().map(|pane| pane.id.clone()).collect();
+        let ids: Vec<String> = views.iter().map(|view| view.id.to_string()).collect();
         // The zones, or whether an engine is to blame.
         let zones = match composed {
             Ok(zones) => Ok(zones),
             Err(why) => {
                 // Which engine: each one asked alone what compose asks of it.
                 let mut found = false;
-                for (pane, view) in shown.iter().zip(&views) {
+                for (pane, view) in shown.iter().zip(views.iter().filter(|view| view.id != CARDS)) {
                     let mut alone = Canvas::new(width, height);
                     let replay = super::caught(|| {
-                        view.engine.draw(&mut alone, screen::content(view.area));
+                        view.engine.draw(&mut alone, view.inside());
                         (view.engine.cursor(), view.engine.scrolled(), view.engine.history())
                     });
                     if let Err(why) = replay {
@@ -2188,6 +3038,7 @@ impl Server {
         let mut back = None;
         if self.menu.as_ref().is_some_and(|(menu, _)| menu == id) {
             back = self.menu.take().and_then(|(_, before)| before);
+            self.list = None;
         }
         for tab in &mut self.tabs {
             tab.forget(id);
@@ -2428,7 +3279,8 @@ impl Server {
                 let spec = PaneSpec { member, role: String::new(), argv, env, cwd };
                 answer(self.open(spec, tab))
             }
-            Request::Build { team, dir, columns, tabs, cols, rows, exe, lang } => {
+            Request::Build { team, dir, columns, tabs, cols, rows, exe, lang, focus } => {
+                self.focus_layout = focus;
                 self.exe = Some(exe).filter(|exe| !exe.is_empty());
                 if !lang.is_empty() {
                     self.lang = lang;
@@ -2445,7 +3297,8 @@ impl Server {
                 answer(opened)
             }
             Request::Respawn { id, pane } => answer(self.respawn(&id, pane)),
-            Request::Arrange { tabs, columns } => {
+            Request::Arrange { tabs, columns, focus } => {
+                self.focus_layout = focus;
                 self.arrange(tabs, columns);
                 ok(serde_json::Value::Null)
             }
@@ -2549,6 +3402,13 @@ impl Server {
             let zoom = zooms.iter().find(|(title, id)| *title == tab.title && tab.panes.iter().any(|pane| pane == id));
             tab.zoomed = zoom.map(|(_, id)| id.to_string());
         }
+        // ⌥l and the places of a tab in « focus » stay with a tab of the same title.
+        for tab in &mut arranged {
+            if let Some(old) = self.tabs.iter_mut().find(|old| old.title == tab.title) {
+                tab.mode = old.mode;
+                tab.focus = old.focus.take();
+            }
+        }
         self.tabs = arranged;
         self.active = self.focus.as_deref().and_then(|id| self.tabs.iter().position(|tab| tab.has(id))).unwrap_or(0);
         self.layout();
@@ -2570,6 +3430,16 @@ impl Server {
     /// The team's menu (`recruit _menu`) in a pane floating over the team, on the client: `client`, else the one there
     /// is. A menu already open stays: one at a time.
     fn open_menu(&mut self, client: Option<&str>, sheet: Option<(&str, Option<MenuField>)>) -> Result<MenuOpened> {
+        self.open_menu_as(client, sheet, None)
+    }
+
+    /// [`Server::open_menu`], as a `list` under a header's text if given: `recruit _menu … --list`.
+    fn open_menu_as(
+        &mut self,
+        client: Option<&str>,
+        sheet: Option<(&str, Option<MenuField>)>,
+        list: Option<List>,
+    ) -> Result<MenuOpened> {
         let Some(attached) = self.client.as_ref().filter(|c| client.is_none_or(|id| c.id == id)) else {
             return Ok(MenuOpened::NoClient);
         };
@@ -2585,11 +3455,17 @@ impl Server {
         if glyphs(attached) == Glyphs::Nerd {
             argv.push("--nerd".into());
         }
+        if self.light {
+            argv.push("--light".into());
+        }
         if let Some((member, field)) = sheet {
             argv.extend(["--member".into(), member.to_string()]);
             if let Some(field) = field.and_then(MenuField::arg) {
                 argv.extend(["--field".into(), field.into()]);
             }
+        }
+        if list.is_some() {
+            argv.push("--list".into());
         }
         let cwd = self.welcome.lock().unwrap_or_else(PoisonError::into_inner).dir.clone();
         let cwd = if cwd.is_empty() { "/".to_string() } else { cwd };
@@ -2597,12 +3473,16 @@ impl Server {
         let id = self.spawn(spec)?;
         let before = self.focus.clone();
         self.menu = Some((id.clone(), before));
+        self.list = list;
         self.focus_on(&id);
         Ok(MenuOpened::Opened)
     }
 
     /// The menu's place: 100 × 28 inside its frame, as the mock-ups draw it, centered; less in a smaller screen.
     fn menu_area(&self) -> Rect {
+        if let Some(list) = &self.list {
+            return list_area(list.anchor, list.size, (self.size.0 as usize, (self.size.1 as usize).saturating_sub(1)));
+        }
         let (width, height) = (self.size.0 as usize, (self.size.1 as usize).saturating_sub(1));
         let fit = |wanted: usize, room: usize| wanted.min(room.saturating_sub(2)).max(1).min(room);
         let (w, h) = (fit(102, width), fit(30, height));
@@ -2990,6 +3870,7 @@ mod tests {
             rows: 24,
             exe: String::new(),
             lang: String::new(),
+            focus: false,
         };
         assert!(matches!(server.request(build), Reply::Ok(_)));
         server
@@ -3100,6 +3981,7 @@ mod tests {
                 header: server.header(pane, None, None, now()),
                 focused: false,
                 selection: None,
+                bare: false,
             })
             .collect();
         let width = views[0].area.width;
@@ -3203,6 +4085,7 @@ mod tests {
                 .map(|(title, names)| (title.to_string(), names.iter().map(|n| n.to_string()).collect()))
                 .collect(),
             columns: 3,
+            focus: false,
         };
         assert!(matches!(server.request(arrange(&[("1", &["dev-a", "dev-b"])])), Reply::Ok(_)));
         assert_eq!(server.tabs[0].zoomed.as_deref(), Some(a.as_str()));
@@ -3215,6 +4098,715 @@ mod tests {
         server.close_pane(&b);
         assert_eq!(server.tabs[0].zoomed, None);
         assert_eq!(server.shown_ids(), [a]);
+    }
+
+    #[test]
+    fn next_pane_keeps_the_zoom_and_zoom_gives_the_grid() {
+        let state = tempfile::tempdir().unwrap();
+        let panes = vec![sleeper("dev-a"), sleeper("dev-b"), sleeper("dev-c")];
+        let mut server =
+            built(state.path(), &["dev-a", "dev-b", "dev-c"], vec![TabSpec { title: "1".into(), panes, side: None }]);
+        let (a, b, c) = (id_of(&server, "dev-a"), id_of(&server, "dev-b"), id_of(&server, "dev-c"));
+        // The grid: the focus goes on, the grid stays.
+        server.focus_on(&a);
+        server.act(Action::NextPane);
+        assert_eq!((server.focus.as_deref(), server.tabs[0].zoomed.as_deref()), (Some(b.as_str()), None));
+        // Zoomed: the next member takes the room, the others hidden.
+        server.zoom(&b);
+        server.act(Action::NextPane);
+        assert_eq!((server.focus.as_deref(), server.tabs[0].zoomed.as_deref()), (Some(c.as_str()), Some(c.as_str())));
+        assert_eq!(server.shown_ids(), [c.as_str()]);
+        assert_eq!(server.pane(&c).unwrap().area, Rect { x: 0, y: 0, width: 80, height: 23 });
+        assert_eq!(server.pane(&b).unwrap().area, Rect::default());
+        // Round the tab, zoom kept.
+        server.act(Action::NextPane);
+        assert_eq!(server.tabs[0].zoomed.as_deref(), Some(a.as_str()));
+        // ⌥z gives the grid back, ⤡ too.
+        server.act(Action::Zoom);
+        assert_eq!(server.tabs[0].zoomed, None);
+        assert_eq!(server.focus.as_deref(), Some(a.as_str()));
+        server.zoom(&a);
+        server.part_click(&a, chrome::Part::Zoom);
+        assert_eq!(server.tabs[0].zoomed, None);
+        // A tab of one member: nothing to go to, the zoom stays.
+        let alone = vec![sleeper("dev-a")];
+        let state = tempfile::tempdir().unwrap();
+        let mut server = built(state.path(), &["dev-a"], vec![TabSpec { title: "1".into(), panes: alone, side: None }]);
+        let a = id_of(&server, "dev-a");
+        server.zoom(&a);
+        server.act(Action::NextPane);
+        assert_eq!(server.tabs[0].zoomed.as_deref(), Some(a.as_str()));
+    }
+
+    /// Two members at rest for `rested` seconds, context `context` %, the team compacting from 70 %.
+    fn resting(state: &Path, rested: u64, context: u8) -> Server {
+        let panes = vec![sleeper("dev-a"), sleeper("dev-b")];
+        let mut server = built(state, &["dev-a", "dev-b"], vec![TabSpec { title: "1".into(), panes, side: None }]);
+        server.auto_compact = Some(70);
+        server.auto_idle = 900;
+        for (i, name) in ["dev-a", "dev-b"].into_iter().enumerate() {
+            server.panes[i].state = Some(State::Idle);
+            server.panes[i].since = Some(now() - rested);
+            let look = board::MemberLook { context: Some(context), ..Default::default() };
+            server.looks.insert(name.into(), look);
+        }
+        server
+    }
+
+    fn due(server: &Server) -> Vec<String> {
+        server.compaction_due(now()).0.into_iter().map(|(member, _, _)| member).collect()
+    }
+
+    #[test]
+    fn a_member_at_rest_with_a_high_context_is_compacted_once_off_screen() {
+        let state = tempfile::tempdir().unwrap();
+        let mut server = resting(state.path(), 901, 71);
+        // No client attached: nothing on any screen.
+        assert_eq!(due(&server), ["dev-a", "dev-b"]);
+        let (_, wait) = server.compaction_due(now());
+        assert_eq!(wait, None);
+
+        // Not long enough: the wait is what is left of the shortest rest.
+        let short = resting(state.path(), 600, 71);
+        let (asked, wait) = short.compaction_due(now());
+        assert!(asked.is_empty());
+        assert!(wait.is_some_and(|wait| (298..=300).contains(&wait.as_secs())), "{wait:?}");
+
+        // The context below the share, the compaction off, a command running, not at rest: not asked.
+        assert!(due(&resting(state.path(), 901, 69)).is_empty());
+        let mut off = resting(state.path(), 901, 90);
+        off.auto_compact = None;
+        assert!(due(&off).is_empty());
+        let mut busy = resting(state.path(), 901, 90);
+        busy.looks.get_mut("dev-a").unwrap().shell = true;
+        assert_eq!(due(&busy), ["dev-b"]);
+        let state_path = state.path();
+        for state in [State::Working, State::Blocked, State::Error] {
+            let mut other = resting(state_path, 901, 90);
+            other.panes[0].state = Some(state);
+            assert_eq!(due(&other), ["dev-b"], "{state:?}");
+        }
+        let mut unknown = resting(state.path(), 901, 90);
+        unknown.looks.get_mut("dev-a").unwrap().context = None;
+        assert_eq!(due(&unknown), ["dev-b"]);
+
+        // On a client's screen: the tab shown, but the zoomed pane alone.
+        let _client = attached(&mut server);
+        assert!(due(&server).is_empty(), "the tab is shown");
+        let b = id_of(&server, "dev-b");
+        server.zoom(&b);
+        assert_eq!(due(&server), ["dev-a"], "a hidden pane of a zoomed tab");
+
+        // Asked: not again in this rest, but after a new turn.
+        server.plan_compaction(now());
+        assert!(due(&server).is_empty());
+        assert_eq!(server.asked.get("dev-a").map(|asked| Some(asked.since)), Some(server.panes[0].since));
+        server.panes[0].since = Some(now() - 1000);
+        assert_eq!(due(&server), ["dev-a"], "a new rest");
+    }
+
+    fn outcome(id: &str, done: bool, skip: Option<&str>, error: Option<&str>) -> bridge::Compaction {
+        bridge::Compaction {
+            id: id.into(),
+            done,
+            skip: skip.map(String::from),
+            error: error.map(String::from),
+            auto: true,
+            ..Default::default()
+        }
+    }
+
+    /// `dev-a` asked `ago` seconds back, after `failures` requests that failed, its id (7) written.
+    fn asked_ago(server: &mut Server, ago: u64, failures: u8) -> u64 {
+        let since = server.panes[0].since.unwrap();
+        let at = Instant::now() - Duration::from_secs(ago);
+        server.asked.insert("dev-a".into(), Asked { since, id: Some("7".into()), at, ended: false, failures });
+        since
+    }
+
+    fn within(left: Option<Duration>, low: u64, high: u64) -> bool {
+        left.is_some_and(|left| (low..=high).contains(&left.as_secs()))
+    }
+
+    #[test]
+    fn a_request_refused_or_unanswered_is_asked_again_later() {
+        let state = tempfile::tempdir().unwrap();
+        let mut server = resting(state.path(), 1000, 80);
+        let since = server.panes[0].since.unwrap();
+        let answer = |server: &mut Server, answer: Option<bridge::Compaction>| {
+            server.outcomes.clear();
+            if let Some(answer) = answer {
+                server.outcomes.insert("dev-a".into(), answer);
+            }
+        };
+
+        // Not asked: now.
+        assert_eq!(server.renewal("dev-a", since), Some(Duration::ZERO));
+        // Done: the rest is closed, whenever.
+        asked_ago(&mut server, 400, 0);
+        answer(&mut server, Some(outcome("7", true, None, None)));
+        assert_eq!(server.renewal("dev-a", since), None);
+        // A subagent or a teammate at work: again 5 minutes after, as long as it lasts, failures or not.
+        answer(&mut server, Some(outcome("7", false, Some(bridge::SKIP_HELPERS), None)));
+        for (failures, skip) in [(0, bridge::SKIP_HELPERS), (1, bridge::SKIP_BUSY), (200, bridge::SKIP_HELPERS)] {
+            answer(&mut server, Some(outcome("7", false, Some(skip), None)));
+            asked_ago(&mut server, 100, failures);
+            assert!(within(server.renewal("dev-a", since), 199, 200), "{failures}");
+            assert!(!due(&server).contains(&"dev-a".to_string()));
+            assert!(server.compaction_due(now()).1.is_some_and(|wait| wait.as_secs() <= 200));
+            asked_ago(&mut server, 301, failures);
+            assert_eq!(server.renewal("dev-a", since), Some(Duration::ZERO), "{failures}");
+        }
+        assert_eq!(due(&server), ["dev-a", "dev-b"]);
+        // No answer yet, or in progress, for a little while: the rest stays open, and the one more try waits.
+        for pending in [None, Some(outcome("7", false, None, None))] {
+            answer(&mut server, pending);
+            asked_ago(&mut server, 10, 0);
+            assert!(within(server.renewal("dev-a", since), 289, 290));
+            asked_ago(&mut server, 10, 1);
+            assert!(within(server.renewal("dev-a", since), 19, 20), "open, watched, not asked");
+            assert!(!due(&server).contains(&"dev-a".to_string()));
+        }
+        // No answer for its id (lapsed; the answer is an older one's), an error, another skip: once more, then closed.
+        for said in [
+            None,
+            Some(outcome("6", true, None, None)),
+            Some(outcome("7", false, None, Some("x"))),
+            Some(outcome("7", false, Some("precompact"), None)),
+        ] {
+            answer(&mut server, said);
+            asked_ago(&mut server, 100, 0);
+            assert!(server.renewal("dev-a", since).is_some_and(|left| left > Duration::ZERO));
+            asked_ago(&mut server, 301, 0);
+            assert_eq!(server.renewal("dev-a", since), Some(Duration::ZERO));
+            asked_ago(&mut server, 301, 1);
+            assert_eq!(server.renewal("dev-a", since), None);
+        }
+        // A new rest starts afresh.
+        server.panes[0].since = Some(now() - 950);
+        assert_eq!(due(&server), ["dev-a", "dev-b"]);
+    }
+
+    #[test]
+    fn a_state_a_program_tells_makes_the_compaction_look_again() {
+        let state = tempfile::tempdir().unwrap();
+        let mut server = resting(state.path(), 10, 80);
+        server.look_again = false;
+        // Nothing to take: nothing to look at again.
+        server.take_relays();
+        assert!(!server.look_again);
+        // Its state, as `frame` takes it (even with no client): the next turn of the loop looks.
+        let mut replies = Vec::new();
+        server.panes[0]
+            .with(|engine| engine.feed(b"\x1b]7501;?\x1b\\\x1b]7501;state=idle:app=claude-code\x1b\\", &mut replies));
+        server.take_relays();
+        assert!(server.look_again);
+        assert!(server.panes[0].since.is_some());
+    }
+
+    /// Feeds pane 0's program the statuses `says` (`working`, `idle`…), as it would write them, and takes them.
+    fn tells(server: &mut Server, says: &[&str]) {
+        let mut replies = Vec::new();
+        for state in says {
+            let osc = format!("\x1b]7501;state={state}:app=claude-code\x1b\\");
+            server.panes[0].with(|engine| engine.feed(osc.as_bytes(), &mut replies));
+            server.take_relays();
+        }
+    }
+
+    /// A tab of `names` in « focus » on an 80 × 24 screen, a client attached.
+    fn focused(state: &Path, names: &[&str]) -> (Server, UnixStream) {
+        let panes = names.iter().map(|name| sleeper(name)).collect();
+        let mut server = built(state, names, vec![TabSpec { title: "1".into(), panes, side: None }]);
+        let client = attached(&mut server);
+        server.focus_layout = true;
+        server.layout();
+        (server, client)
+    }
+
+    fn places(server: &Server) -> Places {
+        server.tabs[0].focus.as_ref().expect("in focus").places().clone()
+    }
+
+    #[test]
+    fn a_tab_in_focus_has_the_active_member_on_the_left_and_the_best_placed_on_the_right() {
+        let state = tempfile::tempdir().unwrap();
+        let (mut server, _client) = focused(state.path(), &["dev-a", "dev-b", "dev-c", "dev-d"]);
+        let id = |server: &Server, name: &str| id_of(server, name);
+        let (a, b, c, d) = (id(&server, "dev-a"), id(&server, "dev-b"), id(&server, "dev-c"), id(&server, "dev-d"));
+        // 80 × 23: two panes on the right; the active one (the first) on the left; a card for the last.
+        let at = places(&server);
+        assert_eq!(at.left.as_deref(), Some(a.as_str()));
+        assert_eq!(at.right.len(), 2);
+        assert_eq!(at.others.len(), 1);
+        assert_eq!(server.shown_ids().len(), 3);
+        let area = |server: &Server, id: &str| server.pane(id).unwrap().area;
+        let left = area(&server, &a);
+        assert!(left.x == 0 && left.height == 23 && left.width < 80);
+        for id in &at.right {
+            let right = area(&server, id);
+            assert!(right.x == left.width && right.x + right.width == 80, "{right:?}");
+        }
+        assert_eq!(area(&server, &at.others[0]), Rect::default(), "a card is hidden");
+        assert!(server.compose());
+
+        // The focus on a card: it comes to the left.
+        let card = at.others[0].clone();
+        server.focus_on(&card);
+        assert_eq!(places(&server).left.as_deref(), Some(card.as_str()));
+        assert!(server.shown_ids().contains(&card));
+        // The focus on a pane on the right: only the focus, the left stays.
+        let right = places(&server).right[0].clone();
+        server.focus_on(&right);
+        assert_eq!(server.focus.as_deref(), Some(right.as_str()));
+        assert_eq!(places(&server).left.as_deref(), Some(card.as_str()));
+
+        // ⌥n: the next member of the tab, in reading order, to the left, with the focus.
+        server.tabs[0].focus = None;
+        server.focus_on(&a);
+        server.layout();
+        assert_eq!(places(&server).left.as_deref(), Some(a.as_str()));
+        server.act(Action::NextPane);
+        assert_eq!((places(&server).left.as_deref(), server.focus.as_deref()), (Some(b.as_str()), Some(b.as_str())));
+        server.act(Action::NextPane);
+        assert_eq!(places(&server).left.as_deref(), Some(c.as_str()));
+        assert_eq!(server.focus.as_deref(), Some(c.as_str()));
+        assert!(server.shown_ids().len() == 3 && server.shown_ids().contains(&c));
+        let _ = d;
+
+        // ⌥l: the grid for this tab, and back; zoom keeps its way.
+        server.act(Action::ToggleLayout);
+        assert!(server.tabs[0].focus.is_none());
+        assert_eq!(server.shown_ids().len(), 4);
+        server.act(Action::ToggleLayout);
+        assert!(server.tabs[0].focus.is_some());
+        assert_eq!(places(&server).left.as_deref(), Some(c.as_str()), "the active one on the left again");
+        let zoomed = c.clone();
+        server.zoom(&zoomed);
+        assert_eq!(server.shown_ids(), std::slice::from_ref(&c));
+        server.zoom(&zoomed);
+        // The client leaves: the choice of ⌥l goes with it.
+        server.act(Action::ToggleLayout);
+        assert!(server.tabs[0].focus.is_none());
+        let _ = server.drop_client(None);
+        assert!(server.tabs[0].mode.is_none() && server.tabs[0].focus.is_some());
+
+        // A screen too narrow for it: the grid.
+        let _client = attached(&mut server);
+        server.resize((70, 24));
+        assert!(server.tabs[0].focus.is_none());
+        assert_eq!(server.shown_ids().len(), 4);
+        server.resize((100, 30));
+        assert!(server.tabs[0].focus.is_some());
+        // The team in its grid: ⌥l asks for the focus.
+        server.focus_layout = false;
+        server.layout();
+        assert!(server.tabs[0].focus.is_none());
+        server.act(Action::ToggleLayout);
+        assert!(server.tabs[0].focus.is_some());
+    }
+
+    #[test]
+    fn the_members_left_out_are_cards_that_a_click_brings_to_the_left() {
+        let state = tempfile::tempdir().unwrap();
+        let names = ["dev-a", "dev-b", "dev-c", "dev-d", "dev-e"];
+        let (mut server, _client) = focused(state.path(), &names);
+        let at = places(&server);
+        assert_eq!((at.right.len(), at.others.len()), (2, 2));
+        // The same room for the panes and the cards: every member is a pane shown or a card, none lost, none twice.
+        let rect = server.cards_rect().expect("a frame for the cards");
+        let mut seen: Vec<String> = server.shown_ids();
+        seen.extend(server.card_ids.clone());
+        seen.sort();
+        let mut all: Vec<String> = names.iter().map(|name| id_of(&server, name)).collect();
+        all.sort();
+        assert_eq!(seen, all);
+        let (width, height) = server.tab_room();
+        assert!(rect.x + rect.width <= width && rect.y + rect.height <= height, "{rect:?}");
+        for id in server.shown_ids() {
+            let pane = server.pane(&id).unwrap().area;
+            assert!(pane.x + pane.width <= width && pane.y + pane.height <= height);
+            let apart =
+                pane.x + pane.width <= rect.x || rect.x + rect.width <= pane.x || pane.y + pane.height <= rect.y;
+            assert!(apart, "{pane:?} over the cards {rect:?}");
+        }
+        // Drawn: the frame titled, the names of the cards.
+        assert!(server.compose());
+        let rows: Vec<String> = (0..height).map(|y| server.screen.borrow().canvas().row(y)).collect();
+        let text = rows.join("\n");
+        assert!(text.contains(&cards::title()), "{text}");
+        // Two by two in this narrow screen, the names cut to what holds: the cards' capsules are there.
+        assert_eq!(text.matches('\u{2577}').count() + text.matches('\u{257B}').count(), 2, "{text}");
+        // A card that begins to wait gives no notice: it is in view, red.
+        let waiting = server.cards[0].name.clone();
+        let looks = BTreeMap::from([(
+            waiting,
+            board::MemberLook { state: Some(look::State::Waiting), since: Some(now() as i64), ..Default::default() },
+        )]);
+        server.message(Msg::Looks(looks));
+        assert!(server.notice.is_none());
+        server.refresh_cards();
+        assert_eq!(server.cards.iter().filter(|card| card.state == look::State::Waiting).count(), 1, "red");
+        // A click on a card brings its member to the left, the left one takes a place on the right.
+        let wide = width >= layout::FOCUS_WIDE;
+        let placed = cards::place(chrome::inside(rect), &server.cards, wide);
+        let (index, card) = placed.shown[0];
+        let member = server.card_ids[index].clone();
+        let left = at.left.clone().unwrap();
+        let (col, row) = (card.x as u16 + 1, card.y as u16);
+        server.mouse(&Mouse { kind: MouseKind::Down(Button::Left), col, row, mods: Mods::NONE });
+        server.mouse(&Mouse { kind: MouseKind::Up(Button::Left), col, row, mods: Mods::NONE });
+        assert_eq!(places(&server).left.as_deref(), Some(member.as_str()));
+        assert_eq!(server.focus.as_deref(), Some(member.as_str()));
+        assert!(places(&server).right.contains(&left) || places(&server).others.contains(&left));
+        assert_eq!(server.card_ids.len(), 2, "the cards made again");
+        // A press in the frame but on no card: nothing, and nothing leaks to a pane.
+        let before = places(&server);
+        let corner = (rect.x as u16, rect.y as u16);
+        server.mouse(&Mouse { kind: MouseKind::Down(Button::Left), col: corner.0, row: corner.1, mods: Mods::NONE });
+        assert_eq!(places(&server), before);
+        // Zoomed or in the grid: no cards.
+        server.act(Action::ToggleLayout);
+        assert!(server.cards_rect().is_none());
+    }
+
+    #[test]
+    fn the_bars_layout_button_follows_the_tab_and_toggles_it() {
+        let state = tempfile::tempdir().unwrap();
+        let (mut server, _client) = focused(state.path(), &["dev-a", "dev-b", "dev-c"]);
+        assert_eq!(server.switch(0), Some(chrome::Switch::ToGrid));
+        let button = |server: &mut Server| {
+            assert!(server.compose());
+            server.zones.iter().find(|(_, target)| *target == Target::Layout).map(|(zone, _)| *zone)
+        };
+        let at = button(&mut server).expect("the button is drawn");
+        let click = |server: &mut Server, at: Rect| {
+            let (col, row) = (at.x as u16 + 1, at.y as u16);
+            server.mouse(&Mouse { kind: MouseKind::Down(Button::Left), col, row, mods: Mods::NONE });
+            server.mouse(&Mouse { kind: MouseKind::Up(Button::Left), col, row, mods: Mods::NONE });
+        };
+        click(&mut server, at);
+        assert!(server.tabs[0].focus.is_none());
+        assert_eq!(server.switch(0), Some(chrome::Switch::ToFocus));
+        let at = button(&mut server).expect("the button, the other way");
+        click(&mut server, at);
+        assert!(server.tabs[0].focus.is_some());
+        // A screen too small for it: no button.
+        server.resize((70, 24));
+        assert_eq!(server.switch(0), None);
+        assert!(button(&mut server).is_none());
+    }
+
+    #[test]
+    fn a_double_click_on_the_header_of_a_pane_on_the_right_brings_it_to_the_left() {
+        let state = tempfile::tempdir().unwrap();
+        let (mut server, _client) = focused(state.path(), &["dev-a", "dev-b", "dev-c"]);
+        let left = places(&server).left.clone().unwrap();
+        let right = places(&server).right[0].clone();
+        assert!(server.compose());
+        let area = server.pane(&right).unwrap().area;
+        // On the border row, off the header's parts.
+        let at = (area.x + area.width - 1, area.y);
+        let click = |server: &mut Server| {
+            let (col, row) = (at.0 as u16, at.1 as u16);
+            server.mouse(&Mouse { kind: MouseKind::Down(Button::Left), col, row, mods: Mods::NONE });
+            server.mouse(&Mouse { kind: MouseKind::Up(Button::Left), col, row, mods: Mods::NONE });
+        };
+        // One press: the focus, and the left stays.
+        click(&mut server);
+        assert_eq!(
+            (server.focus.as_deref(), places(&server).left.as_deref()),
+            (Some(right.as_str()), Some(left.as_str()))
+        );
+        // Two: it is the left, the other takes its place.
+        click(&mut server);
+        assert_eq!(places(&server).left.as_deref(), Some(right.as_str()));
+        assert!(places(&server).right.contains(&left));
+        assert_eq!(server.focus.as_deref(), Some(right.as_str()));
+        // Apart in time: two single presses.
+        let other = places(&server).right[0].clone();
+        server.header_click = None;
+        let area = server.pane(&other).unwrap().area;
+        let (col, row) = ((area.x + area.width - 1) as u16, area.y as u16);
+        server.mouse(&Mouse { kind: MouseKind::Down(Button::Left), col, row, mods: Mods::NONE });
+        server.header_click.as_mut().unwrap().0 -= DOUBLE_CLICK;
+        server.mouse(&Mouse { kind: MouseKind::Down(Button::Left), col, row, mods: Mods::NONE });
+        assert_eq!(places(&server).left.as_deref(), Some(right.as_str()));
+    }
+
+    #[test]
+    fn nothing_moves_in_a_tab_in_focus_under_the_pointer_or_after_a_key_or_a_click() {
+        let state = tempfile::tempdir().unwrap();
+        let (mut server, _client) = focused(state.path(), &["dev-a", "dev-b", "dev-c", "dev-d"]);
+        let before = places(&server);
+        let epoch = now() as i64;
+        let tick = Instant::now();
+        assert!(!server.holding(tick).0);
+        // The pointer: held only over a pane on the right, and for five seconds after it moved.
+        let right = server.pane(&before.right[0]).unwrap().area;
+        let left = server.pane(before.left.as_ref().unwrap()).unwrap().area;
+        server.pointer = Some((right.x + 2, right.y + 1));
+        server.pointer_at = Some(tick);
+        let (held, end) = server.holding(tick);
+        assert!(held && end.is_some_and(|end| end > tick + Duration::from_secs(4)));
+        server.pointer_at = Some(tick - Duration::from_secs(6));
+        assert!(!server.holding(tick).0, "it has not moved for a while");
+        server.pointer_at = Some(tick);
+        server.pointer = Some((left.x + 2, left.y + 1));
+        assert!(!server.holding(tick).0, "over the left pane, the places may move");
+        server.pointer = Some((5, 23));
+        assert!(!server.holding(tick).0, "on the bar too");
+        // A key, a click: a second.
+        server.pointer = None;
+        server.last_key = Some(tick);
+        let (held, end) = server.holding(tick);
+        assert!(held && end.is_some_and(|end| end > tick && end <= tick + Duration::from_secs(1)));
+        server.last_key = Some(tick - Duration::from_secs(2));
+        server.last_click = Some(tick);
+        assert!(server.holding(tick).0);
+        server.last_click = None;
+        server.last_key = None;
+        // A member that waits or failed goes past the pane's minute: it comes in as soon as nothing holds the tab. One
+        // at work respects it: the server wakes for the end of the minute.
+        let d = id_of(&server, "dev-d");
+        let look = |state, since| board::MemberLook { state: Some(state), since: Some(since), ..Default::default() };
+        server.looks.insert("dev-d".into(), look(look::State::Waiting, epoch));
+        server.last_key = Some(Instant::now());
+        server.update_focus();
+        assert_eq!(places(&server), before, "held");
+        assert!(server.focus_wake.is_some(), "woken when the hold ends");
+        server.last_key = None;
+        server.update_focus();
+        assert!(places(&server).right.contains(&d), "{:?}", places(&server));
+        assert!(server.shown_ids().contains(&d));
+        assert!(server.focus_wake.is_none(), "nothing more is due");
+
+        // At work: held, then the minute of the pane it would replace.
+        let (mut server, _client) = focused(state.path(), &["dev-a", "dev-b", "dev-c", "dev-d"]);
+        let d = id_of(&server, "dev-d");
+        // Two minutes at work already: its own 30 seconds are past.
+        server.looks.insert("dev-d".into(), look(look::State::Working, epoch - 120));
+        server.last_key = Some(Instant::now());
+        server.update_focus();
+        assert_eq!(places(&server), before, "held");
+        server.last_key = None;
+        server.update_focus();
+        assert_eq!(places(&server), before, "the minute is not over");
+        let wake = server.focus_wake.expect("a place comes due");
+        let left = wake.saturating_duration_since(Instant::now()).as_secs();
+        assert!((55..=60).contains(&left), "{left}");
+        // A minute later its turn has come: it is on the right.
+        let later = Instant::now() + focus::STAY_AT_LEAST + Duration::from_secs(1);
+        let seen = server.focus_seen(0, later);
+        let focus = server.tabs[0].focus.as_mut().unwrap();
+        assert!(focus.update(&seen, 2, later, false));
+        assert!(focus.places().right.contains(&d), "{:?}", focus.places());
+        // The pane with the focus is never lost: dropped to a card, it comes back to the left.
+        assert!(server.shown_ids().contains(server.focus.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn a_client_with_another_theme_has_the_whole_screen_drawn_again() {
+        let state = tempfile::tempdir().unwrap();
+        let (mut server, _client) = focused(state.path(), &["dev-a", "dev-b"]);
+        assert!(server.compose());
+        assert_eq!(server.screen.borrow().canvas().width(), 80);
+        // The same theme as the client before: the cells kept are good.
+        assert!(!server.theme(false));
+        assert_eq!(server.screen.borrow().canvas().width(), 80);
+        // Another: the next frame is drawn whole.
+        server.dirty = false;
+        assert!(server.theme(true) && server.light);
+        assert!(server.dirty);
+        assert!(server.compose());
+        assert_eq!(server.screen.borrow().canvas().width(), 80);
+        assert!(!server.theme(true));
+        assert!(server.theme(false) && !server.light);
+        // A background that says light: luminance over a half.
+        assert!(look::light_background((250, 250, 250)) && !look::light_background((40, 44, 52)));
+    }
+
+    #[test]
+    fn a_member_compacting_on_its_own_stays_at_rest() {
+        let state = tempfile::tempdir().unwrap();
+        let mut server = resting(state.path(), 1000, 80);
+        server.auto_idle = 0;
+        let mut replies = Vec::new();
+        server.panes[0].with(|engine| engine.feed(b"\x1b]7501;?\x1b\\", &mut replies));
+        tells(&mut server, &["idle"]);
+        let since = server.panes[0].since.unwrap();
+        let shown = |server: &Server| server.header(&server.panes[0], None, None, now()).state;
+        // dev-a is asked; the writer tells the id back.
+        let planned = server.plan_compaction(now());
+        assert!(planned.iter().any(|(member, _, _)| member == "dev-a"));
+        server.message(Msg::Requested("dev-a".into(), since, Ok("c1".into())));
+        assert!(server.compacting("dev-a", Some(since)));
+
+        // Claude Code says `working` for the compaction: nothing changes on the screen, nor the time in the state.
+        tells(&mut server, &["working"]);
+        assert_eq!((shown(&server), server.panes[0].since), (look::State::Idle, Some(since)));
+        assert_eq!(server.panes[0].state, Some(State::Idle));
+        assert!(server.panes[0].held.is_some());
+        assert_eq!(server.counts(), chrome::Hint::Counts { working: 0, waiting: 0, error: 0, idle: 2 });
+        // The dashboard reads the panes: at rest, since the same time.
+        let Reply::Ok(list) = server.answer(Request::Panes) else { panic!("panes") };
+        let list: Vec<PaneInfo> = serde_json::from_value(list).unwrap();
+        let info = list.iter().find(|info| info.member == "dev-a").unwrap();
+        assert_eq!((info.status.as_deref(), info.since), (Some("idle"), Some(since)));
+        // Its end: the state of the last turn again; the compaction is over, a `working` is a turn's.
+        tells(&mut server, &["idle"]);
+        assert!(server.panes[0].held.is_none() && server.asked["dev-a"].ended);
+        assert!(!server.compacting("dev-a", Some(since)));
+        assert_eq!((shown(&server), server.panes[0].since), (look::State::Idle, Some(since)));
+        tells(&mut server, &["working"]);
+        assert_eq!(shown(&server), look::State::Working);
+
+        // Made (`done`), the program said no other state (a message received meanwhile: its turn queued behind the
+        // compaction begins right after it): the `working` held is that turn's, since the mod's answer.
+        let mut server = resting(state.path(), 1000, 80);
+        server.auto_idle = 0;
+        server.panes[0].with(|engine| engine.feed(b"\x1b]7501;?\x1b\\", &mut replies));
+        tells(&mut server, &["idle"]);
+        let since = server.panes[0].since.unwrap();
+        server.plan_compaction(now());
+        server.message(Msg::Requested("dev-a".into(), since, Ok("c2".into())));
+        tells(&mut server, &["working"]);
+        assert_eq!((shown(&server), server.panes[0].since), (look::State::Idle, Some(since)));
+        let answered = now() as i64 + 3;
+        let done = bridge::Compaction { done: true, at: answered, ..outcome("c2", true, None, None) };
+        server.message(Msg::Outcomes(BTreeMap::from([("dev-a".to_string(), done)])));
+        server.settle_compactions();
+        assert!(server.panes[0].held.is_none());
+        assert_eq!((shown(&server), server.panes[0].since), (look::State::Working, Some(answered as u64)));
+        // It stays at work until the program says the end of the turn.
+        server.settle_compactions();
+        assert_eq!(shown(&server), look::State::Working);
+        tells(&mut server, &["idle"]);
+        assert_eq!(shown(&server), look::State::Idle);
+
+        // A compaction on its own: `done` at its end, before the mod answers: the answer changes nothing.
+        let mut server = resting(state.path(), 1000, 80);
+        server.auto_idle = 0;
+        server.panes[0].with(|engine| engine.feed(b"\x1b]7501;?\x1b\\", &mut replies));
+        tells(&mut server, &["idle"]);
+        let since = server.panes[0].since.unwrap();
+        server.plan_compaction(now());
+        server.message(Msg::Requested("dev-a".into(), since, Ok("c5".into())));
+        tells(&mut server, &["working", "idle"]);
+        assert_eq!((shown(&server), server.panes[0].since), (look::State::Idle, Some(since)));
+        let done = bridge::Compaction { done: true, at: now() as i64 + 2, ..outcome("c5", true, None, None) };
+        server.message(Msg::Outcomes(BTreeMap::from([("dev-a".to_string(), done)])));
+        server.settle_compactions();
+        assert_eq!((shown(&server), server.panes[0].since), (look::State::Idle, Some(since)));
+
+        // Refused (a helper at work, or an error): not compacting after all, the `working` told since it began.
+        for answer in [outcome("c3", false, Some(bridge::SKIP_HELPERS), None), outcome("c3", false, None, Some("x"))] {
+            let mut server = resting(state.path(), 1000, 80);
+            server.auto_idle = 0;
+            server.panes[0].with(|engine| engine.feed(b"\x1b]7501;?\x1b\\", &mut replies));
+            tells(&mut server, &["idle"]);
+            let since = server.panes[0].since.unwrap();
+            server.plan_compaction(now());
+            server.message(Msg::Requested("dev-a".into(), since, Ok("c3".into())));
+            tells(&mut server, &["working"]);
+            let began = server.panes[0].held.as_ref().map(|(_, when)| *when).unwrap();
+            assert_eq!(shown(&server), look::State::Idle, "held while the answer is waited for");
+            server.message(Msg::Outcomes(BTreeMap::from([("dev-a".to_string(), answer)])));
+            server.settle_compactions();
+            assert_eq!((shown(&server), server.panes[0].since), (look::State::Working, Some(began)));
+        }
+
+        // No answer in time: the same.
+        let mut server = resting(state.path(), 1000, 80);
+        server.auto_idle = 0;
+        server.panes[0].with(|engine| engine.feed(b"\x1b]7501;?\x1b\\", &mut replies));
+        tells(&mut server, &["idle"]);
+        let since = server.panes[0].since.unwrap();
+        server.plan_compaction(now());
+        server.message(Msg::Requested("dev-a".into(), since, Ok("c4".into())));
+        tells(&mut server, &["working"]);
+        server.settle_compactions();
+        assert_eq!(shown(&server), look::State::Idle);
+        server.asked.get_mut("dev-a").unwrap().at = Instant::now() - COMPACTING;
+        server.settle_compactions();
+        assert_eq!(shown(&server), look::State::Working);
+        // A member never asked: its `working` is a turn at once.
+        let mut other = resting(state.path(), 1000, 80);
+        other.panes[0].with(|engine| engine.feed(b"\x1b]7501;?\x1b\\", &mut replies));
+        tells(&mut other, &["idle", "working"]);
+        assert_eq!(other.header(&other.panes[0], None, None, now()).state, look::State::Working);
+    }
+
+    #[test]
+    fn a_member_is_asked_every_five_minutes_while_helpers_work_and_twice_otherwise() {
+        let state = tempfile::tempdir().unwrap();
+        let mut server = resting(state.path(), 1000, 80);
+        let asked_now = |server: &mut Server| {
+            let planned = server.plan_compaction(now());
+            planned.into_iter().map(|(member, _, _)| member).filter(|member| member == "dev-a").count()
+        };
+        let watched = |server: &Server| server.watched.lock().unwrap().contains(&"dev-a".to_string());
+        let write = |server: &mut Server, id: &str| {
+            let since = server.asked["dev-a"].since;
+            server.message(Msg::Requested("dev-a".into(), since, Ok(id.into())));
+        };
+        let wait_again = |server: &mut Server| server.asked.get_mut("dev-a").unwrap().at = Instant::now() - AUTO_AGAIN;
+
+        assert_eq!(asked_now(&mut server), 1);
+        assert_eq!(server.asked["dev-a"].failures, 0);
+        assert!(watched(&server));
+        assert_eq!(asked_now(&mut server), 0, "not twice in a row");
+        assert!(server.compaction.is_some());
+        // Three refusals for a subagent or a teammate in a row: asked each time, none counts, always watched.
+        for round in 0..3 {
+            let id = format!("h{round}");
+            write(&mut server, &id);
+            assert_eq!(server.asked["dev-a"].id.as_deref(), Some(id.as_str()));
+            let refused =
+                BTreeMap::from([("dev-a".to_string(), outcome(&id, false, Some(bridge::SKIP_HELPERS), None))]);
+            server.message(Msg::Outcomes(refused));
+            assert!(watched(&server), "round {round}");
+            assert_eq!(asked_now(&mut server), 0, "5 minutes not passed");
+            wait_again(&mut server);
+            assert_eq!(asked_now(&mut server), 1, "round {round}");
+            assert_eq!(server.asked["dev-a"].failures, 0, "round {round}");
+            assert!(watched(&server), "the new request is waited for");
+        }
+        // Then it goes unanswered: once more 5 minutes after, then closed and no longer watched.
+        write(&mut server, "u1");
+        server.asked.get_mut("dev-a").unwrap().at = Instant::now() - AUTO_PENDING;
+        assert_eq!(asked_now(&mut server), 0, "5 minutes not passed");
+        wait_again(&mut server);
+        assert_eq!(asked_now(&mut server), 1);
+        assert_eq!(server.asked["dev-a"].failures, 1);
+        // The last request is waited for, watched and not asked, while its answer may come.
+        assert!(watched(&server));
+        assert_eq!(asked_now(&mut server), 0);
+        write(&mut server, "u2");
+        server.asked.get_mut("dev-a").unwrap().at = Instant::now() - AUTO_AGAIN;
+        assert_eq!(asked_now(&mut server), 0, "closed");
+        assert!(!watched(&server));
+        // A stale writer's id (another rest) is not kept.
+        let since = server.asked["dev-a"].since;
+        server.message(Msg::Requested("dev-a".into(), since - 1, Ok("old".into())));
+        assert_eq!(server.asked["dev-a"].id.as_deref(), Some("u2"));
+        // The compaction off: nothing asked nor watched.
+        server.auto_compact = None;
+        assert_eq!(asked_now(&mut server), 0);
+        assert!(server.watched.lock().unwrap().is_empty());
+        assert!(server.asked.is_empty());
+    }
+
+    #[test]
+    fn an_automatic_compaction_is_requested_in_the_state_folder() {
+        let state = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        ask_compaction(state.path(), &tx, "dev-a", 75, 1234);
+        let request: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(state.path().join("compact/dev-a")).unwrap()).unwrap();
+        assert_eq!((request["auto"].as_bool(), request["percent"].as_u64()), (Some(true), Some(75)));
+        let Ok(Msg::Requested(member, since, Ok(id))) = rx.try_recv() else { panic!("the id comes back") };
+        assert_eq!((member.as_str(), since, request["id"].as_str()), ("dev-a", 1234, Some(id.as_str())));
     }
 
     #[test]
@@ -3571,6 +5163,134 @@ mod tests {
     }
 
     #[test]
+    fn a_list_goes_under_its_text_within_the_screen() {
+        let screen = (80, 23);
+        let text = |x, y| Rect { x, y, width: 6, height: 1 };
+        // Under the text, its content aligned on it (the frame one column to the left).
+        assert_eq!(list_area(text(10, 0), (26, 8), screen), Rect { x: 6, y: 1, width: 26, height: 8 });
+        // Too far right: moved left just enough to end at the edge.
+        assert_eq!(list_area(text(70, 0), (26, 8), screen), Rect { x: 54, y: 1, width: 26, height: 8 });
+        // No room below: above the text, its bottom edge on the row over it.
+        assert_eq!(list_area(text(10, 20), (26, 8), screen), Rect { x: 6, y: 12, width: 26, height: 8 });
+        // Room neither below nor above: the larger side, cut to it. Never out of the screen.
+        assert_eq!(list_area(text(10, 11), (26, 40), screen), Rect { x: 6, y: 12, width: 26, height: 11 });
+        assert_eq!(list_area(text(10, 14), (90, 40), screen), Rect { x: 0, y: 0, width: 80, height: 14 });
+        assert_eq!(list_area(text(10, 3), (26, 20), (20, 5)), Rect { x: 0, y: 0, width: 20, height: 3 });
+        // A screen of one row: the list there, not under it.
+        assert_eq!(list_area(text(10, 0), (26, 8), (80, 1)), Rect { x: 6, y: 0, width: 26, height: 1 });
+        // Near the left edge.
+        assert_eq!(list_area(text(2, 0), (26, 8), screen).x, 0);
+    }
+
+    #[test]
+    fn a_click_on_the_model_or_effort_opens_a_list_that_a_click_outside_closes() {
+        let state = tempfile::tempdir().unwrap();
+        let tabs = vec![TabSpec { title: "1".into(), panes: vec![sleeper("dev-a"), sleeper("dev-b")], side: None }];
+        let mut server = built(state.path(), &["dev-a", "dev-b"], tabs);
+        server.exe = Some("/bin/cat".into());
+        let _client = attached(&mut server);
+        let (a, b) = (id_of(&server, "dev-a"), id_of(&server, "dev-b"));
+        let look = board::MemberLook {
+            model: Some("Opus".into()),
+            effort: Some("high".into()),
+            context: Some(40),
+            ..Default::default()
+        };
+        server.looks.insert("dev-a".into(), look.clone());
+        server.looks.insert("dev-b".into(), look);
+        server.focus_on(&a);
+        assert!(server.compose());
+        let part = |server: &Server, id: &str, part: chrome::Part| {
+            let found = server.parts.iter().find(|(_, of, p)| of == id && *p == part);
+            found.map(|(at, _, _)| *at).unwrap_or_else(|| panic!("{part:?} of {id}"))
+        };
+        let click = |server: &mut Server, col: usize, row: usize| {
+            server.mouse(&Mouse {
+                kind: MouseKind::Down(Button::Left),
+                col: col as u16,
+                row: row as u16,
+                mods: Mods::NONE,
+            });
+            server.mouse(&Mouse {
+                kind: MouseKind::Up(Button::Left),
+                col: col as u16,
+                row: row as u16,
+                mods: Mods::NONE,
+            });
+        };
+
+        // The effort of dev-b: a list under it, the focus on it, the team not dimmed.
+        let effort = part(&server, &b, chrome::Part::Effort);
+        click(&mut server, effort.x, effort.y);
+        let list = server.list.clone().expect("a list");
+        assert_eq!((list.pane.as_str(), list.part, list.anchor), (b.as_str(), chrome::Part::Effort, effort));
+        let (menu, before) = server.menu.clone().expect("the menu's pane");
+        assert_eq!(before.as_deref(), Some(a.as_str()));
+        assert_eq!(server.focus.as_deref(), Some(menu.as_str()));
+        assert_eq!(server.pane(&menu).unwrap().area, list_area(effort, LIST_SIZE, (80, 23)));
+        assert!(server.compose());
+        assert!(server.choice.is_none() && server.notice.is_none());
+
+        // The menu tells the size it needs, its frame included: the pane takes exactly that.
+        let mut replies = Vec::new();
+        server
+            .panes
+            .iter()
+            .find(|pane| pane.id == menu)
+            .unwrap()
+            .with(|engine| engine.feed(b"\x1b[8;5;30t", &mut replies));
+        server.take_relays();
+        let area = server.pane(&menu).unwrap().area;
+        assert_eq!((area.width, area.height), (30, 5), "the size announced, no frame added");
+        assert_eq!(area, list_area(effort, (30, 5), (80, 23)));
+        // Another pane's size request is no one's business.
+        server.panes.iter().find(|pane| pane.id == a).unwrap().with(|engine| engine.feed(b"\x1b[8;5;9t", &mut replies));
+        server.take_relays();
+        assert_eq!(server.pane(&a).unwrap().size, server.pane(&a).unwrap().size);
+        assert_eq!(server.pane(&menu).unwrap().area, area);
+
+        // A press inside the list is the list's, even over a header part it covers: nothing else opens.
+        click(&mut server, area.x + 2, area.y + 2);
+        assert!(server.list.is_some() && server.choice.is_none());
+        // A press outside closes it and does nothing more; the focus is where it was.
+        let name = part(&server, &a, chrome::Part::Name);
+        click(&mut server, name.x, name.y);
+        assert!(server.list.is_none() && server.menu.is_none());
+        assert!(server.pane(&menu).is_none(), "its pane is gone");
+        assert_eq!(server.focus.as_deref(), Some(a.as_str()));
+        assert!(server.compose());
+
+        // A second click on the same text closes it, and does not open another.
+        let model = part(&server, &b, chrome::Part::Model);
+        click(&mut server, model.x, model.y);
+        assert!(server.list.as_ref().is_some_and(|list| list.part == chrome::Part::Model));
+        click(&mut server, model.x, model.y);
+        assert!(server.list.is_none() && server.menu.is_none());
+        assert_eq!(server.focus.as_deref(), Some(a.as_str()));
+
+        // The window resized meanwhile: closed, the text it hung under has moved.
+        click(&mut server, model.x, model.y);
+        assert!(server.list.is_some());
+        server.resize((100, 30));
+        assert!(server.list.is_none() && server.menu.is_none());
+        assert_eq!(server.focus.as_deref(), Some(a.as_str()));
+        assert!(server.compose());
+        let model = part(&server, &b, chrome::Part::Model);
+        // Ended by itself (Échap): closed the same.
+        click(&mut server, model.x, model.y);
+        let (menu, _) = server.menu.clone().unwrap();
+        server.close_pane(&menu);
+        assert!(server.list.is_none() && server.menu.is_none());
+        assert_eq!(server.focus.as_deref(), Some(a.as_str()));
+        // The name still opens the whole menu, centered.
+        let name = part(&server, &b, chrome::Part::Name);
+        click(&mut server, name.x, name.y);
+        assert!(server.list.is_none());
+        let (menu, _) = server.menu.clone().expect("the menu");
+        assert_eq!(server.pane(&menu).unwrap().area, server.menu_area());
+    }
+
+    #[test]
     fn the_colors_follow_the_team() {
         let state = tempfile::tempdir().unwrap();
         let write = |names: &[&str]| {
@@ -3593,6 +5313,7 @@ mod tests {
             rows: 24,
             exe: String::new(),
             lang: String::new(),
+            focus: false,
         };
         assert!(matches!(server.request(build), Reply::Ok(_)));
         assert_eq!(server.order, ["chef", "dev-a", "dev-b"]);
@@ -3605,7 +5326,11 @@ mod tests {
         assert!(matches!(server.request(Request::OpenWindow { pane: sleeper("dev-c") }), Reply::Ok(_)));
         assert_eq!(server.order, ["chef", "dev-z", "dev-b", "dev-c"]);
         write(&["chef", "dev-z", "dev-c"]);
-        let arrange = Request::Arrange { tabs: vec![("1".into(), vec!["dev-z".into(), "dev-c".into()])], columns: 3 };
+        let arrange = Request::Arrange {
+            tabs: vec![("1".into(), vec!["dev-z".into(), "dev-c".into()])],
+            columns: 3,
+            focus: false,
+        };
         assert!(matches!(server.request(arrange), Reply::Ok(_)));
         assert_eq!(server.order, ["chef", "dev-z", "dev-c"]);
         assert_eq!(member_color(&server.order, "dev-c"), look::member_color(2));

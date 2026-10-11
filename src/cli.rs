@@ -114,12 +114,18 @@ pub enum Command {
         /// The client's terminal carries the Nerd Font symbols
         #[arg(long)]
         nerd: bool,
+        /// The client's terminal has a light background: the light palette
+        #[arg(long)]
+        light: bool,
         /// Open on this member's sheet
         #[arg(long, value_name = "MEMBER")]
         member: Option<String>,
         /// The field of its sheet to focus: name, model or effort
         #[arg(long, requires = "member")]
         field: Option<String>,
+        /// Only the list of the field's values, under a pane's header: a model or an effort (lot of 2026-10-11)
+        #[arg(long, requires = "field")]
+        list: bool,
     },
     /// Internal: changes a running team as its menu does, without the menu: for scripts and tests
     #[command(name = "_edit", hide = true)]
@@ -319,6 +325,7 @@ fn french(command: clap::Command) -> clap::Command {
                 .mut_arg("state", |a| a.help("Le dossier de l'équipe, sous ~/.cache/recruit/teams/"))
                 .mut_arg("client", |a| a.help("Le client où s'affiche le menu, pour le détacher"))
                 .mut_arg("nerd", |a| a.help("Le terminal du client embarque les symboles Nerd Font"))
+                .mut_arg("light", |a| a.help("Le terminal du client a un fond clair : la palette claire"))
                 .mut_arg("member", |a| a.help("Ouvrir sur la fiche de ce membre").value_name("MEMBRE"))
                 .mut_arg("field", |a| a.help("Le champ de sa fiche à mettre en avant : name, model ou effort").value_name("CHAMP"))
         })
@@ -414,6 +421,13 @@ mod tests {
         let Some(Command::Menu { member, field, .. }) = cli.command else { panic!() };
         assert_eq!((member.as_deref(), field.as_deref()), (Some("dev"), Some("effort")));
         assert!(Cli::try_parse_from(["recruit", "_menu", "/s", "--field", "model"]).is_err(), "a field needs a member");
+        let cli =
+            Cli::try_parse_from(["recruit", "_menu", "/s", "--member", "dev", "--field", "model", "--list"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Menu { list: true, .. })));
+        assert!(
+            Cli::try_parse_from(["recruit", "_menu", "/s", "--member", "dev", "--list"]).is_err(),
+            "a list needs a field"
+        );
     }
 
     #[test]

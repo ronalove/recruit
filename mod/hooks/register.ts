@@ -20,6 +20,9 @@ type Reply = {
   override?: Override
   summarize?: Ask
   compact?: string
+  // What the answer to the compaction tells back: the server's own (auto), the context before (percent); and, for an
+  // automatic one, what the summary keeps.
+  compactAsk?: { auto?: boolean; percent?: number; instructions?: string }
   // « continue » to send, unless the prompt box holds a draft or a turn runs.
   resume?: string
   // How to count the context's breakdown: estimated by the session, or with the token-count API.
@@ -29,10 +32,12 @@ type Reply = {
 }
 // The answers to what recruit asked, for the next tick.
 type Summary = { id: string; text?: string; error?: string }
-type Compaction = { id: string; done?: boolean; skip?: string; error?: string }
+type Compaction = { id: string; done?: boolean; skip?: string; error?: string; auto?: boolean; percent?: number }
 // 'busy' and 'unsupported' are codes recruit says in the user's language.
 type Resumption = { id: string; sent?: boolean; draft?: boolean; error?: string }
-type Handover = { summary?: Summary; compaction?: Compaction; resumption?: Resumption }
+// A /compact the person typed, that recruit did not ask for: how big the conversation was and became, if known.
+type Typed = { tokensBefore?: number; tokensAfter?: number }
+type Handover = { summary?: Summary; compaction?: Compaction; resumption?: Resumption; typed?: Typed }
 type Bridge = { exe: string; state: string; member: string }
 
 const nothing: RenderElement = { type: 'Box', props: { display: 'none' } }
@@ -118,13 +123,23 @@ async function summarize($: EngineInterface, ask: Ask): Promise<Summary> {
   }
 }
 
-async function compact($: EngineInterface, id: string): Promise<Compaction> {
+async function compact(
+  $: EngineInterface,
+  id: string,
+  ask: Reply['compactAsk'],
+  running: () => boolean,
+): Promise<Compaction> {
+  // Told back in the answer, for the dashboard's trace.
+  const who = { ...(ask?.auto ? { auto: true } : {}), ...(ask?.percent !== undefined ? { percent: ask.percent } : {}) }
+  // A turn running refuses it: not a failure, the member went back to work; recruit asks again if it still must.
+  if (running()) return { id, skip: 'busy', ...who }
   try {
-    const r = await $.session.compact()
-    return 'skip' in r && r.skip !== undefined ? { id, skip: r.skip } : { id, done: true }
+    const r = await $.session.compact(ask?.instructions ? { instructions: ask.instructions } : undefined)
+    return 'skip' in r && r.skip !== undefined ? { id, skip: r.skip, ...who } : { id, done: true, ...who }
   } catch (error) {
-    // A turn running refuses it.
-    return { id, error: String(error) }
+    // A turn that began since the check refused it all the same.
+    if (running()) return { id, skip: 'busy', ...who }
+    return { id, error: String(error), ...who }
   }
 }
 
@@ -208,10 +223,14 @@ export const register: Register = on => {
           $.ui.invalidate('ui.render')
         }
         if (reply.summarize) void summarize($, reply.summarize).then(summary => (handover = { ...handover, summary }))
-        if (reply.compact) void compact($, reply.compact).then(compaction => (handover = { ...handover, compaction }))
+        const turnRuns = () => turn !== undefined
+        if (reply.compact) {
+          void compact($, reply.compact, reply.compactAsk, turnRuns).then(
+            compaction => (handover = { ...handover, compaction }),
+          )
+        }
         if (reply.resume) {
-          const running = () => turn !== undefined
-          void resume($, reply.resume, running).then(resumption => (handover = { ...handover, resumption }))
+          void resume($, reply.resume, turnRuns).then(resumption => (handover = { ...handover, resumption }))
         }
         // The error shown, if any, is over.
         if (failed > 1) $.ui.status(undefined)
@@ -248,10 +267,16 @@ export const register: Register = on => {
     return next(context ? { ...e, context: [...(e.context ?? []), context] } : e)
   })
 
-  // The main conversation's, once installed: a precompute installs nothing.
+  // The main conversation's, once installed: a precompute installs nothing. The person's own /compact is handed over
+  // for the trace; recruit's goes through the plugin, the engine's at its threshold is shown by the panel.
   on('session.compact', async ($, e, next) => {
     const r = await next(e)
-    if (bridge && !e.agentId && e.trigger !== 'precompute' && r.skip === undefined) compactions += 1
+    if (bridge && !e.agentId && e.trigger !== 'precompute' && r.skip === undefined) {
+      compactions += 1
+      if (e.trigger === 'manual') {
+        handover = { ...handover, typed: { tokensBefore: r.tokensBefore, tokensAfter: r.tokensAfter } }
+      }
+    }
     return r
   })
 

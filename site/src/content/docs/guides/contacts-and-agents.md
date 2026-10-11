@@ -54,14 +54,34 @@ role = "Web interface"
 tab = "Code"
 ```
 
+The grid can also be set from the [team's menu](/recruit/guides/menu/#the-teams-actions), "Grid" (`g`): 4 × 2, 3 × 2, 2 × 2, 3 × 1 or 2 × 1. A smaller grid gives each member more room, over more tabs. A terminal has one font size for the whole window, so a pane cannot have a smaller font of its own: the grid and the focus below are the way to make room.
+
+### Focus
+
+When a tab holds more members than you can follow, `layout = "focus"` shows one of them large and only the busiest beside it:
+
+- **On the left**, the member you chose, as tall as the tab.
+- **On the right**, the best placed of the others, one above the other: those waiting for you, those whose turn failed, those at work, then those at rest most recently. Three, or two in a window under 120 × 36.
+- **Below them**, the others as cards, as on the dashboard, in a frame titled "others" that counts them by state. A card shows the member's state, its model and its effort, what it does, and the curve of its last half hour.
+
+Places change slowly, so that nothing jumps under your eyes. A member that starts waiting for you, or whose turn fails, comes to the right at once, though never in the place of another one waiting or failed. A member that starts working comes after 30 seconds, in the place of the least well placed. Otherwise a pane keeps its place for a minute at least. Nothing moves while the pointer is on the right or on the cards, while you type, or for a second after a click.
+
+| To | Do |
+|---|---|
+| bring a member to the left | click its card, double-click the top border of its pane on the right, or `Alt+n` for the next one of the tab |
+| type in a pane on the right | click it: it gets the keys, and stays where it is |
+| go back to the grid, or try the focus | `Alt+l`, or the "grid (⌥l)" or "focus (⌥l)" button in the bar: the current tab only, until you detach |
+
+The first tab, with the dashboard and the journal, keeps its grid, and so does a tab in a window under 80 columns or 14 rows. "Layout" (`l`) in the team's menu switches between grid and focus for the whole team, and writes it in the file.
+
 ### One tab per member
 
 `layout = "tabs"` gives each member a tab of its own, named after it, contacts first. The dashboard and the journal go in the first tab.
 
 ## Changing it while the team runs
 
-The [team's menu](/recruit/guides/menu/) makes a member a contact or a working agent, or moves it to another tab. Its pane moves without its Claude stopping. When the only contact leaves or becomes a working agent, the menu asks who takes its place.
+The [team's menu](/recruit/guides/menu/) makes a member a contact or a working agent, moves it to another tab, and sets the grid and the layout. Panes move without their Claude stopping. When the only contact leaves or becomes a working agent, the menu asks who takes its place.
 
 ## Moving between tabs
 
-`Alt+1`…`Alt+9` go to a tab, `Alt+Shift+←` / `Alt+Shift+→` to the previous or next one, `Alt+n` to the next member of the tab, and a click on a member's card on the dashboard goes to its pane. When a member you cannot see waits for you, a notice tells you, and `Alt+g` takes you there. See [Around the screen](/recruit/guides/screen/).
+`Alt+1`…`Alt+9` go to a tab, `Alt+Shift+←` / `Alt+Shift+→` to the previous or next one, `Alt+n` to the next member of the tab (a member shown over the whole tab stays so: the next one takes its place), and a click on a member's card on the dashboard goes to its pane. When a member you cannot see waits for you, a notice tells you, and `Alt+g` takes you there. See [Around the screen](/recruit/guides/screen/).

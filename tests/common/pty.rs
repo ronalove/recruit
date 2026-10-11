@@ -29,6 +29,9 @@ use alacritty_terminal::vte::ansi::{NamedColor, Processor, Rgb};
 /// (libghostty-vt's is d8d8d8), so that an answer passed on is told from one made up.
 const FG: Rgb = Rgb { r: 0xc0, g: 0xc1, b: 0xc2 };
 const BG: Rgb = Rgb { r: 0x1e, g: 0x1e, b: 0x1e };
+/// The same for a light theme (`Profile::light`).
+const FG_LIGHT: Rgb = Rgb { r: 0x2b, g: 0x2e, b: 0x33 };
+const BG_LIGHT: Rgb = Rgb { r: 0xfa, g: 0xfa, b: 0xf7 };
 
 /// How the test terminal behaves, to imitate a real one.
 #[derive(Clone, Copy, Debug)]
@@ -40,11 +43,13 @@ pub struct Profile {
     /// Answers XTVERSION (`CSI > q`) with this name, as Ghostty (`ghostty 1.3.1`), kitty or WezTerm do; alacritty
     /// itself does not.
     pub xtversion: Option<&'static str>,
+    /// Answers OSC 10 and 11 with a light theme (dark text on a pale background) instead of the dark one.
+    pub light: bool,
 }
 
 impl Default for Profile {
     fn default() -> Profile {
-        Profile { kitty_keyboard: true, capture: false, xtversion: None }
+        Profile { kitty_keyboard: true, capture: false, xtversion: None, light: false }
     }
 }
 
@@ -134,6 +139,7 @@ struct Shared {
     /// Every byte, with `Profile::capture`.
     raw: Option<Vec<u8>>,
     xtversion: Option<&'static str>,
+    light: bool,
 }
 
 /// A program on a PTY of the test's, and the screen it draws.
@@ -224,6 +230,7 @@ impl TestTerm {
                 closed: false,
                 raw: profile.capture.then(Vec::new),
                 xtversion: profile.xtversion,
+                light: profile.light,
             }),
             Condvar::new(),
         ));
@@ -393,7 +400,7 @@ impl TestTerm {
                     .collect()
             })
             .collect();
-        serde_json::json!({ "cols": self.cols, "rows": rows }).to_string()
+        serde_json::json!({ "cols": self.cols, "rows": rows, "light": shared.light }).to_string()
     }
 
     /// Whether the cell at `col`, `row` is drawn in reverse video.
@@ -401,6 +408,39 @@ impl TestTerm {
         let (mutex, _) = &*self.shared;
         let shared = lock(mutex);
         shared.term.grid()[Line(row as i32)][Column(col)].flags.contains(alacritty_terminal::term::cell::Flags::INVERSE)
+    }
+
+    /// The attributes of the cell at `col`, `row`, as letters: `b`old, `d`im, `i`talic, `u`nderline, `r`everse, `s`trike.
+    pub fn flags(&self, col: usize, row: usize) -> String {
+        use alacritty_terminal::term::cell::Flags;
+        let (mutex, _) = &*self.shared;
+        let shared = lock(mutex);
+        let cell = &shared.term.grid()[Line(row as i32)][Column(col)];
+        [
+            (Flags::BOLD, 'b'),
+            (Flags::DIM, 'd'),
+            (Flags::ITALIC, 'i'),
+            (Flags::UNDERLINE, 'u'),
+            (Flags::INVERSE, 'r'),
+            (Flags::STRIKEOUT, 's'),
+        ]
+        .into_iter()
+        .filter(|(flag, _)| cell.flags.contains(*flag))
+        .map(|(_, letter)| letter)
+        .collect()
+    }
+
+    /// How many cells of the screen are dim.
+    pub fn dim_cells(&self) -> usize {
+        use alacritty_terminal::term::cell::Flags;
+        let (mutex, _) = &*self.shared;
+        let shared = lock(mutex);
+        let grid = shared.term.grid();
+        (0..self.rows)
+            .map(|row| {
+                (0..self.cols).filter(|col| grid[Line(row as i32)][Column(*col)].flags.contains(Flags::DIM)).count()
+            })
+            .sum()
     }
 
     /// The cell at `col`, `row` (from 0): its text (with what combines into it), foreground and background, as
@@ -490,7 +530,9 @@ fn read(mut master: File, mut replies: File, shared: &(Mutex<Shared>, Condvar), 
                 Event::PtyWrite(text) => text,
                 // OSC 10 asks for `NamedColor::Foreground` (256), OSC 11 for `Background` (257).
                 Event::ColorRequest(index, format) => {
-                    format(if index == NamedColor::Background as usize { BG } else { FG })
+                    let light = lock(mutex).light;
+                    let (fg, bg) = if light { (FG_LIGHT, BG_LIGHT) } else { (FG, BG) };
+                    format(if index == NamedColor::Background as usize { bg } else { fg })
                 }
                 _ => continue,
             };
