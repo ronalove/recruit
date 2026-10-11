@@ -146,6 +146,7 @@ instructions = """
 - Le moteur répond aux requêtes de l'application (DA1, DA2, DSR, CPR, DECRQM, XTVERSION, protocole clavier kitty, OSC 10 et 11) et remonte ce qui se relaie (OSC 52, notifications, progression, titre, BEL) sous forme d'événements, sans l'écrire lui-même.
 - Le reste du code ne voit que le trait : aucun type du moteur ne sort de ta zone.
 - Tests unitaires sur des séquences connues, sans Claude ; tu donnes au testeur les programmes factices utiles au banc."""
+model = "sonnet"
 
 [teams.mux.members.dev-saisie]
 role = "Développeur Rust des entrées : lecture côté client, raccourcis, encodage du clavier, de la souris, du collage et du focus pour chaque panneau."
@@ -157,6 +158,7 @@ instructions = """
 - Exigences de la spec (§5.4 et §6) : Shift+Entrée va à la ligne dans Claude Code quel que soit le terminal ; Ctrl+B, Ctrl+R, Ctrl+O, Tab et Shift+Tab arrivent à Claude Code ; Échap sans délai ; Option comme Alt sous macOS, raccourcis affichés avec ⌥.
 - Molette : à l'application si elle capture la souris, sinon à l'historique (avec dev-rendu).
 - Tests unitaires en tables, tirées des spécifications kitty et xterm, pour chaque mode ; aucun test ne dépend d'un terminal réel."""
+model = "sonnet"
 
 [teams.mux.members.dev-rendu]
 role = "Développeur Rust du rendu : canvas, composition des panneaux et des calques, capacités du terminal, historique, sélection et copie."
@@ -169,6 +171,7 @@ instructions = """
 - Capacités du vrai terminal transmises par le client (couleurs, OSC 8, largeur des graphèmes, mode 2027), et repli propre.
 - Historique (une vue qui défile), sélection à la souris, double et triple clic, copie par OSC 52 (spec, §5.5).
 - Les tests comparent des écrans rendus en texte ; tu mesures le coût d'une image avec le testeur."""
+model = "sonnet"
 
 [teams.mux.members.dev-serveur]
 role = "Développeur Rust du serveur et du client : processus, socket, protocole, détacher et revenir, cycle de vie de l'équipe."
@@ -181,6 +184,7 @@ instructions = """
 - Ce que `launch.rs`, `live.rs`, `app.rs` et `board.rs` demandent aujourd'hui à `Tmux` (spec, §4) devient une requête au serveur : lancer, rejoindre, arrêter, lister, relancer un membre, ouvrir et fermer les panneaux, aller à un membre, ouvrir le menu. Tu le fais avec l'architecte, qui tient l'intégration.
 - Détacher et revenir marchent depuis un autre terminal et par SSH ; un deuxième `attach` suit la décision de l'utilisateur (spec, §10, question 3).
 - Pas de runtime async sans l'accord de l'architecte, mesures à l'appui."""
+model = "sonnet"
 
 [teams.mux.members.designer]
 role = "Designer de l'interface : maquettes du nouvel écran, interactions, cohérence avec le tableau de bord et le menu."
@@ -203,6 +207,7 @@ instructions = """
 - Calques : menu, menu quitter (Détacher, Quitter, Annuler), confirmations ; ils s'ouvrent au-dessus de l'équipe, le reste atténué, et se cliquent.
 - Tu suis les maquettes du designer, et tu lui signales ce qui ne tient pas dans un vrai terminal.
 - Tests : écrans rendus en texte, sans terminal."""
+model = "sonnet"
 
 [teams.mux.members.testeur]
 role = "Testeur : banc d'intégration sans terminal, grille de compatibilité avec Claude Code, terminaux, performance."

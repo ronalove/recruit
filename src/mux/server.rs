@@ -4605,6 +4605,50 @@ mod tests {
         assert!(server.shown_ids().contains(server.focus.as_ref().unwrap()));
     }
 
+    /// What a turn of the loop does after the messages: what looks again after them, as `run` does it.
+    fn end_of_turn(server: &mut Server) {
+        let again = std::mem::take(&mut server.look_again);
+        if again || server.compaction.is_some_and(|at| at <= Instant::now()) {
+            server.auto_compaction();
+        }
+        if again || server.focus_wake.is_some_and(|at| at <= Instant::now()) {
+            server.update_focus();
+        }
+        if std::mem::take(&mut server.cards_stale) {
+            server.refresh_cards();
+        }
+    }
+
+    #[test]
+    fn a_mouse_move_that_lights_nothing_asks_for_no_frame() {
+        for focus in [false, true] {
+            let state = tempfile::tempdir().unwrap();
+            let names = ["dev-a", "dev-b", "dev-c", "dev-d", "dev-e"];
+            let panes = names.iter().map(|name| sleeper(name)).collect();
+            let mut server = built(state.path(), &names, vec![TabSpec { title: "1".into(), panes, side: None }]);
+            let _client = attached(&mut server);
+            server.focus_layout = focus;
+            server.layout();
+            assert_eq!(server.tabs[0].focus.is_some(), focus);
+            assert!(server.compose());
+            end_of_turn(&mut server);
+            server.dirty = false;
+            // Over a pane's text, over the right panes and the cards, and on the bar: the same place again and again.
+            for (col, row) in [(5u16, 5u16), (70, 3), (70, 20), (3, 23)] {
+                let event = input::Event::Mouse(Mouse { kind: MouseKind::Moved, col, row, mods: Mods::NONE });
+                // The first move may light a part or a button; a frame for that is right.
+                server.message(Msg::Client("c1".into(), ClientMsg::Input(event.clone())));
+                end_of_turn(&mut server);
+                server.dirty = false;
+                for _ in 0..5 {
+                    server.message(Msg::Client("c1".into(), ClientMsg::Input(event.clone())));
+                    end_of_turn(&mut server);
+                    assert!(!server.dirty, "focus {focus}: at {col},{row}: the same place again asked for a frame");
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_client_with_another_theme_has_the_whole_screen_drawn_again() {
         let state = tempfile::tempdir().unwrap();

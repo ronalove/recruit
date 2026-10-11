@@ -2550,57 +2550,85 @@ fn hover_redraws_only_on_change() {
     let motion = |term: &mut TestTerm, (col, row): (usize, usize)| {
         term.send(format!("\x1b[<35;{};{}M", col + 1, row + 1).as_bytes());
     };
-    // The clocks (the seconds in the header and on the dashboard's cards) draw frames of their own: each run of moves
-    // is measured against a run of the same length with the pointer still, and may cost only a frame or two more.
-    const RUN: Duration = Duration::from_millis(400);
+    // The clocks (the seconds in the header and on the cards, a few phases a second) draw frames of their own, and on a
+    // slow machine a second that turns lands in a run now and then (a CI run saw 3 frames against 0). A defect draws a
+    // frame for the moves in every run; a clock only in some. So each measure is made several times, short, and what
+    // counts is the quietest run: the moves are not to cost more than a frame or two over the quietest run of the
+    // pointer standing still.
+    const RUN: Duration = Duration::from_millis(250);
+    const RUNS: usize = 8;
     const SLACK: u64 = 2;
-    let measure = |term: &mut TestTerm, moves: &mut dyn FnMut(&mut TestTerm)| {
+    let measure_once = |term: &mut TestTerm, moves: &mut dyn FnMut(&mut TestTerm), span: Duration| {
         let before = frames(&team);
         let begun = std::time::Instant::now();
         moves(term);
-        std::thread::sleep(RUN.saturating_sub(begun.elapsed()));
+        std::thread::sleep(span.saturating_sub(begun.elapsed()));
         frames(&team) - before
     };
+    // The frames of each of `runs` runs.
+    let measure = |term: &mut TestTerm, moves: &mut dyn FnMut(&mut TestTerm), span: Duration, runs: usize| {
+        (0..runs).map(|_| measure_once(term, moves, span)).collect::<Vec<u64>>()
+    };
+    let quietest = |runs: &[u64]| runs.iter().copied().min().unwrap_or_default();
     let name = find_in_header(&term, " lead ").map(|(c, r)| (c + 1, r)).expect("name");
     let model = find_in_header(&term, "Opus").expect("model");
     let inside = (5, 10);
     let mut checks = Checks::default();
-    let still = measure(&mut term, &mut |_| {});
+    let still = measure(&mut term, &mut |_| {}, RUN, RUNS);
     // Over the text of the pane: nothing to light.
-    let idle_moves = measure(&mut term, &mut |term| {
-        for i in 0..100 {
-            motion(term, (inside.0 + i % 20, inside.1 + i % 5));
-        }
-    });
+    let idle_moves = measure(
+        &mut term,
+        &mut |term| {
+            for i in 0..100 {
+                motion(term, (inside.0 + i % 20, inside.1 + i % 5));
+            }
+        },
+        RUN,
+        RUNS,
+    );
     checks.check(
-        "F3 100 moves over a pane's text: no more frames than standing still",
-        idle_moves <= still + SLACK,
-        || format!("{idle_moves} frames against {still}"),
+        "F3 100 moves over a pane's text: no more frames than standing still (quietest runs)",
+        quietest(&idle_moves) <= quietest(&still) + SLACK,
+        || format!("runs of moves {idle_moves:?} against standing still {still:?}"),
     );
     // On one element: a frame to light it (waited for), none after.
     motion(&mut term, name);
     assert!(wait(Duration::from_secs(3), || shown(&term).contains("réglages")), "the name never lit: {}", shown(&term));
-    let still = measure(&mut term, &mut |_| {});
-    let same = measure(&mut term, &mut |term| {
-        for _ in 0..100 {
-            motion(term, name);
-        }
-    });
-    checks.check("F3 100 moves on the same name: no more frames than standing still", same <= still + SLACK, || {
-        format!("{same} frames against {still}")
-    });
-    // From one element to the other, twenty times: about a frame a change.
-    let still = measure(&mut term, &mut |_| {});
-    let changes = measure(&mut term, &mut |term| {
-        for i in 0..20 {
-            motion(term, if i % 2 == 0 { model } else { name });
-            std::thread::sleep(Duration::from_millis(40));
-        }
-    });
+    let still = measure(&mut term, &mut |_| {}, RUN, RUNS);
+    let same = measure(
+        &mut term,
+        &mut |term| {
+            for _ in 0..100 {
+                motion(term, name);
+            }
+        },
+        RUN,
+        RUNS,
+    );
     checks.check(
-        "F3 20 changes of element: 6 to 25 frames, the clocks apart (under load, moves merge into one frame)",
-        (6..=25 + still + SLACK).contains(&changes),
-        || format!("{changes} frames against {still} standing still"),
+        "F3 100 moves on the same name: no more frames than standing still (quietest runs)",
+        quietest(&same) <= quietest(&still) + SLACK,
+        || format!("runs of moves {same:?} against standing still {still:?}"),
+    );
+    // From one element to the other, twenty times: about a frame a change. A run lasts 0.8 s, longer than a second's
+    // clocks: the least a run draws is a frame or so a change, the quietest run no more than a frame a change.
+    let still = measure(&mut term, &mut |_| {}, Duration::from_millis(800), 3);
+    let changes = measure(
+        &mut term,
+        &mut |term| {
+            for i in 0..20 {
+                motion(term, if i % 2 == 0 { model } else { name });
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        },
+        Duration::from_millis(800),
+        3,
+    );
+    println!("F3 frames per run: still {still:?}, changes {changes:?}, same {same:?}, idle moves {idle_moves:?}");
+    checks.check(
+        "F3 20 changes of element: at least 6 frames in every run, at most 25 in the quietest (moves merge under load)",
+        changes.iter().all(|c| *c >= 6) && quietest(&changes) <= 25 + quietest(&still) + SLACK,
+        || format!("runs of changes {changes:?} against standing still {still:?}"),
     );
     // The name lit and unlit shows on the screen.
     motion(&mut term, name);
