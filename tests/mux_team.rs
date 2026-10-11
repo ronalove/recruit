@@ -364,12 +364,9 @@ fn client_keys_and_buttons() {
         opened && screen(&term).contains("dev"),
         screen(&term),
     );
-    term.send(b"\x1b");
-    check(
-        "R1 Esc closes the menu",
-        wait(Duration::from_secs(3), || !screen(&term).contains("Nouvel agent")),
-        screen(&term),
-    );
+    // The server's state, not the screen alone: the menu clears its screen before its process ends, and a click in
+    // between is swallowed (`Target::Quit if self.menu.is_some()`).
+    check("R1 Esc closes the menu", close_menu(&team, &mut term), screen(&term));
     let at = find(&term, &format!("quitter ({sign}q)")).expect("quit button");
     click(&mut term, at);
     let opened = wait(Duration::from_secs(3), || screen(&term).contains("Annuler"));
@@ -384,7 +381,7 @@ fn client_keys_and_buttons() {
         wait(Duration::from_secs(5), || screen(&term).contains("Nouvel agent")),
         screen(&term),
     );
-    term.send(b"\x1b");
+    check("R1 Esc closes the menu opened by the key", close_menu(&team, &mut term), screen(&term));
     assert!(failed.is_empty(), "{}", failed.join("\n"));
     team.stop();
 }
