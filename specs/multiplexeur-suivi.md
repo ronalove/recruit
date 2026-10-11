@@ -4,7 +4,7 @@ Tenu par l'architecte. La spec : [multiplexeur.md](multiplexeur.md) ; ses décis
 
 ## Tour raté (ouverte le 2026-10-10 à 19 h 23, par l'utilisateur ; après la 2.0.1 ; lot fini et relu à 20 h 09)
 
-Rien n'est commité. Dernière retouche : la ligne choisie de la fiche reste toujours visible (`Room`, menu/draw.rs), relue, capture refaite (`target/night/failed/`), passes EN et FR vertes. Pour plus tard : « … et N de plus » qui porte ⚑ et ✗ au tableau de bord ; en lecture seule, le bloc Modèle/Effort de la fiche hors du budget de hauteur (sans effet visible).
+Commit 4ebd65c (avec le CLAUDE.md : deux pièges), CI verte (run 38130335031), poussé sur `main` le 2026-10-11 ; la branche `multiplexeur` est supprimée (ici et sur GitHub), le worktree `../recruit-1.1.3` retiré : on travaille et on publie depuis `main`, dans ce dossier. Pas encore publié (2.1.0 recommandée). Dernière retouche : la ligne choisie de la fiche reste toujours visible (`Room`, menu/draw.rs), relue, capture refaite (`target/night/failed/`), passes EN et FR vertes. Pour plus tard : « … et N de plus » qui porte ⚑ et ✗ au tableau de bord ; en lecture seule, le bloc Modèle/Effort de la fiche hors du budget de hauteur (sans effet visible).
 
 Décision de l'utilisateur : direction C de la planche du designer (https://claude.ai/artifact/PowPbqMHrrJsnP3g1djhCa), détail au CLAUDE.md (Décisions, écran du multiplexeur) : un état à part, en orange, jusqu'au tour suivant ; ✗ sur l'onglet après ⚑ ; notification (une pour plusieurs erreurs en 10 s) ; ⌥g après les attentes ; libellé court dans l'en-tête après le nom ; texte entier en haut de la fiche du menu ; ligne « Reprendre » qui envoie « continue » si la saisie est vide.
 
