@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
 //! What the native multiplexer's integration tests and bench share: the test binary started again as a fake
-//! program or a measured child, what a process costs (memory, CPU, wakeups), the lines the fakes write, and the
-//! tester's own tmux server for the baselines (`-L rtest-testeur`, never the user's).
+//! program or a measured child, what a process costs (memory, CPU, wakeups) and the lines the fakes write.
 
 // Each test crate uses its own part of this module.
 #![allow(dead_code)]
@@ -15,14 +14,11 @@ pub mod team;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 /// The environment variable that turns the test binary into one of its children (a fake program, a measured
 /// process): its value names the role, the test `child` reads it.
 pub const CHILD: &str = "RECRUIT_TEST_CHILD";
-
-/// The tester's tmux server, for the baselines.
-pub const TMUX_SOCKET: &str = "rtest-testeur";
 
 /// A command that runs this test binary again as the child `role`: only the test named `child` runs, and it hands
 /// over to the role at once.
@@ -32,7 +28,7 @@ pub fn child(role: &str) -> Command {
     command
 }
 
-/// The same command, as words for a shell or for tmux (`env CHILD=role exe child …`), plus `vars`.
+/// The same command, as words for a shell or for a pane (`env CHILD=role exe child …`), plus `vars`.
 pub fn child_words(role: &str, vars: &[(&str, String)]) -> Vec<OsString> {
     let mut words: Vec<OsString> = vec!["env".into(), format!("{CHILD}={role}").into()];
     words.extend(vars.iter().map(|(key, value)| OsString::from(format!("{key}={value}"))));
@@ -194,29 +190,6 @@ fn timebase() -> (u32, u32) {
 /// Mebibytes, for the tables.
 pub fn mib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
-}
-
-/// The tester's tmux, without any configuration and without the `TMUX` of the session the tests run in.
-pub fn tmux() -> Command {
-    let mut command = Command::new("tmux");
-    command.args(["-L", TMUX_SOCKET, "-f", "/dev/null"]).env_remove("TMUX").env_remove("TMUX_PANE");
-    command
-}
-
-/// Runs a tmux command, and returns its output (trimmed), or panics with its error.
-pub fn tmux_run<I, S>(args: I) -> String
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    let output = tmux().args(args).stdin(Stdio::null()).output().expect("tmux");
-    assert!(output.status.success(), "tmux: {}", String::from_utf8_lossy(&output.stderr).trim());
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-/// Whether tmux is there at all.
-pub fn has_tmux() -> bool {
-    Command::new("tmux").arg("-V").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
 /// Whether the variable `var` holds today's date (`date +%F`): the lock on what a whole `cargo test -- --ignored`

@@ -14,7 +14,7 @@ mod text;
 use crossterm::style::Color;
 
 pub(crate) use painter::Painter;
-pub(crate) use text::{columns, fit, is_direction_mark};
+pub(crate) use text::{Long, Wrap, columns, fit, is_direction_mark, text_columns, wrap, wrap_chars};
 use text::{detached, left_out, width};
 
 /// How a cell is drawn.

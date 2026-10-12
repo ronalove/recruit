@@ -8,7 +8,7 @@ use crossterm::style::Color;
 
 use super::sheet::{Action, Fid, Overlay, Sheet, Target};
 use crate::t;
-use crate::ui::canvas::{Canvas, Style, columns, fit};
+use crate::ui::canvas::{self, Canvas, Long, Style, Wrap, columns, fit};
 use crate::ui::look::{self, Glyphs, State};
 
 /// From this width, the wide layout.
@@ -287,31 +287,13 @@ fn label(fid: Fid) -> String {
     }
 }
 
-/// `text` on rows of `width` columns at most, broken between words, `lines` at most (the last one cut with « … »).
+/// `text` on rows of `width` columns at most, broken between words, `lines` at most (the last one cut with « … »), a
+/// word longer than a row cut with « … » too. None for a text without words.
 pub(super) fn wrap(text: &str, width: usize, lines: usize) -> Vec<String> {
-    let mut rows: Vec<String> = Vec::new();
-    let mut row = String::new();
-    for word in text.split_whitespace() {
-        let wanted = if row.is_empty() { columns(word) } else { columns(&row) + 1 + columns(word) };
-        if wanted <= width || row.is_empty() {
-            if !row.is_empty() {
-                row.push(' ');
-            }
-            row.push_str(word);
-        } else {
-            rows.push(std::mem::take(&mut row));
-            row.push_str(word);
-        }
+    if text.split_whitespace().next().is_none() {
+        return Vec::new();
     }
-    if !row.is_empty() {
-        rows.push(row);
-    }
-    if rows.len() > lines {
-        let rest = rows[lines - 1..].join(" ");
-        rows.truncate(lines - 1);
-        rows.push(fit(&rest, width));
-    }
-    rows.into_iter().map(|r| fit(&r, width)).collect()
+    canvas::wrap(text, width, Wrap::new(Long::Ellipsis).lines(lines))
 }
 
 mod footer;

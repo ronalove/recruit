@@ -359,3 +359,70 @@ fn a_new_size_or_a_lent_terminal_sends_it_all() {
     painter.forget();
     assert!(text(&painter.frame(&canvas)).starts_with("\x1b[0m\x1b[2J"));
 }
+
+fn rows(text: &str, width: usize, how: Wrap) -> Vec<String> {
+    wrap(text, width, how)
+}
+
+#[test]
+fn text_wrapped_between_words() {
+    let split = Wrap::new(Long::Split);
+    assert_eq!(rows("un  deux\ttrois", 8, split), ["un deux", "trois"]);
+    assert_eq!(rows("", 8, split), [""]);
+    assert_eq!(rows("  \n ", 8, split), [""]);
+    assert_eq!(rows("日本語 日本語", 6, split), ["日本語", "日本語"]);
+    // A word longer than a row: broken where it must, one character at least, however wide.
+    assert_eq!(rows("ab abcdefghij", 4, split), ["ab", "abcd", "efgh", "ij"]);
+    assert_eq!(rows("日本", 1, split), ["日", "本"]);
+    // The last piece takes the next word.
+    assert_eq!(rows("abcdef gh", 4, split), ["abcd", "ef", "gh"]);
+    assert_eq!(rows("abcdef g", 4, split), ["abcd", "ef g"]);
+    // Whole: alone on a row, left as it is; Ellipsis: alone on a row, cut.
+    assert_eq!(rows("ab abcdefghij cd", 4, Wrap::new(Long::Whole)), ["ab", "abcdefghij", "cd"]);
+    assert_eq!(rows("ab abcdefghij cd", 4, Wrap::new(Long::Ellipsis)), ["ab", "abc…", "cd"]);
+    assert_eq!(rows("abcdefghij", 0, Wrap::new(Long::Ellipsis)), [""]);
+}
+
+#[test]
+fn text_wrapped_in_a_number_of_rows() {
+    let text = "Je publie la version 0.6.2 de recruit";
+    assert_eq!(rows(text, 20, Wrap::new(Long::Split).lines(2)), ["Je publie la version", "0.6.2 de recruit"]);
+    // The last row takes the rest, cut with an ellipsis; one row at least.
+    assert_eq!(rows(text, 20, Wrap::new(Long::Split).lines(1)), ["Je publie la versio…"]);
+    assert_eq!(rows(text, 20, Wrap::new(Long::Split).lines(0)), ["Je publie la versio…"]);
+    assert_eq!(rows("un deux trois quatre cinq", 10, Wrap::new(Long::Ellipsis).lines(2)), ["un deux", "trois qua…"]);
+    assert_eq!(rows("abcdefghijklmnop qr", 6, Wrap::new(Long::Split).lines(2)), ["abcdef", "ghijk…"]);
+    assert_eq!(rows(text, 8, Wrap::new(Long::Whole).lines(usize::MAX)).len(), 6);
+}
+
+#[test]
+fn text_wrapped_as_measured() {
+    // Character by character, a heart with its selector is one column; whole, it is two.
+    let heart = "abc \u{2764}\u{fe0f}";
+    assert_eq!(rows(heart, 5, Wrap::new(Long::Whole)), [heart]);
+    assert_eq!(rows(heart, 5, Wrap::new(Long::Whole).measured(text_columns)), ["abc", "\u{2764}\u{fe0f}"]);
+}
+
+#[test]
+fn chars_wrapped_keep_their_spaces() {
+    let tie = |text: &str| text.chars().map(|c| (c, c.is_uppercase())).collect::<Vec<_>>();
+    let flat = |rows: Vec<Vec<(char, bool)>>| {
+        rows.into_iter().map(|r| r.into_iter().map(|(c, _)| c).collect()).collect::<Vec<String>>()
+    };
+    let split = |text: &str, width| flat(wrap_chars(&tie(text), width, Long::Split, text_columns));
+    assert_eq!(split("un    deux trois", 8), ["un", "deux", "trois"]);
+    assert_eq!(split("a   b", 8), ["a   b"]);
+    assert_eq!(split("  retrait", 20), ["  retrait"]);
+    assert_eq!(split("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+    assert_eq!(split("", 4), [""]);
+    // A word that fits whole stays whole: its prefix « a⌚ » is wider (3) than the word with its text selector (2).
+    assert_eq!(split("a\u{231a}\u{fe0e}", 2), ["a\u{231a}\u{fe0e}"]);
+    assert_eq!(split("b a\u{231a}\u{fe0e}", 4), ["b a\u{231a}\u{fe0e}"]);
+    // Not on the row but alone on a row: a row of its own, whole; broken only if wider than a row.
+    assert_eq!(split("b a\u{231a}\u{fe0e}", 2), ["b", "a\u{231a}\u{fe0e}"]);
+    assert_eq!(split("  a\u{231a}\u{fe0e}", 2), ["a\u{231a}\u{fe0e}"]);
+    assert_eq!(split("b a\u{231a}\u{fe0e}", 1), ["b", "a", "\u{231a}\u{fe0e}"]);
+    // What was tied to a character stays with it.
+    let rows = wrap_chars(&tie("aB cD"), 3, Long::Split, text_columns);
+    assert_eq!(rows[1], [('c', false), ('D', true)]);
+}

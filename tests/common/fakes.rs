@@ -190,8 +190,12 @@ fn keylog() -> ! {
     let _ = write!(out, "\x1b[2J\x1b[HKEYLOG READY\r\n");
     // With `KEYLOG_PROBE`: an emoji with a skin tone, then a cursor position request; the answer comes in as the
     // first bytes logged. Its column says how many cells the terminal (or the engine above it) gave the emoji.
-    if std::env::var_os("KEYLOG_PROBE").is_some() {
+    // `KEYLOG_PROBE=2` asks, after it, whether mode 2027 (grapheme clusters) is known: `CSI ? 2027 $ p`.
+    if let Ok(probe) = std::env::var("KEYLOG_PROBE") {
         let _ = write!(out, "\r\n\u{1f44d}\u{1f3fd}\x1b[6n");
+        if probe == "2" {
+            let _ = write!(out, "\x1b[?2027$p");
+        }
     }
     let _ = out.flush();
     let start = Instant::now();

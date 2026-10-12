@@ -379,6 +379,8 @@ fn hover_redraws_only_on_change() {
     let changes = measure(
         &mut term,
         &mut |term| {
+            // Looked for again: the header's time grows and moves the model by a cell now and then.
+            let model = find_in_header(term, "Opus").map_or(model, |(col, row)| (col + 1, row));
             for i in 0..20 {
                 motion(term, if i % 2 == 0 { model } else { name });
                 std::thread::sleep(Duration::from_millis(40));

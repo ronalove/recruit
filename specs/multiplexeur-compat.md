@@ -296,10 +296,10 @@ Frappes réelles : `tests/mux_keys.rs` les envoie par System Events dans chaque 
 | Co4 | ok | — | — | — | — | — | — | — | campagne 2, `mux_screen::colors_without_24_bits` : `COLORTERM` vide, terminal inconnu : rouge 24 bits envoyé en couleur 196, aucun 38;2 |
 | U1 | ok | — | — | — | — | — | — | — | campagne 1 : « 漢字 » saisi et affiché |
 | U2 | ok | — | — | — | — | — | — | — | campagne 1 : « 🙂 » saisi |
-| U3 | — | ko | — | ok | ok | ok | — | — | campagne 1, sonde du factice `keylog` (👍🏽 puis CPR) : Ghostty 1.3.1 répond colonne 3 (2 cases, mode 2027 actif par défaut), le moteur du mux colonne 5 (4 cases) : la ligne se décale ; dev-saisie coupe 2027 à l'ouverture ; campagne 1, Terminal.app : 👍🏽 colonne 5 en direct (4 cases, pas de 2027), colonne 3 via le mux (le moteur en compte 2) : la ligne se décale ; campagne 1 : kitty et WezTerm colonne 3, comme le moteur ; Terminal.app (sans 2027) colonne 5 en direct, mais le rendu lui envoie 👍 sans 🏽 : aligné par conception (à vérifier au banc) |
+| U3 | ok | ok | cont. | cont. | ok | ok | — | — | campagne 4 (2026-10-12, `mux_keys::real_probe`, des fenêtres sans frappe ni capture, 2.3.0 + 2027 du client) : colonne du curseur après 👍🏽, en direct puis via le client : **Ghostty 3 et 3, kitty 3 et 3, WezTerm 3 et 3 (égales) ; Terminal.app 5 et 3, iTerm2 5 et 3 (différentes)**. Terminal.app et iTerm2 ne groupent pas la teinte (4 cases seules) : le moteur, lui, en compte 2 (colonne 3), et le client, sans 2027 chez eux, écrit 👍 sur 2 cases sans la teinte (`painter::narrowed`) ; kitty, qui répond 0 au 2027, reçoit de même 👍 sans la teinte à travers le client alors qu'il groupe en direct : le programme et l'écran restent d'accord, la teinte n'est pas dessinée dans ces deux-là (alignement à l'écran non capturé, pas de go pour les captures). Avant : campagne 1, le moteur du mux comptait 4 cases, Ghostty 2 : la ligne se décalait ; corrigé par le 2027 du client |
 | U4 | ok | — | — | — | — | — | — | — | campagne 2, `mux_screen::a_pane_as_written` : « e » + U+0301 dans une seule case, la suivante à sa place |
 | U5 | — | — | — | — | — | — | — | — | attend l'usage réel : l'indicateur animé pendant un vrai tour |
-| U6 | ok | — | — | — | — | — | — | — | unitaires `input::grapheme_clusters_turned_off_only_where_on`, `ghostty::queries_are_answered` ; campagne 2, `mux_screen` : DECRQM `?2027` du panneau répondu (`2027;1`) |
+| U6 | ok | ok | ok | ok | ok | ok | — | — | unitaires `input::terminal::tests::grapheme_clusters_kept_or_turned_on_where_known` (2027 gardé s'il est réglé, allumé s'il est connu éteint, rien sinon), `ghostty::queries_are_answered` ; campagne 2, `mux_screen` : DECRQM `?2027` du panneau répondu (`2027;1`) ; campagne 4, `real_probe` : réponse du vrai terminal à `CSI ? 2027 $ p` en direct : Ghostty 1 (réglé, gardé), kitty 0 (inconnu), WezTerm 3 (réglé pour de bon), iTerm2 4 (éteint pour de bon), Terminal.app aucune réponse ; dans le panneau, le moteur répond toujours `2027;1` |
 | U7 | ok | — | — | — | — | — | — | — | campagne 2, `mux_screen::a_pane_as_written` : « ┌─┐│└┘█▀▄░ » rendu à l'identique ; les cadres de Claude (`/model`) : journée |
 | Pf1 | ok | — | — | — | — | — | — | — | campagne 2, serveur natif + client : 0,00 %, 0 réveil, 0 octet, avec 2 vrais Claude, 10 factices ou 9 historiques pleins (voir « Banc ») |
 | Pf2 | ok | — | — | — | — | — | — | — | campagne 2 : 10 panneaux en flux à 58,7 images/s (seuil 50) ; au débit de Claude, 4,3 % pour un panneau contre 1,4 % pour tmux |
@@ -378,6 +378,20 @@ Non rejoués (pas d'accord) : `mux_keys` (frappes), `screenshots` (fenêtres). L
 - `claude_mouse_native` attendait « 80 » dans le panneau avant de chercher « FINI-TEST » : « 80 » est dans l'écho de la question, présent tout de suite, donc le test continuait 3 s plus tard sans la réponse de Claude (il ne passait qu'à la faveur du temps de réponse). Il attend maintenant une ligne qui est exactement « FINI-TEST ». Il cherchait aussi le mot à droite de la colonne du titre du cadre (`find` rend la colonne du nom, 5 cases à droite du bord) : une réponse alignée à gauche n'était pas vue. Corrigé dans `tests/mux_claude.rs` (marge de 8 cases, message d'échec avec l'écran et la capture).
 - Sessions laissées par les tests sous `~/.claude/projects` (3 dossiers du dossier temporaire de cette campagne : `…claude-campaign-tmp-recruit-testeur-claude`, `…-tmplN2DMw-proj`, `…-tmpxOQM80-proj`), à retirer quand aucun Claude ne tourne ; `~/.claude.json` non touché par moi.
 
+### Campagne 4 : U3 et U6 dans de vrais terminaux (2026-10-12, 16 h 46)
+
+Après le 2027 du client (dev-saisie) et le 2027 qui survit au RIS (dev-terminal). Accord de l'utilisateur pour la journée : `real_probe` seulement, des fenêtres, sans frappe ni capture. Copie du binaire (2.3.0 et le travail du jour), terminaux de la machine (Ghostty 1.3.1, iTerm2 3.7.4, Terminal.app 2.15, kitty 0.49.2, WezTerm 20240203), 31 s en tout. `SHOTS_CONSENT=$(date +%F) RECRUIT_BIN=<copie> cargo test --test mux_keys -- --ignored --nocapture --test-threads=1 real_probe`.
+
+| Terminal | Direct : colonne, 2027 | Via le client : colonne, 2027 | Verdict |
+|---|---|---|---|
+| Terminal.app | 5, aucune réponse | 3, 1 | **colonnes différentes** |
+| iTerm2 | 5, 4 | 3, 1 | **colonnes différentes** |
+| Ghostty | 3, 1 | 3, 1 | égales |
+| kitty | 3, 0 | 3, 1 | égales |
+| WezTerm | 3, 3 | 3, 1 | égales |
+
+Colonne : celle du curseur après 👍🏽 (teinte de peau, 4 cases pour un terminal qui ne groupe pas, 2 pour un qui groupe) ; 2027 : la réponse du terminal à `CSI ? 2027 $ p` (1 réglé, 0 inconnu, 3 réglé pour de bon, 4 éteint pour de bon). Les deux écarts sont ceux de terminaux sans 2027 (Terminal.app, iTerm2) : le moteur compte 2 cases et le client écrit 👍 sur 2 cases sans la teinte (`painter::narrowed`), si bien que le programme et l'écran s'accordent, sans la teinte à l'écran. Non vérifié sur capture (pas de go) : ce que montrent réellement ces deux fenêtres.
+
 ## Parité (§7.1 de la spec) : vérifications de l'étape 2
 
 À cocher en natif, en français et en anglais, sous macOS et, pour ce qui n'a pas besoin d'une fenêtre, sous Linux (Alpine). Chaque ligne dit sa preuve :
@@ -431,15 +445,17 @@ Ordre prévu : `mux_team` et son faux `claude` dès maintenant (D, S, H, L), pui
 
 ## Banc de performance
 
+Depuis le 2026-10-12 le banc ne mesure plus tmux (les colonnes « tmux » des tableaux qui suivent sont les chiffres des campagnes passées, gardés pour mémoire) : seuls restent le multiplexeur, l'exécution directe du factice et, pour la mémoire, le moteur d'alacritty.
+
 `tests/mux_bench.rs`, en release, un test à la fois, chaque mesure dans un processus à part (le binaire de test relancé) :
 
 ```sh
 CARGO_TARGET_DIR=<à soi> CARGO_PROFILE_RELEASE_LTO=off cargo test --release --test mux_bench -- --ignored --nocapture --test-threads=1
 ```
 
-Chaque mesure est comparée à tmux (`-L rtest-testeur`, `-f /dev/null`, `history-limit 100000`) dans la même séance. La charge de la machine est notée : seuls les rapports au tmux de la même séance se comparent d'une campagne à l'autre.
+Jusqu'au 2026-10-12, chaque mesure était comparée à tmux (`-L rtest-testeur`, `-f /dev/null`, `history-limit 100000`) dans la même séance, et seuls les rapports au tmux de la même séance se comparaient d'une campagne à l'autre. Cette référence a quitté le banc : pour la latence, la ligne `direct` (le factice seul sur le terminal de test, mesuré dans la même passe) donne l'« ajouté » ; pour le CPU et la mémoire, des chiffres absolus, avec la charge de la machine notée à chaque passe, et, pour comparer deux arbres, la copie de l'arbre de référence lancée en alternance, test par test (méthode de l'étape 3 de la refactorisation).
 
-Seuils (architecte, 2026-10-09) : au repos, 0 octet vers le terminal, CPU indiscernable de 0, au plus 1 réveil par seconde ; latence ajoutée (mux moins direct) p50 ≤ 2 ms et p99 ≤ 16 ms au repos, p99 ≤ 33 ms avec 9 panneaux en flux ; 10 panneaux en flux à 50 images/s au moins ; 0 image partielle ; mémoire comparée à tmux, sans seuil.
+Seuils (architecte, 2026-10-09) : au repos, 0 octet vers le terminal, CPU indiscernable de 0, au plus 1 réveil par seconde ; latence ajoutée (mux moins direct) p50 ≤ 2 ms et p99 ≤ 16 ms au repos, p99 ≤ 33 ms avec 9 panneaux en flux ; 10 panneaux en flux à 50 images/s au moins ; 0 image partielle ; mémoire sans seuil (jusqu'au 2026-10-12 comparée à tmux).
 
 ### Mémoire par panneau, 100 000 lignes (`memory_per_pane`)
 

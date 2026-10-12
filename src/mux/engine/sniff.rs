@@ -31,6 +31,9 @@ pub(super) enum Sniffed {
     SyncEnd,
     /// `CSI ? 2031 h` (mode 2031 among others, maybe): the program asks to be told when the theme changes.
     ThemeReports,
+    /// `CSI ? 2027 l` (mode 2027 among others, maybe, but not 2026, which wins): the program turns grapheme clusters
+    /// off. Its end of a synchronized update is [`Sniffed::SyncEnd`], which the engine takes for this too.
+    GraphemesOff,
     /// `CSI 8 ; rows ; cols t` (XTWINOPS): the program asks for a screen of this size.
     Resize {
         rows: u16,
@@ -145,6 +148,7 @@ impl Sniffer {
                     self.state = Scan::Ground;
                     return match (&self.kept[..], byte) {
                         (kept, b'l') if lists_mode(kept, b"2026") => Some(Sniffed::SyncEnd),
+                        (kept, b'l') if lists_mode(kept, b"2027") => Some(Sniffed::GraphemesOff),
                         (kept, b'h') if lists_mode(kept, b"2031") => Some(Sniffed::ThemeReports),
                         // A cut sequence may have lost the parameters that made it something else.
                         (kept, b't') if kept.len() < CSI_KEPT => window_size(kept),
@@ -380,6 +384,19 @@ mod tests {
         // At the end of a long list of modes, cut anywhere.
         assert_eq!(sniff(&[b"\x1b[?1000;1002;1006;2026l"]), [Sniffed::SyncEnd]);
         assert_eq!(sniff(&[b"\x1b[?1000;1002;10", b"06;1004;2004;2026l"]), [Sniffed::SyncEnd]);
+    }
+
+    #[test]
+    fn grapheme_clusters_turned_off_are_found() {
+        assert_eq!(
+            sniff(&[b"a\x1b[?2027l b \x1b[?1000;2027l\x1b[?2027h\x1b[?20270l\x1b[2027l\x1b[?2026l\x1b[?2027;1006l"]),
+            [Sniffed::GraphemesOff, Sniffed::GraphemesOff, Sniffed::SyncEnd, Sniffed::GraphemesOff]
+        );
+        // Cut anywhere, and at the end of a long list.
+        assert_eq!(sniff(&[b"\x1b[?20", b"27", b"l"]), [Sniffed::GraphemesOff]);
+        assert_eq!(sniff(&[b"\x1b[?1000;1002;10", b"06;1004;2004;2027l"]), [Sniffed::GraphemesOff]);
+        // The end of an update that is also in the list is that, first.
+        assert_eq!(sniff(&[b"\x1b[?2026;2027l"]), [Sniffed::SyncEnd]);
     }
 
     #[test]

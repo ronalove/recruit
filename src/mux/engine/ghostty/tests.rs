@@ -458,6 +458,32 @@ fn cells_are_drawn_as_claude_measures_them() {
 }
 
 #[test]
+fn graphemes_stay_whole_after_a_reset() {
+    let mut engine = engine();
+    // `reset` typed in a shell: the real terminal still groups clusters, so the engine must go on measuring them whole.
+    answer(&mut engine, b"\x1bc");
+    assert_eq!(answer(&mut engine, b"\x1b[?2027$p"), "\x1b[?2027;1$y");
+    answer(&mut engine, "👍🏽x".as_bytes());
+    rows(&engine);
+    assert_eq!(engine.cursor().unwrap().x, 3, "👍🏽 is one cell of two columns");
+}
+
+#[test]
+fn graphemes_stay_whole_whatever_the_program_asks() {
+    // The real terminal draws clusters whole whatever a program asks, so the engine does not follow it on this mode.
+    for off in [&b"\x1b[?2027l"[..], b"\x1b[?1000;2027;1006l", b"\x1b[?2026;2027l"] {
+        let mut engine = engine();
+        // In the same write: what follows the sequence is measured whole already.
+        let mut bytes = off.to_vec();
+        bytes.extend("👍🏽x".as_bytes());
+        answer(&mut engine, &bytes);
+        rows(&engine);
+        assert_eq!(engine.cursor().unwrap().x, 3, "👍🏽 is one cell of two columns after {off:?}");
+        assert_eq!(answer(&mut engine, b"\x1b[?2027$p"), "\x1b[?2027;1$y");
+    }
+}
+
+#[test]
 fn links_and_hidden_text() {
     let mut engine = engine();
     answer(&mut engine, b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ \x1b[8msecret");

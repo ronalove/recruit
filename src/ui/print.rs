@@ -8,6 +8,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::config::Team;
 use crate::t;
+use crate::ui::canvas::{Long, Wrap, text_columns, wrap};
 
 /// The members, one per line: name, role, and whether the user talks to them. A role too long for the terminal goes
 /// on under itself, broken between words.
@@ -62,19 +63,7 @@ fn team_lines(team: &Team, cols: Option<usize>) -> Vec<String> {
 /// `text` on rows of `width` columns at most, broken between words; a word longer than a row has one of its own. One
 /// row at least.
 fn break_words(text: &str, width: usize) -> Vec<String> {
-    let mut rows = vec![String::new()];
-    for word in text.split_whitespace() {
-        let row = rows.last_mut().expect("a row");
-        if row.is_empty() {
-            row.push_str(word);
-        } else if row.width() + 1 + word.width() <= width {
-            row.push(' ');
-            row.push_str(word);
-        } else {
-            rows.push(word.to_string());
-        }
-    }
-    rows
+    wrap(text, width, Wrap::new(Long::Whole).measured(text_columns))
 }
 
 #[cfg(test)]

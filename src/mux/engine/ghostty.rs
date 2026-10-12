@@ -123,8 +123,9 @@ impl Ghostty {
         let mut term = Terminal::new(cols.max(1), rows.max(1)).context("libghostty-vt")?;
         let shared = Arc::new(Mutex::new(Shared::default()));
         term.set_scrollback_max_bytes(None)?.set_scrollback_max_lines(Some(history))?;
-        // Grapheme clusters measured whole, as Claude Code does (Bun.stringWidth).
-        term.set_mode(Mode::GRAPHEME_CLUSTER, true)?;
+        // Grapheme clusters measured whole, as Claude Code does (Bun.stringWidth) and as the real terminal draws them:
+        // the default, so that a full reset (RIS) goes back to it rather than to a cell-by-cell measure.
+        term.set_default_mode(Mode::GRAPHEME_CLUSTER, true)?;
         // DECSCUSR cannot ask for it: what the cursor is when the program asked for nothing.
         term.set_default_cursor_style(Some(CursorStyle::BlockHollow))?;
         term.set_default_fg_color(Some(rgb_color(DEFAULT_FG)))?;
@@ -214,11 +215,26 @@ impl Ghostty {
                 self.armed = false;
                 self.forget_theme();
             }
-            Sniffed::SyncEnd => self.sync_ended(),
+            Sniffed::SyncEnd => {
+                self.sync_ended();
+                // The list that ended the update may have turned graphemes off too ([`Sniffed::GraphemesOff`]).
+                self.keep_graphemes();
+            }
             Sniffed::ThemeReports => self.theme_asked(replies),
+            Sniffed::GraphemesOff => self.keep_graphemes(),
             // The engine does nothing with it: the server decides.
             Sniffed::Resize { rows, cols } => self.relays.push(Relay::Resize { rows, cols }),
         }
+    }
+
+    /// The program turned grapheme clusters (mode 2027) off, or may have: they stay on. The real terminal draws them
+    /// whole whatever a program asks (the client keeps its mode 2027 on, or turns it on where it is known, and never
+    /// follows a pane), so the engine, whose cursor positions and cell widths the program reads back and the screen is
+    /// composed from, measures as it draws: a pane that went cell by cell would shift the rest of the line, and the
+    /// frame around it, by the width the real terminal gives to an emoji with a skin tone or a flag. Setting what is
+    /// already set does nothing, and this runs right after the sequence, before the bytes that follow.
+    fn keep_graphemes(&mut self) {
+        let _ = self.term.set_mode(Mode::GRAPHEME_CLUSTER, true);
     }
 
     /// The program turned mode 2031 on: if it was never told the theme (it did not ask with `CSI ? 996 n`) and the

@@ -15,6 +15,7 @@ use crossterm::{cursor, queue, terminal};
 use unicode_width::UnicodeWidthStr;
 
 use super::Cancelled;
+use super::canvas::{Long, text_columns, wrap_chars};
 use super::terminal::PanicGuard;
 use crate::t;
 
@@ -405,30 +406,7 @@ fn score(label: &[char], filter: &[char]) -> Option<i64> {
 /// breaks.
 fn wrap(pieces: &[(&str, Paint)], width: usize) -> Vec<Row> {
     let chars: Vec<(char, Paint)> = pieces.iter().flat_map(|(t, p)| t.chars().map(move |c| (c, *p))).collect();
-    // Measured as text, like `columns`.
-    let wide = |chars: &[(char, Paint)]| chars.iter().map(|&(c, _)| c).collect::<String>().width();
-    let mut rows: Vec<Vec<(char, Paint)>> = vec![Vec::new()];
-    let mut rest = chars.as_slice();
-    while !rest.is_empty() {
-        let gap = rest.iter().take_while(|(c, _)| *c == ' ').count();
-        let len = rest[gap..].iter().take_while(|(c, _)| *c != ' ').count();
-        let (spaces, word) = (&rest[..gap], &rest[gap..gap + len]);
-        rest = &rest[gap + len..];
-        let row = rows.last_mut().expect("a row");
-        if wide(&[row.as_slice(), spaces, word].concat()) <= width {
-            row.extend(spaces);
-        } else if !row.is_empty() && !word.is_empty() {
-            rows.push(Vec::new());
-        }
-        for &c in word {
-            let row = rows.last_mut().expect("a row");
-            row.push(c);
-            if row.len() > 1 && wide(row) > width {
-                row.pop();
-                rows.push(vec![c]);
-            }
-        }
-    }
+    let rows = wrap_chars(&chars, width, Long::Split, text_columns);
     rows.into_iter()
         .map(|row| {
             let mut pieces: Row = Vec::new();

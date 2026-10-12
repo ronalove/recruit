@@ -8,6 +8,15 @@ fn wait_list_gone(team: &Team, term: &TestTerm) -> bool {
     wait(Duration::from_secs(5), || menu_text(team).is_none() && !shown(term).contains("défaut"))
 }
 
+/// Clicks one cell inside `text` in a header and waits for the list. The text is looked for now, not kept from before:
+/// a header's time is right-aligned and grows ("9s", then "10s"), which moves what is left of it by a cell, and a click
+/// at the old column then lands beside the word (the macOS CI of 7536dc9, "the list opens again").
+fn open_on(team: &Team, term: &mut TestTerm, text: &str) -> Option<ListBox> {
+    let (col, row) = find_in_header(term, text)?;
+    click(term, (col + 1, row));
+    wait_list(team, term)
+}
+
 /// The row of the list where the cursor `›` is, among the rows of `list`.
 fn list_cursor(term: &TestTerm, list: ListBox) -> Option<usize> {
     let screen = term.screen();
@@ -47,13 +56,11 @@ fn quick_list_chooses_a_model_and_an_effort() {
     let before_untouched = untouched(&term);
     let model = find_in_header(&term, "Opus").expect("the model");
     let model_before = look_of(&term, model);
-    let open = |term: &mut TestTerm, at: (usize, usize)| {
-        click(term, at);
-        wait_list(&team, term)
-    };
+    let open = |term: &mut TestTerm, text: &str| open_on(&team, term, text);
 
     // Opens under the text, at the size announced, the text in reverse, nothing dimmed.
-    let Some(list) = open(&mut term, model) else { panic!("no list: {}", shown(&term)) };
+    let Some(list) = open(&mut term, "Opus") else { panic!("no list: {}", shown(&term)) };
+    let model = find_in_header(&term, "Opus").expect("the model, with the list open");
     checks.check("3 under the model: its row is the next", list.y == model.1 + 1, || format!("{list:?} {model:?}"));
     checks.check("3 under the model: the values start at its column", list.x + 4 == model.0, || {
         format!("{list:?} {model:?}")
@@ -106,7 +113,7 @@ fn quick_list_chooses_a_model_and_an_effort() {
         || shown(&term),
     );
     // A click outside, in lead's own pane.
-    if open(&mut term, model).is_some() {
+    if open(&mut term, "Opus").is_some() {
         click(&mut term, (10, 20));
         checks.check("3 a click outside closes", wait_list_gone(&team, &term), || shown(&term));
         checks.check("3 outside: the file is as it was", team_file(&team) == before_file, || team_file(&team));
@@ -119,7 +126,7 @@ fn quick_list_chooses_a_model_and_an_effort() {
         checks.check("3 the list opens again", false, || shown(&term));
     }
     // A second click on the text.
-    if open(&mut term, model).is_some() {
+    if open(&mut term, "Opus").is_some() {
         click(&mut term, (model.0 + 1, model.1));
         checks.check("3 a second click on the text closes", wait_list_gone(&team, &term), || shown(&term));
         checks.check("3 second click: the file is as it was", team_file(&team) == before_file, || team_file(&team));
@@ -132,7 +139,7 @@ fn quick_list_chooses_a_model_and_an_effort() {
         checks.check("3 the list opens a third time", false, || shown(&term));
     }
     // ↓↓ ⏎: « default » is in place, Opus then Sonnet.
-    if let Some(list) = open(&mut term, model) {
+    if let Some(list) = open(&mut term, "Opus") {
         term.send(b"\x1b[B\x1b[B");
         let down = wait(Duration::from_secs(2), || list_cursor(&term, list) == Some(list.y + 3));
         checks.check("3 ↓↓ goes to the third value", down, || format!("{:?}", list_cursor(&term, list)));
@@ -163,7 +170,7 @@ fn quick_list_chooses_a_model_and_an_effort() {
     // The effort: its own list, with the levels.
     let effort = find_in_header(&term, "élevé").expect("the effort");
     let effort_before = look_of(&term, effort);
-    if let Some(list) = open(&mut term, effort) {
+    if let Some(list) = open(&mut term, "élevé") {
         let body = shown(&term);
         for level in ["faible", "moyen", "élevé", "extra", "max"] {
             checks.check(&format!("3 the effort list says {level}"), body.contains(level), || body.clone());
@@ -182,8 +189,7 @@ fn quick_list_chooses_a_model_and_an_effort() {
         checks.check("3 the effort list opens", false, || shown(&term));
     }
     // A click on a value chooses it.
-    let model = find_in_header(&term, "Sonnet").expect("the model");
-    if let Some(list) = open(&mut term, model) {
+    if let Some(list) = open(&mut term, "Sonnet") {
         let haiku = (list.y + 1..list.bottom()).find(|row| term.screen()[*row].contains("Haiku"));
         match haiku {
             Some(row) => {
@@ -340,10 +346,8 @@ fn quick_list_asks_and_refuses() {
     let session = noted(&team, "dev");
     let mut checks = Checks::default();
     let before_file = team_file(&team);
-    let model = find_in_header(&term, "Opus").expect("dev's model");
     // Back to the default starts it again (↻): the question opens in the list, on Annuler.
-    click(&mut term, model);
-    assert!(wait_list(&team, &term).is_some(), "no list: {}", shown(&term));
+    assert!(open_on(&team, &mut term, "Opus").is_some(), "no list: {}", shown(&term));
     checks.check(
         "3 the default row says ↻",
         shown(&term).lines().any(|r| r.contains("défaut") && r.contains('↻')),
@@ -370,8 +374,7 @@ fn quick_list_asks_and_refuses() {
         format!("{:?}", team.launches("dev"))
     });
     // Again, and « Relancer ».
-    click(&mut term, model);
-    if wait_list(&team, &term).is_some() {
+    if open_on(&team, &mut term, "Opus").is_some() {
         term.send(b"\x1b[A");
         term.send(b"\r");
         let _ = wait(Duration::from_secs(10), || shown(&term).contains("Annuler"));
@@ -394,10 +397,8 @@ fn quick_list_asks_and_refuses() {
     let keys = alt(&term, '1');
     term.send(&keys);
     assert!(wait(Duration::from_secs(10), || has_header(&term, "lead")), "{}", shown(&term));
-    let lead = find_in_header(&term, "Opus").expect("lead's model");
     let _read_only = ReadOnly::new(team.proj.join(".recruit"));
-    click(&mut term, lead);
-    if wait_list(&team, &term).is_some() {
+    if open_on(&team, &mut term, "Opus").is_some() {
         term.send(b"\x1b[B");
         term.send(b"\r");
         let refused = wait(Duration::from_secs(10), || shown(&term).contains("✗"));

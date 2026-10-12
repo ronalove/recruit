@@ -6,7 +6,7 @@ use crossterm::style::Color;
 
 use crate::claude::bridge::Task;
 use crate::t;
-use crate::ui::canvas::{columns, fit};
+use crate::ui::canvas::{self, Long, Wrap, columns, fit};
 use crate::ui::look::{self, Glyphs, Pressure, State, duration};
 
 use super::paint::*;
@@ -275,49 +275,7 @@ fn doing_lines_of(
 /// `text` over at most `lines` lines of `width` columns, cut between words, a word longer than a line where it must;
 /// an ellipsis ends the last line when the text goes on. One line at least, empty for an empty text.
 pub(super) fn wrap(text: &str, width: usize, lines: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out: Vec<String> = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        let mut word: Vec<char> = word.chars().collect();
-        loop {
-            let (used, size) =
-                (columns(&line), word.iter().map(|c| columns(c.encode_utf8(&mut [0; 4]))).sum::<usize>());
-            if used > 0 && used + 1 + size <= width {
-                line.push(' ');
-                line.extend(&word);
-                break;
-            }
-            if used > 0 {
-                out.push(std::mem::take(&mut line));
-                continue;
-            }
-            if size <= width {
-                line.extend(&word);
-                break;
-            }
-            // Longer than a line: cut, the rest on the next. One character at least, however wide.
-            let mut taken = 0;
-            let cut = word
-                .iter()
-                .take_while(|c| {
-                    taken += columns(c.encode_utf8(&mut [0; 4]));
-                    taken <= width
-                })
-                .count()
-                .max(1);
-            out.push(word.drain(..cut).collect());
-        }
-    }
-    if !line.is_empty() || out.is_empty() {
-        out.push(line);
-    }
-    let lines = lines.max(1);
-    if out.len() > lines {
-        let rest = out.split_off(lines - 1).join(" ");
-        out.push(fit(&rest, width));
-    }
-    out
+    canvas::wrap(text, width.max(1), Wrap::new(Long::Split).lines(lines))
 }
 
 /// The model, faded (its initial short of room, `?` while it is not known), then the effort's sign and name in Claude

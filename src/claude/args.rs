@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::profile_dir;
+use super::Profile;
 use crate::config::{Member, Team};
 
 /// The settings of a member other than the main contact, for its session only: a status line that prints nothing,
@@ -20,7 +20,7 @@ pub(super) const QUIET: &str = r#"{"statusLine":{"type":"command","command":"tru
 pub fn status_line(dir: &Path, config_dir: Option<&Path>) -> bool {
     let root = git_root(dir).unwrap_or_else(|| dir.to_path_buf());
     let files = [
-        profile_dir(config_dir).join("settings.json"),
+        Profile::of(config_dir).folder().join("settings.json"),
         dir.join(".claude/settings.json"),
         dir.join(".claude/settings.local.json"),
         root.join(".claude/settings.local.json"),

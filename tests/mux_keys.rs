@@ -667,8 +667,17 @@ fn still_ours(pid: u32, app: &str) -> bool {
 type Got = Vec<Option<Vec<u8>>>;
 
 /// One window: `kind` on the fake (`through_mux`: inside a copy of `recruit _mux`), the strokes typed, what the
-/// pane got for each (`None`: not typed, the frontmost window was not the terminal's).
-fn play(kind: &TerminalKind, variant: &str, through_mux: bool, modes: &str, dir: &Path, recruit: &Path) -> Got {
+/// pane got for each (`None`: not typed, the frontmost window was not the terminal's). With `probe_only`, nothing
+/// is typed and the window is not brought to the front: only the fake's probe (see `real_probe`).
+fn play(
+    kind: &TerminalKind,
+    variant: &str,
+    through_mux: bool,
+    modes: &str,
+    dir: &Path,
+    recruit: &Path,
+    probe_only: bool,
+) -> Got {
     let run = dir.join(format!("{}-{variant}-{}", kind.name, if through_mux { "mux" } else { "direct" }));
     std::fs::create_dir_all(&run).expect("run dir");
     let log = run.join("keys.log");
@@ -679,7 +688,7 @@ fn play(kind: &TerminalKind, variant: &str, through_mux: bool, modes: &str, dir:
     let vars = [
         ("KEYLOG_FILE", log.to_string_lossy().into_owned()),
         ("KEYLOG_MODES", modes.to_string()),
-        ("KEYLOG_PROBE", "1".to_string()),
+        ("KEYLOG_PROBE", if probe_only { "2" } else { "1" }.to_string()),
         ("KEYLOG_TITLE", title.clone()),
     ];
     let fake = common::child_words("keylog", &vars);
@@ -726,7 +735,14 @@ fn play(kind: &TerminalKind, variant: &str, through_mux: bool, modes: &str, dir:
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    let strokes = strokes();
+    let strokes: Vec<Stroke> = if probe_only {
+        // Probes only, by construction: a reordering of `strokes()` can never make a key typed here.
+        let probes: Vec<Stroke> = strokes().into_iter().filter(|s| s.script.is_empty()).collect();
+        assert!(!probes.is_empty() && probes.iter().all(|s| s.script.is_empty()), "no probe among the strokes");
+        probes
+    } else {
+        strokes()
+    };
     let Some(fake_pid) = fake_pid else {
         println!("{} ({variant}) : le factice n'a pas démarré", kind.name);
         return vec![None; strokes.len()];
@@ -740,7 +756,7 @@ fn play(kind: &TerminalKind, variant: &str, through_mux: bool, modes: &str, dir:
     };
     // A guard that fails stops this window only (the next terminal is played); Ctrl-C (`STOP`) stops everything.
     let mut halted = false;
-    if let Err(why) = activate(app_pid, &title) {
+    if !probe_only && let Err(why) = activate(app_pid, &title) {
         println!("{} ({variant}) : la fenêtre de test n'est pas venue au premier plan : {why} ; rien tapé", kind.name);
         halted = true;
     }
@@ -754,9 +770,19 @@ fn play(kind: &TerminalKind, variant: &str, through_mux: bool, modes: &str, dir:
             continue;
         }
         if stroke.script.is_empty() {
-            // The probe: what came in since the fake started.
+            // The probe: what came in since the fake started. Alone, the answers are waited for (5 s at most): the
+            // window is not in front, and a terminal may answer late.
             std::thread::sleep(Duration::from_millis(800));
-            let (new, len) = read_log(&log, seen);
+            let (mut new, mut len) = read_log(&log, seen);
+            let answered = |lines: &[String]| {
+                let bytes = bytes_of(lines);
+                bytes.contains(&b'R') && bytes.windows(2).any(|w| w == b"$y")
+            };
+            let started = Instant::now();
+            while probe_only && !answered(&new) && started.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(100));
+                (new, len) = read_log(&log, seen);
+            }
             seen = len;
             got.push(Some(bytes_of(&new)));
             continue;
@@ -856,8 +882,8 @@ fn real_keys() {
                     if STOP.load(Ordering::SeqCst) {
                         return;
                     }
-                    let direct = play(kind, variant, false, mode, dir.path(), &recruit);
-                    let mux = play(kind, variant, true, mode, dir.path(), &recruit);
+                    let direct = play(kind, variant, false, mode, dir.path(), &recruit, false);
+                    let mux = play(kind, variant, true, mode, dir.path(), &recruit, false);
                     println!();
                     println!("### {} ({variant}), factice {mode}", kind.name);
                     println!();
@@ -893,6 +919,97 @@ fn real_keys() {
         // The saved copy stays on disk, with the commands that put it back printed above.
         let kept = dir.keep();
         println!("Dossier du passage gardé : {}", kept.display());
+    }
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// What a probe answer says: the cursor's column after 👍🏽 (`CSI row ; col R`) and the terminal's answer to
+/// `CSI ? 2027 $ p` (`CSI ? 2027 ; n $ y`), each if present.
+fn probe_answers(bytes: &[u8]) -> (Option<usize>, Option<u8>) {
+    let text = String::from_utf8_lossy(bytes);
+    let column = text.split("\x1b[").skip(1).find_map(|part| {
+        let (row_col, _) = part.split_once('R')?;
+        let (row, col) = row_col.split_once(';')?;
+        row.chars().all(|c| c.is_ascii_digit()).then_some(())?;
+        col.parse().ok()
+    });
+    let mode = text.split_once("\x1b[?2027;").and_then(|(_, rest)| rest.split_once("$y")?.0.parse().ok());
+    (column, mode)
+}
+
+#[test]
+fn probe_answers_are_read() {
+    assert_eq!(probe_answers(b"\x1b[2;3R\x1b[?2027;1$y"), (Some(3), Some(1)));
+    assert_eq!(probe_answers(b"\x1b[2;5R"), (Some(5), None));
+    assert_eq!(probe_answers(b"\x1b[?2027;0$y"), (None, Some(0)));
+    assert_eq!(probe_answers(b"nothing"), (None, None));
+}
+
+/// U3 and U6 in real terminals: windows only, no key typed and no window captured. Each terminal (`PROBE_TERMINALS`
+/// to choose them) opens on the keys fake with `KEYLOG_PROBE=2`, direct and then inside a native server with the
+/// real client; the fake writes 👍🏽 and asks for the cursor position and for mode 2027. The answers say how many
+/// cells the terminal (direct) or the multiplexer's engine (through the client) gave the emoji, and whether 2027 is
+/// known; the columns must be equal. Nothing at all without `SHOTS_CONSENT=<today's date>`, given with the user's go
+/// (the windows show on their screen, and some come to the front), and the test named:
+///
+/// ```sh
+/// SHOTS_CONSENT=$(date +%F) RECRUIT_BIN=<copy of the binary> cargo test --test mux_keys -- --ignored --nocapture
+/// --test-threads=1 real_probe
+/// ```
+#[test]
+#[ignore = "opens windows on the user's screen: needs SHOTS_CONSENT, see its doc"]
+fn real_probe() {
+    if !common::consented("SHOTS_CONSENT", "windows open on the user's screen", "real_probe") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let recruit = common::recruit_copy(dir.path());
+    // SAFETY: the handler only stores to an atomic. Ctrl-C ends the window in progress, and iTerm2's profile is put
+    // back, as in `real_keys`.
+    unsafe { libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t) };
+    let chosen = std::env::var("PROBE_TERMINALS").unwrap_or_default();
+    // iTerm2's profile, only if iTerm2 is played and not running (it is skipped then).
+    let iterm = TERMINALS.iter().find(|k| k.name == "iterm2").expect("iterm2");
+    let mut iterm_profile = (chosen.is_empty() || chosen.split(',').any(|c| c == "iterm2"))
+        .then(|| single_instance(iterm).is_none().then(ItermProfile::install))
+        .flatten();
+    println!();
+    println!("| Terminal | Direct : colonne, 2027 | Via le client : colonne, 2027 | Verdict |");
+    println!("|---|---|---|---|");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for kind in TERMINALS.iter().filter(|k| chosen.is_empty() || chosen.split(',').any(|c| c == k.name)) {
+            if STOP.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Some(process) = single_instance(kind) {
+                println!("| {} | sauté : l'application tourne déjà (pid {process}) | | |", kind.name);
+                continue;
+            }
+            let variant = kind.variants[0];
+            let direct = play(kind, variant, false, "plain", dir.path(), &recruit, true);
+            let mux = play(kind, variant, true, "plain", dir.path(), &recruit, true);
+            let answers = |got: &Got| got.first().cloned().flatten().map(|bytes| probe_answers(&bytes));
+            let show = |a: &Option<(Option<usize>, Option<u8>)>| match a {
+                None => "pas de fenêtre".to_string(),
+                Some((column, mode)) => format!(
+                    "{}, {}",
+                    column.map_or("pas de réponse".to_string(), |c| c.to_string()),
+                    mode.map_or("pas de réponse".to_string(), |m| m.to_string())
+                ),
+            };
+            let (d, m) = (answers(&direct), answers(&mux));
+            let verdict = match (&d, &m) {
+                (Some((Some(a), _)), Some((Some(b), _))) if a == b => "colonnes égales",
+                (Some((Some(_), _)), Some((Some(_), _))) => "colonnes différentes",
+                _ => "pas de mesure",
+            };
+            println!("| {} | {} | {} | {verdict} |", kind.name, show(&d), show(&m));
+        }
+    }));
+    if let Some(profile) = &mut iterm_profile {
+        profile.restore();
     }
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);

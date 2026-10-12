@@ -48,9 +48,7 @@ const KEYBOARD_NONE: u8 = 0;
 const KEYBOARD_KITTY: u8 = 1;
 const KEYBOARD_MODIFY: u8 = 2;
 
-/// Whether mode 2027 (grapheme clusters) was on, and turned off: turned on again only then.
-static GRAPHEMES_OFF: AtomicBool = AtomicBool::new(false);
-/// Whether it was off, and turned on: turned off again only then.
+/// Whether mode 2027 (grapheme clusters) was off, and turned on: turned off again only then.
 static GRAPHEMES_ON: AtomicBool = AtomicBool::new(false);
 
 /// The real terminal while the multiplexer is on it: raw, alternate screen, cursor hidden, mouse (presses, drags,
@@ -76,17 +74,11 @@ pub(crate) struct Terminal {
 }
 
 impl Terminal {
-    /// Sets the terminal up, after asking what it can do (see [`Caps`]); grapheme clusters (2027) off, see
-    /// [`Terminal::open_with`].
+    /// Sets the terminal up, after asking what it can do (see [`Caps`]). Grapheme clusters (mode 2027) are measured as
+    /// the engine measures them, whole, where the terminal knows the mode: kept on where it is (Ghostty has it on by
+    /// default), turned on where it is off, and given back as it was. Elsewhere the painter writes a cluster in
+    /// pieces (`Features::graphemes`).
     pub(crate) fn open() -> io::Result<(Terminal, Caps)> {
-        Terminal::open_with(false)
-    }
-
-    /// The same, with grapheme clusters (mode 2027) measured as the engine measures them, where the terminal knows the
-    /// mode: on when `graphemes` (an engine that measures them whole), off otherwise (Ghostty has them on by
-    /// default: an engine that measures code point by code point gives 👍🏽 two wide cells, which the terminal would
-    /// join into one, and the rest of the line would move left). Given back as it was.
-    pub(crate) fn open_with(graphemes: bool) -> io::Result<(Terminal, Caps)> {
         let input = tty()?;
         crossterm::terminal::enable_raw_mode()?;
         // From here, Drop puts the terminal back.
@@ -102,14 +94,13 @@ impl Terminal {
             _panic: Guard::install(),
         };
         let answers = terminal.probe()?;
-        let caps = caps(&answers, |name| std::env::var(name).ok());
-        // Hidden: what the probe heard, for the terminals' grid (specs/multiplexeur-compat.md).
+        let mut caps = caps(&answers, |name| std::env::var(name).ok());
+        let setup = setup(&answers, &caps);
+        caps.output.graphemes = setup.graphemes_active;
+        // Hidden: what the probe heard and what is used of it, for the terminals' grid (specs/multiplexeur-compat.md).
         if let Some(path) = std::env::var_os("RECRUIT_MUX_CAPS") {
             let _ = std::fs::write(path, report(&answers, &caps, |name| std::env::var(name).ok()));
         }
-        let setup = setup(&answers, &caps, graphemes);
-        let mut caps = caps;
-        caps.output.graphemes = setup.graphemes_active;
         setup.arm();
         terminal.write(&setup.bytes)?;
         terminal.setup = Some(setup);
@@ -274,7 +265,6 @@ fn mouse_change(motion: bool) -> &'static [u8] {
 struct Setup {
     bytes: Vec<u8>,
     kitty: bool,
-    graphemes_off: bool,
     graphemes_on: bool,
     /// Mode 2027 on once set up: the terminal measures grapheme clusters whole (`Features::graphemes`).
     graphemes_active: bool,
@@ -284,28 +274,22 @@ impl Setup {
     /// Says what [`leave`] will have to undo.
     fn arm(&self) {
         KEYBOARD.store(if self.kitty { KEYBOARD_KITTY } else { KEYBOARD_MODIFY }, Ordering::SeqCst);
-        GRAPHEMES_OFF.store(self.graphemes_off, Ordering::SeqCst);
         GRAPHEMES_ON.store(self.graphemes_on, Ordering::SeqCst);
     }
 }
 
-fn setup(answers: &Answers, caps: &Caps, graphemes: bool) -> Setup {
+fn setup(answers: &Answers, caps: &Caps) -> Setup {
     let mut bytes = ENTER.to_vec();
     let kitty = caps.kitty_keyboard;
     bytes.extend_from_slice(if kitty { KITTY_PUSH } else { MODIFY_OTHER_KEYS });
-    // Measured as the engine measures: turned off when set (1) and on when reset (2); set or reset for good (3, 4),
+    // Measured as the engine measures: kept when set (1), turned on when reset (2); set or reset for good (3, 4),
     // or unknown, it stays.
-    let graphemes_off = !graphemes && answers.modes.contains(&(2027, 1));
-    let graphemes_on = graphemes && answers.modes.contains(&(2027, 2));
-    if graphemes_off {
-        bytes.extend_from_slice(b"\x1b[?2027l");
-    }
+    let graphemes_on = answers.modes.contains(&(2027, 2));
     if graphemes_on {
         bytes.extend_from_slice(b"\x1b[?2027h");
     }
-    let graphemes_active = answers.modes.contains(&(2027, 3))
-        || (graphemes && (answers.modes.contains(&(2027, 1)) || answers.modes.contains(&(2027, 2))));
-    Setup { bytes, kitty, graphemes_off, graphemes_on, graphemes_active }
+    let graphemes_active = [1, 2, 3].iter().any(|state| answers.modes.contains(&(2027, *state)));
+    Setup { bytes, kitty, graphemes_on, graphemes_active }
 }
 
 /// The terminal as before: see [`LEAVE`]. Out of raw mode last.
@@ -319,9 +303,6 @@ fn leave() {
             let _ = out.write_all(b"\x1b[>4m");
         }
         _ => {}
-    }
-    if GRAPHEMES_OFF.swap(false, Ordering::SeqCst) {
-        let _ = out.write_all(b"\x1b[?2027h");
     }
     if GRAPHEMES_ON.swap(false, Ordering::SeqCst) {
         let _ = out.write_all(b"\x1b[?2027l");
@@ -572,35 +553,25 @@ mod tests {
     use crate::mux::input::probe::tests::{env, heard};
     use crate::mux::input::{Key, KeyCode, Mods};
     #[test]
-    fn grapheme_clusters_turned_off_only_where_on() {
+    fn grapheme_clusters_kept_or_turned_on_where_known() {
         let ends = |setup: &Setup, tail: &[u8]| setup.bytes.ends_with(tail);
-        // Ghostty 1.3.1: 2027 on by default.
+        // Ghostty 1.3.1: 2027 on by default; kept, and left on at the end.
         let (ghostty, _) = heard(b"\x1b[?0u\x1b[?2026;2$y\x1b[?2027;1$y\x1b[?62;22;52c");
-        let caps = caps(&ghostty, env(&[]));
-        let off = setup(&ghostty, &caps, false);
-        assert!(off.graphemes_off && off.kitty && !off.graphemes_active);
-        assert!(ends(&off, b"\x1b[>1u\x1b[?2027l"), "{:?}", off.bytes.escape_ascii().to_string());
-        // Kept on for an engine that measures them whole.
-        let kept = setup(&ghostty, &caps, true);
-        assert!(!kept.graphemes_off && !kept.graphemes_on && kept.graphemes_active && ends(&kept, KITTY_PUSH));
-        // Known but off (2): turned on for such an engine, left off otherwise.
+        let kept = setup(&ghostty, &caps(&ghostty, env(&[])));
+        assert!(!kept.graphemes_on && kept.graphemes_active && kept.kitty && ends(&kept, KITTY_PUSH));
+        assert!(!kept.bytes.windows(8).any(|w| w == b"\x1b[?2027l" || w == b"\x1b[?2027h"));
+        // Known but off (2): turned on, and off again at the end.
         let (known, _) = heard(b"\x1b[?2027;2$y");
-        let known_caps = super::caps(&known, env(&[]));
-        let on = setup(&known, &known_caps, true);
-        assert!(on.graphemes_on && !on.graphemes_off && on.graphemes_active && ends(&on, b"\x1b[?2027h"));
-        let left = setup(&known, &known_caps, false);
-        assert!(!left.graphemes_on && !left.graphemes_off && !left.graphemes_active);
-        assert!(ends(&left, MODIFY_OTHER_KEYS));
-        // For good (3, 4), unknown (0), or not answered (Terminal.app): nothing to do, either way.
+        let on = setup(&known, &caps(&known, env(&[])));
+        assert!(on.graphemes_on && on.graphemes_active && ends(&on, b"\x1b[?2027h"));
+        // For good (3 on; 4 off), unknown (0), or not answered (Terminal.app, tmux): nothing to do; the terminal
+        // measures them whole only where it is on for good.
         for answer in [&b"\x1b[?2027;3$y"[..], b"\x1b[?2027;4$y", b"\x1b[?2027;0$y", b""] {
             let (answers, _) = heard(answer);
-            for graphemes in [false, true] {
-                let plain = setup(&answers, &super::caps(&answers, env(&[])), graphemes);
-                assert!(!plain.graphemes_off && !plain.graphemes_on, "{answer:?} {graphemes}");
-                assert!(!plain.kitty && ends(&plain, MODIFY_OTHER_KEYS), "{answer:?} {graphemes}");
-                // On for good, the terminal measures them whole whatever we ask; off for good or unknown, not.
-                assert_eq!(plain.graphemes_active, answer == b"\x1b[?2027;3$y", "{answer:?} {graphemes}");
-            }
+            let plain = setup(&answers, &caps(&answers, env(&[])));
+            assert!(!plain.graphemes_on, "{answer:?}");
+            assert!(!plain.kitty && ends(&plain, MODIFY_OTHER_KEYS), "{answer:?}");
+            assert_eq!(plain.graphemes_active, answer == b"\x1b[?2027;3$y", "{answer:?}");
         }
     }
 

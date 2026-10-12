@@ -527,9 +527,7 @@ fn deserialize(table: toml::Table, file: &Path) -> Result<Settings> {
                 at
             ));
         }
-    }
-    // A tab with the title of the ones recruit makes would make two windows of one title.
-    for (name, team) in &settings.teams {
+        // A tab with the title of the ones recruit makes would make two windows of one title.
         if let Some((member, tab)) = team
             .members
             .iter()

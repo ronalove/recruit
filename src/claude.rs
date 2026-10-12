@@ -93,11 +93,30 @@ pub fn command(claude: &Path, config_dir: Option<&Path>) -> Command {
     command
 }
 
-/// The profile's folder: the settings' one, else the environment's. None: Claude Code's default.
-fn profile(config_dir: Option<&Path>) -> Option<PathBuf> {
-    config_dir
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::var_os(CONFIG_DIR).filter(|d| !d.is_empty()).map(PathBuf::from))
+/// A Claude Code profile: the folder `CLAUDE_CONFIG_DIR` names, or Claude Code's default when none does. What Claude
+/// keeps in it has two homes: its own folder (`<profile>`, `~/.claude` by default) and its global configuration, which
+/// sits inside the folder of a profile but beside `~/.claude` in the default one (`~/.claude.json`).
+struct Profile(Option<PathBuf>);
+
+impl Profile {
+    /// The settings' profile, else the environment's. None: Claude Code's default.
+    fn of(config_dir: Option<&Path>) -> Self {
+        Self::pick(config_dir, std::env::var_os(CONFIG_DIR))
+    }
+
+    fn pick(config_dir: Option<&Path>, env: Option<std::ffi::OsString>) -> Self {
+        Self(config_dir.map(Path::to_path_buf).or_else(|| env.filter(|d| !d.is_empty()).map(PathBuf::from)))
+    }
+
+    /// Where the profile keeps its sessions, conversations and settings.
+    fn folder(&self) -> PathBuf {
+        self.0.clone().unwrap_or_else(|| home().join(".claude"))
+    }
+
+    /// The global configuration (`.claude.json`): the folder's own in a profile, `~/.claude.json` in the default one.
+    fn global_config(&self) -> PathBuf {
+        self.0.clone().unwrap_or_else(home).join(".claude.json")
+    }
 }
 
 /// Claude sessions open on this machine (`claude agents --json`).
@@ -112,7 +131,7 @@ pub fn running(claude: &Path, config_dir: Option<&Path>) -> Result<Vec<Running>>
 /// Whether Claude Code trusts this folder, as recorded in its global configuration: the folder or one of its
 /// parents approved. None when the configuration cannot be read.
 pub fn trusted(dir: &Path, config_dir: Option<&Path>) -> Option<bool> {
-    let file = profile(config_dir).unwrap_or_else(home).join(".claude.json");
+    let file = Profile::of(config_dir).global_config();
     let config: serde_json::Value = serde_json::from_slice(&fs::read(file).ok()?).ok()?;
     let projects = config.get("projects")?.as_object()?;
     Some(dir.ancestors().any(|d| {
@@ -122,11 +141,6 @@ pub fn trusted(dir: &Path, config_dir: Option<&Path>) -> Option<bool> {
             .and_then(serde_json::Value::as_bool)
             == Some(true)
     }))
-}
-
-/// Where the profile keeps its conversations, among others.
-fn profile_dir(config_dir: Option<&Path>) -> PathBuf {
-    profile(config_dir).unwrap_or_else(|| home().join(".claude"))
 }
 
 #[cfg(test)]
@@ -150,6 +164,25 @@ mod tests {
         let only = std::env::join_paths([first.path()]).unwrap();
         assert_eq!(find_in(&only, Path::new("claude")), None);
         assert_eq!(find_in(&path, Path::new("absent")), None);
+    }
+
+    /// The default profile keeps its configuration beside its folder (`~/.claude.json`), a named one inside it.
+    #[test]
+    fn the_places_of_a_profile() {
+        let named = Profile::pick(Some(Path::new("/opt/perso")), None);
+        assert_eq!(named.folder(), Path::new("/opt/perso"));
+        assert_eq!(named.global_config(), Path::new("/opt/perso/.claude.json"));
+        let default = Profile::pick(None, None);
+        assert_eq!(default.folder(), home().join(".claude"));
+        assert_eq!(default.global_config(), home().join(".claude.json"));
+        // The environment names a profile when the settings do not; an empty one names none, the settings win.
+        let env = Profile::pick(None, Some("/opt/env".into()));
+        assert_eq!(env.global_config(), Path::new("/opt/env/.claude.json"));
+        assert_eq!(Profile::pick(None, Some("".into())).folder(), home().join(".claude"));
+        assert_eq!(
+            Profile::pick(Some(Path::new("/opt/perso")), Some("/opt/env".into())).folder(),
+            Path::new("/opt/perso")
+        );
     }
 
     #[test]

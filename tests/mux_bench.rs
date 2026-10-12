@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! The native multiplexer's bench (spec §9, "Performance"): reproducible figures, compared with tmux in the same
-//! run. Ignored by `cargo test`; run in release, one test at a time:
+//! The native multiplexer's bench (spec §9, "Performance"): reproducible figures. Ignored by `cargo test`; run in
+//! release, one test at a time:
 //!
 //! ```sh
 //! CARGO_PROFILE_RELEASE_LTO=off cargo test --release --test mux_bench -- --ignored --nocapture --test-threads=1
@@ -28,7 +28,7 @@ use common::{Usage, fakes, mib};
 /// Rows of every pane in the memory measures: a tall pane, as on a laptop screen.
 const ROWS: usize = 50;
 
-/// The history every pane keeps, as tmux's `history-limit` does today.
+/// The history every pane keeps.
 const HISTORY: usize = 100_000;
 
 /// The entry point of every child: does what `common::CHILD` names, then exits.
@@ -92,7 +92,7 @@ fn engine_memory_child() {
 }
 
 /// Writes `BENCH_LINES` history lines to stdout, says so on the last line, then stays quiet until killed: the
-/// fake program of the tmux baseline.
+/// pane of `memory_through_mux`.
 fn history_child() {
     let cols = common::env_usize("BENCH_COLS", 120);
     let lines = common::env_usize("BENCH_LINES", HISTORY + ROWS);
@@ -150,72 +150,12 @@ fn engine_memory(cols: usize, panes: usize, full: bool) -> Memory {
     }
 }
 
-/// tmux 3.5 or later, with `history-limit 100000`: `panes` panes of `cols` columns, each running the history
-/// fake. What the tmux server gained over a server with one idle pane.
-fn tmux_memory(cols: usize, panes: usize, full: bool) -> Memory {
-    let _ = common::tmux().arg("kill-server").stderr(Stdio::null()).status();
-    // A server that is still exiting would refuse the new session.
-    std::thread::sleep(Duration::from_millis(300));
-    let size = [cols.to_string(), ROWS.to_string()];
-    // A server still exiting refuses the session now and then: three tries.
-    let mut tries = 0;
-    loop {
-        let output = common::tmux()
-            .args(["new-session", "-d", "-s", "bench", "-x", &size[0], "-y", &size[1], "sleep 3600"])
-            .stdin(Stdio::null())
-            .output()
-            .expect("tmux");
-        if output.status.success() {
-            break;
-        }
-        tries += 1;
-        assert!(tries < 3, "tmux new-session: {}", String::from_utf8_lossy(&output.stderr).trim());
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    common::tmux_run(["set-option", "-g", "history-limit", &HISTORY.to_string()]);
-    let server: u32 = common::tmux_run(["display-message", "-p", "#{pid}"]).parse().expect("tmux pid");
-    std::thread::sleep(Duration::from_millis(300));
-    let before = Usage::of(server).expect("tmux usage");
-    let vars = [("BENCH_COLS", cols.to_string()), ("BENCH_FULL", if full { "1" } else { "0" }.to_string())];
-    let words: Vec<String> =
-        common::child_words("history", &vars).iter().map(|w| w.to_string_lossy().into_owned()).collect();
-    let command = shlex::try_join(words.iter().map(String::as_str)).expect("command");
-    for _ in 0..panes {
-        // One window per pane, each of the same size: the server keeps every window's history.
-        common::tmux_run(["new-window", "-d", "-t", "=bench", &command]);
-    }
-    // tmux drops a tenth of the history when it is full: the fake's last line says when it is done.
-    let deadline = Instant::now() + Duration::from_secs(300);
-    loop {
-        let windows = common::tmux_run(["list-windows", "-t", "=bench", "-F", "#{window_index}"]);
-        let done = windows
-            .lines()
-            .filter(|w| *w != "0")
-            .filter(|w| common::tmux_run(["capture-pane", "-p", "-t", &format!("=bench:{w}")]).contains("history-done"))
-            .count();
-        if done >= panes {
-            break;
-        }
-        assert!(Instant::now() < deadline, "tmux panes still filling: {done} of {panes} done");
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    std::thread::sleep(Duration::from_millis(500));
-    let after = Usage::of(server).expect("tmux usage");
-    let _ = common::tmux().arg("kill-server").status();
-    Memory {
-        footprint: after.footprint.saturating_sub(before.footprint),
-        resident: after.resident.saturating_sub(before.resident),
-        virtual_size: after.virtual_size.saturating_sub(before.virtual_size),
-    }
-}
-
-/// Memory per pane with 100 000 lines of history: alacritty's engine alone, and
-/// tmux, for 80, 120 and 200 columns, lines of spread lengths ("typical") and full lines. Per pane: the slope
-/// between 1 and 10 panes, so that what a process costs once does not count.
+/// Memory per pane with 100 000 lines of history: alacritty's engine alone (the reference the native engine is
+/// compared with), for 80, 120 and 200 columns, lines of spread lengths ("typical") and full lines. Per pane: the
+/// slope between 1 and 10 panes, so that what a process costs once does not count.
 #[test]
 #[ignore = "bench: run in release, see the module's doc"]
 fn memory_per_pane() {
-    let tmux = common::has_tmux();
     println!();
     println!(
         "| Lines | Columns | Engine | 1 pane: footprint | 10 panes: footprint | Per pane: footprint | Per pane: resident | Per pane: virtual |"
@@ -226,10 +166,7 @@ fn memory_per_pane() {
     let replay = std::env::var_os("BENCH_REPLAY").is_some();
     for &full in kinds {
         for cols in [80, 120, 200] {
-            let mut rows = vec![("alacritty 0.26", engine_memory(cols, 1, full), engine_memory(cols, 10, full))];
-            if tmux {
-                rows.push(("tmux", tmux_memory(cols, 1, full), tmux_memory(cols, 10, full)));
-            }
+            let rows = [("alacritty 0.26", engine_memory(cols, 1, full), engine_memory(cols, 10, full))];
             for (engine, one, ten) in rows {
                 let per = |a: u64, b: u64| mib(b.saturating_sub(a)) / 9.0;
                 println!(
@@ -273,7 +210,7 @@ impl Lcg {
 /// Percentiles of a set of durations, in milliseconds.
 struct Spread {
     /// Bytes and frames per second sent to the outer terminal, and the CPU of the measured process (the
-    /// multiplexer, or tmux's server) in percent of one core, over the samples.
+    /// multiplexer) in percent of one core, over the samples.
     out_mib_s: f64,
     frames_s: f64,
     cpu: f64,
@@ -327,8 +264,6 @@ enum Setup {
     /// A native server of the test's own (`common::server`) with `panes` panes, the echo first (it has the
     /// focus), the others `others`, and a real client on the test's terminal.
     Mux { panes: usize, others: &'static str },
-    /// tmux, likewise.
-    Tmux { panes: usize, others: &'static str },
 }
 
 /// Starts `setup` on a test terminal and gives the focus to the echo pane; returns the terminal and the count of
@@ -346,7 +281,7 @@ fn start(
     let _ = std::fs::remove_file(&lock);
     let (panes, others) = match setup {
         Setup::Direct => (1, "idle"),
-        Setup::Mux { panes, others } | Setup::Tmux { panes, others } => (*panes, *others),
+        Setup::Mux { panes, others } => (*panes, *others),
     };
     let mut vars = vec![
         ("ONE_OF_LOCK", lock.to_string_lossy().into_owned()),
@@ -375,29 +310,8 @@ fn start(
             assert!(term.wait_for(&fakes::echo_marker(1), Duration::from_secs(5)), "{:#?}", term.screen());
             return (term, 1, Some(server));
         }
-        Setup::Tmux { .. } => {
-            let _ = common::tmux().arg("kill-server").stderr(Stdio::null()).status();
-            std::thread::sleep(Duration::from_millis(300));
-            let command = shlex::try_join(fake.iter().map(|w| w.to_str().expect("UTF-8"))).expect("command");
-            // As recruit's own tmux configuration has it (escape-time 10), and without a status line. In a file:
-            // set by commands after `new-session`, escape-time did not reach the client it attached.
-            let conf = dir.join("tmux.conf");
-            std::fs::write(&conf, "set -s escape-time 10\nset -g status off\n").expect("tmux.conf");
-            let conf = conf.to_string_lossy().into_owned();
-            let mut args: Vec<String> =
-                ["-L", common::TMUX_SOCKET, "-f", &conf, "new-session", "-s", "lat"].map(String::from).to_vec();
-            args.push(command.clone());
-            for _ in 1..panes {
-                args.extend([";".into(), "split-window".into(), command.clone()]);
-                args.extend([";".into(), "select-layout".into(), "tiled".into()]);
-            }
-            TestTerm::spawn(std::ffi::OsStr::new("tmux"), &args, &[], cols, rows, profile)
-        }
     };
     assert!(term.wait_for(&fakes::echo_marker(0), Duration::from_secs(10)), "no echo pane: {:#?}", term.screen());
-    if matches!(setup, Setup::Tmux { .. }) && std::env::var_os("BENCH_DEBUG").is_some() {
-        println!("tmux : {}", common::tmux_run(["show-options", "-s", "escape-time"]));
-    }
     // Find the pane that echoes: a probe byte, then the next pane, until the echo counts it. The count is read
     // on the screen each time: a probe that reached the echo late still counts.
     for _ in 0..panes {
@@ -405,9 +319,6 @@ fn start(
         term.send(b"x");
         if term.wait_for(&fakes::echo_marker(seen + 1), Duration::from_secs(2)) {
             return (term, seen + 1, None);
-        }
-        if let Setup::Tmux { .. } = setup {
-            common::tmux_run(["select-pane", "-t", "=lat:.+"]);
         }
         std::thread::sleep(Duration::from_millis(300));
     }
@@ -422,13 +333,9 @@ fn usage(pid: u32) -> Usage {
     })
 }
 
-/// The processes whose cost is measured: the multiplexer's server and its client, tmux's server, or the fake
-/// alone.
+/// The processes whose cost is measured: the multiplexer's server and its client, or the fake alone.
 fn measured(setup: &Setup, term: &TestTerm, server: Option<&Server>) -> Vec<u32> {
     match (setup, server) {
-        (Setup::Tmux { .. }, _) => {
-            vec![common::tmux_run(["display-message", "-p", "#{pid}"]).parse().expect("tmux pid")]
-        }
         (Setup::Mux { .. }, Some(server)) => vec![server.pid(), term.pid()],
         _ => vec![term.pid()],
     }
@@ -461,9 +368,6 @@ fn stop(setup: &Setup, term: TestTerm, server: Option<Server>) {
             if let Some(mut server) = server {
                 server.stop();
             }
-        }
-        Setup::Tmux { .. } => {
-            let _ = common::tmux().arg("kill-server").status();
         }
         Setup::Direct => {}
     }
@@ -523,7 +427,7 @@ fn latency(setup: &Setup, key: Key, profile: Profile, dir: &std::path::Path, ext
 
 /// Latency added to a key: typed on the outer terminal, echoed by a fake in the
 /// focused pane, read back on the outer screen. The reference is the fake alone on the test's terminal; the
-/// multiplexer and tmux each with 1 pane, then 10 (9 of them flooding). Then Escape alone, which a terminal
+/// multiplexer with 1 pane, then 10 (9 of them flooding). Then Escape alone, which a terminal
 /// reader might hold back to see whether a sequence follows.
 #[test]
 #[ignore = "bench: run in release, see the module's doc"]
@@ -537,12 +441,7 @@ fn latency_added() {
         ("recruit, 10 panes, 9 flooding", Setup::Mux { panes: 10, others: "flood" }, vec![]),
         ("recruit, 10 panes, 9 in 120 KB frames", Setup::Mux { panes: 10, others: "flood" }, frames()),
     ];
-    if common::has_tmux() {
-        setups.push(("tmux, 1 pane", Setup::Tmux { panes: 1, others: "idle" }, vec![]));
-        setups.push(("tmux, 10 panes, 9 flooding", Setup::Tmux { panes: 10, others: "flood" }, vec![]));
-        setups.push(("tmux, 10 panes, 9 in 120 KB frames", Setup::Tmux { panes: 10, others: "flood" }, frames()));
-    }
-    // `LATENCY_ONLY=mux` (or `tmux`, `direct`) keeps the setups whose name starts so; `LATENCY_KEYS=x`.
+    // `LATENCY_ONLY=recruit` (or `direct`) keeps the setups whose name starts so; `LATENCY_KEYS=x`.
     if let Ok(only) = std::env::var("LATENCY_ONLY") {
         setups.retain(|(name, ..)| name.starts_with(&only) || name.contains(&only));
     }
@@ -584,7 +483,7 @@ fn latency_added() {
     }
 }
 
-/// What the measured processes (the multiplexer's server and client, or tmux's server) cost over `secs` seconds.
+/// What the measured processes (the multiplexer's server and client) cost over `secs` seconds.
 struct Cost {
     cpu: f64,
     wakeups_s: f64,
@@ -628,62 +527,36 @@ type Run = (String, Setup, Env, u64);
 /// What goes in the fakes' environment on top of their role's.
 type Env = Vec<(&'static str, String)>;
 
-/// Two real Claude Code at rest, in the multiplexer or tmux: what the multiplexer itself costs (Claude's own CPU
-/// is not counted). The sessions run in the tester's folder for real sessions (see `tests/mux_claude.rs`).
-fn claude_at_rest(mux: bool, dir: &std::path::Path, secs: u64) -> Cost {
+/// Two real Claude Code at rest, in the multiplexer: what the multiplexer itself costs (Claude's own CPU is not
+/// counted). The sessions run in the tester's folder for real sessions (see `tests/mux_claude.rs`).
+fn claude_at_rest(dir: &std::path::Path, secs: u64) -> Cost {
     let work = std::env::temp_dir().join("recruit-testeur-claude");
     std::fs::create_dir_all(&work).expect("work dir");
     let claude = ["claude", "-n", "testeur-compat"];
     let (cols, rows) = OUTER;
-    let (setup, term, server) = if mux {
-        let root = dir.join("claude-at-rest");
-        std::fs::create_dir_all(&root).expect("server root");
-        let server = Server::start(&root);
-        server.spawn("c1", &work, &[], &claude);
-        server.spawn("c2", &work, &[], &claude);
-        let term = server.attach_as(cols, rows, Profile::default());
-        (Setup::Mux { panes: 2, others: "idle" }, term, Some(server))
-    } else {
-        let _ = common::tmux().arg("kill-server").stderr(Stdio::null()).status();
-        std::thread::sleep(Duration::from_millis(300));
-        let conf = dir.join("tmux.conf");
-        std::fs::write(&conf, "set -s escape-time 10\nset -g status off\n").expect("tmux.conf");
-        let command = claude.join(" ");
-        let conf = conf.to_string_lossy().into_owned();
-        let args = [
-            "-L",
-            common::TMUX_SOCKET,
-            "-f",
-            &conf,
-            "new-session",
-            "-s",
-            "lat",
-            &command,
-            ";",
-            "split-window",
-            "-h",
-            &command,
-        ];
-        let term =
-            TestTerm::spawn_in(Some(&work), std::ffi::OsStr::new("tmux"), args, &[], cols, rows, Profile::default());
-        (Setup::Tmux { panes: 2, others: "idle" }, term, None)
-    };
+    let root = dir.join("claude-at-rest");
+    std::fs::create_dir_all(&root).expect("server root");
+    let server = Server::start(&root);
+    server.spawn("c1", &work, &[], &claude);
+    server.spawn("c2", &work, &[], &claude);
+    let term = server.attach_as(cols, rows, Profile::default());
+    let setup = Setup::Mux { panes: 2, others: "idle" };
     // Both up, then their first frames done.
     let _ = term.wait_for("❯", Duration::from_secs(30));
     std::thread::sleep(Duration::from_secs(10));
-    let c = cost(&setup, &term, server.as_ref(), secs, None);
-    stop(&setup, term, server);
+    let c = cost(&setup, &term, Some(&server), secs, None);
+    stop(&setup, term, Some(server));
     c
 }
 
-/// CPU at rest and in a flood, the multiplexer against tmux:
+/// CPU at rest and in a flood:
 /// - at rest: 2 real Claude Code, then 10 fakes (`CPU_SECS` seconds, 60 by default, after 5 s to settle);
 /// - at Claude's pace: 1 and 10 panes writing 20 KB/s each, in synchronized slices every 16 ms;
 /// - flat out: 1 and 10 panes as fast as they can, with what they really wrote (the floods count it), and the CPU
 ///   per Mio of it.
 ///
 /// Wakeups: interrupt wakeups (macOS) or voluntary context switches (Linux) of the measured process. Frames:
-/// synchronized updates sent to the outer terminal (tmux sends them too).
+/// synchronized updates sent to the outer terminal.
 #[test]
 #[ignore = "bench: run in release, see the module's doc"]
 fn cpu_rest_and_flood() {
@@ -703,48 +576,37 @@ fn cpu_rest_and_flood() {
             c.cpu, c.wakeups_s, c.out_bytes, c.frames_s, c.per_frame_us, c.in_mib_s, c.cpu_per_mib
         );
     };
-    for (tool, mux) in [("recruit", true), ("tmux", false)] {
-        if !mux && !common::has_tmux() {
+    let tool = "recruit";
+    let name = format!("{tool}, 2 Claude at rest");
+    // Real sessions: only with `CLAUDE_SESSIONS` (see `common::consented`).
+    if wanted(&name)
+        && common::consented("CLAUDE_SESSIONS", "the line with real Claude Code sessions", "cpu_rest_and_flood")
+    {
+        print(&name, secs, &claude_at_rest(dir.path(), secs));
+    }
+    let setup = |panes: usize, others: &'static str| Setup::Mux { panes, others };
+    let runs: Vec<Run> = vec![
+        (format!("{tool}, 10 fakes at rest"), setup(10, "idle"), vec![], secs),
+        // 9 panes that wrote 100 000 lines each, then nothing: measured once their compression is over.
+        (format!("{tool}, 9 full histories at rest"), setup(10, "fill"), vec![("SETTLE", "30".into())], secs),
+        (format!("{tool}, 1 pane at 20 KB/s"), setup(2, "flood"), vec![("FLOOD_RATE", "20000".into())], flood_secs),
+        (format!("{tool}, 9 panes at 20 KB/s"), setup(10, "flood"), vec![("FLOOD_RATE", "20000".into())], flood_secs),
+        (format!("{tool}, 1 pane flat out"), setup(2, "flood"), vec![], flood_secs),
+        (format!("{tool}, 9 panes flat out"), setup(10, "flood"), vec![], flood_secs),
+    ];
+    for (n, (name, setup, mut extra, secs)) in runs.into_iter().enumerate() {
+        if !wanted(&name) {
             continue;
         }
-        let name = format!("{tool}, 2 Claude at rest");
-        // Real sessions: only with `CLAUDE_SESSIONS` (see `common::consented`).
-        if wanted(&name)
-            && common::consented("CLAUDE_SESSIONS", "the line with real Claude Code sessions", "cpu_rest_and_flood")
-        {
-            print(&name, secs, &claude_at_rest(mux, dir.path(), secs));
-        }
-        let setup = |panes: usize, others: &'static str| {
-            if mux { Setup::Mux { panes, others } } else { Setup::Tmux { panes, others } }
-        };
-        let runs: Vec<Run> = vec![
-            (format!("{tool}, 10 fakes at rest"), setup(10, "idle"), vec![], secs),
-            // 9 panes that wrote 100 000 lines each, then nothing: measured once their compression is over.
-            (format!("{tool}, 9 full histories at rest"), setup(10, "fill"), vec![("SETTLE", "30".into())], secs),
-            (format!("{tool}, 1 pane at 20 KB/s"), setup(2, "flood"), vec![("FLOOD_RATE", "20000".into())], flood_secs),
-            (
-                format!("{tool}, 9 panes at 20 KB/s"),
-                setup(10, "flood"),
-                vec![("FLOOD_RATE", "20000".into())],
-                flood_secs,
-            ),
-            (format!("{tool}, 1 pane flat out"), setup(2, "flood"), vec![], flood_secs),
-            (format!("{tool}, 9 panes flat out"), setup(10, "flood"), vec![], flood_secs),
-        ];
-        for (n, (name, setup, mut extra, secs)) in runs.into_iter().enumerate() {
-            if !wanted(&name) {
-                continue;
-            }
-            let counted = dir.path().join(format!("counts-{tool}-{n}").replace(' ', "-"));
-            std::fs::create_dir_all(&counted).expect("counts");
-            extra.push(("FLOOD_COUNT_DIR", counted.to_string_lossy().into_owned()));
-            let settle = extra.iter().find(|(k, _)| *k == "SETTLE").and_then(|(_, v)| v.parse().ok()).unwrap_or(5);
-            let (term, _, server) = start(&setup, Profile::default(), dir.path(), &extra);
-            std::thread::sleep(Duration::from_secs(settle));
-            let c = cost(&setup, &term, server.as_ref(), secs, Some(&counted));
-            stop(&setup, term, server);
-            print(&name, secs, &c);
-        }
+        let counted = dir.path().join(format!("counts-{tool}-{n}").replace(' ', "-"));
+        std::fs::create_dir_all(&counted).expect("counts");
+        extra.push(("FLOOD_COUNT_DIR", counted.to_string_lossy().into_owned()));
+        let settle = extra.iter().find(|(k, _)| *k == "SETTLE").and_then(|(_, v)| v.parse().ok()).unwrap_or(5);
+        let (term, _, server) = start(&setup, Profile::default(), dir.path(), &extra);
+        std::thread::sleep(Duration::from_secs(settle));
+        let c = cost(&setup, &term, server.as_ref(), secs, Some(&counted));
+        stop(&setup, term, server);
+        print(&name, secs, &c);
     }
 }
 

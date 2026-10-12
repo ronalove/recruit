@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use super::{Running, profile_dir};
+use super::{Profile, Running};
 
 /// The contents of Claude's process `pid`'s own file in the profile (`sessions/<pid>.json`), when it reads and is the
 /// process's own: a pid seen a few seconds ago may be another process's by now.
 fn session_of(config_dir: Option<&Path>, pid: u32) -> Option<serde_json::Value> {
-    let file = profile_dir(config_dir).join("sessions").join(format!("{pid}.json"));
+    let file = Profile::of(config_dir).folder().join("sessions").join(format!("{pid}.json"));
     let session: serde_json::Value = serde_json::from_str(&fs::read_to_string(file).ok()?).ok()?;
     (session["pid"].as_u64() == Some(u64::from(pid))).then_some(session)
 }
@@ -157,13 +157,13 @@ pub fn project_key(dir: &Path) -> String {
 
 /// The conversation file of a session.
 pub fn transcript(dir: &Path, config_dir: Option<&Path>, session_id: &str) -> PathBuf {
-    profile_dir(config_dir).join("projects").join(project_key(dir)).join(format!("{session_id}.jsonl"))
+    Profile::of(config_dir).folder().join("projects").join(project_key(dir)).join(format!("{session_id}.jsonl"))
 }
 
 /// For each session name, the most recent conversation that carries it in this directory: the last title given
 /// in each conversation file, newest file first.
 pub fn last_conversations(dir: &Path, config_dir: Option<&Path>) -> Result<HashMap<String, String>> {
-    let folder = profile_dir(config_dir).join("projects").join(project_key(dir));
+    let folder = Profile::of(config_dir).folder().join("projects").join(project_key(dir));
     let Ok(entries) = fs::read_dir(&folder) else { return Ok(HashMap::new()) };
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
         .filter_map(|e| e.ok())
