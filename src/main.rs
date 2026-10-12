@@ -12,6 +12,7 @@ mod mux;
 mod sys;
 mod team;
 mod ui;
+mod update;
 
 use std::process::ExitCode;
 

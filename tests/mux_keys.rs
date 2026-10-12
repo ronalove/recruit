@@ -703,7 +703,7 @@ fn play(
         let state = run.join("state");
         let _ = writeln!(
             script,
-            "export XDG_CONFIG_HOME={0}/config XDG_CACHE_HOME={0}/cache RECRUIT_TMPDIR={1}",
+            "export XDG_CONFIG_HOME={0}/config XDG_CACHE_HOME={0}/cache RECRUIT_TMPDIR={1} RECRUIT_NO_UPDATE_CHECK=1",
             quote(&run),
             quote(short.path())
         );

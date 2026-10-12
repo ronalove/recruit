@@ -103,6 +103,8 @@ mkdir -p "$RECRUIT_TMPDIR"
 source "$ROOT/scripts/shots-ctl.sh"
 # The dashboard leaves out the usage of the account, the user's and not the demo's.
 export RECRUIT_NO_USAGE=1
+# No look at GitHub for a newer recruit: no arrow at the top of the menu, no network.
+export RECRUIT_NO_UPDATE_CHECK=1
 started=$(date +%s)
 
 cleanup() {

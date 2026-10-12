@@ -566,6 +566,10 @@ pub(crate) struct Sheet {
     pub fresh: bool,
     /// The built-in roles a new agent can take, once its form opened.
     pub roles: Option<Vec<(String, Member)>>,
+    /// The version of recruit the team's server runs, at the top of the menu.
+    pub version: String,
+    /// A published version newer than that one, if the last check found one.
+    pub update: Option<String>,
 }
 
 #[cfg(test)]

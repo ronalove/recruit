@@ -69,6 +69,13 @@ pub fn run(
     } else if let Some(member) = member {
         sheet.open_on(member, field.and_then(field_of));
     }
+    if !list {
+        // The version of the team's server, not of this binary (after an upgrade, an old server starts the new menu),
+        // and whether a newer one is out: read at each opening, once, nothing to read while drawing. The list under a
+        // header draws none of it.
+        sheet.version = crate::mux::socket::read_info(state).map_or(sheet.version, |info| info.version);
+        sheet.update = crate::update::newer(&sheet.version);
+    }
     let (send_states, states) = mpsc::channel();
     let (watched, snapshot) = (state.to_path_buf(), running.snapshot.clone());
     std::thread::spawn(move || watch(watched, snapshot, send_states));

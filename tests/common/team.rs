@@ -145,6 +145,7 @@ impl Team {
             .env("XDG_CACHE_HOME", self.root.join("cache"))
             .env("RECRUIT_TMPDIR", self.run.path())
             .env("RECRUIT_LANG", self.lang)
+            .env("RECRUIT_NO_UPDATE_CHECK", "1")
             .env("SHELL", "/bin/sh")
             .stdin(Stdio::null());
         command.envs(self.extra_env.iter().map(|(k, v)| (k, v)));

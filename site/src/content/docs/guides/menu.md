@@ -22,6 +22,7 @@ The menu opens over the team, the rest dimmed; `Alt+r` and the button open it on
 
 ## The screen
 
+- **At the top**, the version of recruit the team's server runs, the team's name, and its members by state. A green arrow after the version means a newer recruit is published: [update it](/recruit/getting-started/installation/#homebrew) with your package manager, then `recruit <team> --restart --resume` puts the team on it, each member on its conversation. recruit asks GitHub at most once a day; `RECRUIT_NO_UPDATE_CHECK=1`, in the environment you launch the team from, turns the check off.
 - **On the left**, the members as on the dashboard (the line and the icon of their state, their name, the time in that state, their model dimmed and their effort in color), contacts first, then the working agents, and "+ New agent" below.
 - **On the right**, the chosen member's sheet: one setting per row, and on the right of each, dimmed, where its value comes from. Below the sheet, a line says what "default" gives and when a change takes effect.
 - **At the bottom**, the result of the last change, then the team's actions, each with its key.

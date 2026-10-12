@@ -140,6 +140,15 @@ impl Glyphs {
         }
     }
 
+    /// The sign of a newer recruit: an arrow up, one column wide (not ⬆, which may be drawn as an emoji).
+    pub(crate) fn upgrade(self) -> char {
+        match self {
+            // nf-md-arrow_up
+            Glyphs::Nerd => '\u{F005D}',
+            Glyphs::Unicode => '↑',
+        }
+    }
+
     /// The sign of a teammate of the session's own team: a person, one column wide (a pawn: ☺ and ♟ may be drawn as
     /// emoji, two columns).
     pub(crate) fn person(self) -> char {
@@ -249,6 +258,7 @@ mod tests {
             assert_eq!(glyphs.hourglass().width(), Some(1), "{glyphs:?}");
             assert_eq!(glyphs.person().width(), Some(1), "{glyphs:?}");
             assert_eq!(glyphs.console().width(), Some(1), "{glyphs:?}");
+            assert_eq!(glyphs.upgrade().width(), Some(1), "{glyphs:?}");
         }
     }
 

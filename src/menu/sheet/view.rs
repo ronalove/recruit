@@ -32,6 +32,8 @@ impl Sheet {
             composes: 0,
             fresh: false,
             roles: None,
+            version: crate::mux::proto::VERSION.to_string(),
+            update: None,
         }
     }
 

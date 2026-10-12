@@ -95,13 +95,38 @@ fn no_size_too_small() {
     assert!(failed.is_empty(), "{} failed: {}", failed.len(), failed.join(", "));
 }
 
+/// The server's version after « recruit », and the arrow after it only when a newer one is out; the team's name gives
+/// way before either when the room is short.
+#[test]
+fn version_and_update_in_the_header() {
+    let mut s = sheet();
+    s.version = "2.3.1".into();
+    let plain = rows(&draw(&s, &look(), 100, 28))[0].clone();
+    assert!(plain.starts_with(&format!(" recruit 2.3.1{}", t!(" · équipe", " · team"))), "{plain}");
+    for arrow in ['↑', '\u{F005D}'] {
+        assert!(!plain.contains(arrow), "{plain}");
+    }
+    s.update = Some("2.4.0".into());
+    let unicode = rows(&draw(&s, &look(), 100, 28))[0].clone();
+    assert!(unicode.starts_with(&format!(" recruit 2.3.1 ↑{}", t!(" · équipe", " · team"))), "{unicode}");
+    let nerd = Look { glyphs: Glyphs::Nerd, ..look() };
+    let nerd = rows(&draw(&s, &nerd, 100, 28))[0].clone();
+    assert!(nerd.starts_with(" recruit 2.3.1 \u{F005D} "), "{nerd}");
+    // Narrow: the version and the arrow stay, the team's name is cut.
+    s.team.name = "une-équipe-au-nom-très-long".into();
+    let narrow = rows(&draw(&s, &look(), 50, 14))[0].clone();
+    assert!(narrow.starts_with(" recruit 2.3.1 ↑ · "), "{narrow}");
+    assert!(narrow.contains('…') && narrow.contains("⠋ 1"), "{narrow}");
+    assert!(columns(&narrow) <= 50, "{narrow}");
+}
+
 #[test]
 fn wide() {
     let mut s = sheet();
     s.key(Key::Down, &Fake::quiet());
     let drawn = draw(&s, &look(), 100, 28);
     let text = rows(&drawn);
-    assert!(text[0].starts_with(" recruit · "), "{}", text[0]);
+    assert!(text[0].starts_with(&format!(" recruit {} · ", s.version)), "{}", text[0]);
     assert!(text[0].ends_with(&t!("Échap ferme", "Esc closes")));
     assert!(text[0].contains("⠋ 1   ⚑ 1   ◷ 1"), "the states counted: {}", text[0]);
     assert_eq!(text[1].chars().nth(34), Some('┬'), "the list 34 wide");

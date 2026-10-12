@@ -52,7 +52,8 @@ impl Server {
         command
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("XDG_CACHE_HOME", self.root.join("cache"))
-            .env("RECRUIT_TMPDIR", self.run.path());
+            .env("RECRUIT_TMPDIR", self.run.path())
+            .env("RECRUIT_NO_UPDATE_CHECK", "1");
         for key in super::pty::SCRUB {
             command.env_remove(key);
         }

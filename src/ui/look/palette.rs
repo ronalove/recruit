@@ -32,6 +32,8 @@ pub(crate) struct Palette {
     pub orange: Color,
     /// At work: the terminal's yellow on a dark one, too faint on white.
     pub working: Color,
+    /// A newer recruit is published.
+    pub update: Color,
 }
 
 pub(crate) const DARK: Palette = Palette {
@@ -60,6 +62,7 @@ pub(crate) const DARK: Palette = Palette {
     ],
     orange: Color::AnsiValue(208),
     working: Color::Yellow,
+    update: Color::AnsiValue(114),
 };
 
 pub(crate) const LIGHT: Palette = Palette {
@@ -88,6 +91,7 @@ pub(crate) const LIGHT: Palette = Palette {
     ],
     orange: Color::AnsiValue(166),
     working: Color::AnsiValue(136),
+    update: Color::AnsiValue(28),
 };
 
 #[cfg(not(test))]

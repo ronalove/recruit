@@ -22,6 +22,7 @@ Le menu s'ouvre par-dessus l'équipe, le reste atténué ; `Alt+r` et le bouton 
 
 ## L'écran
 
+- **En haut**, la version de recruit que fait tourner le serveur de l'équipe, le nom de l'équipe et ses membres par état. Une flèche verte après la version signale qu'un recruit plus récent est publié : [mets-le à jour](/recruit/fr/getting-started/installation/#homebrew) avec ton gestionnaire de paquets, puis `recruit <équipe> --restart --resume` y passe l'équipe, chaque membre sur sa conversation. recruit le demande à GitHub une fois par jour au plus ; `RECRUIT_NO_UPDATE_CHECK=1`, dans l'environnement d'où tu lances l'équipe, coupe la vérification.
 - **À gauche**, les membres comme au tableau de bord (le trait et l'icône de leur état, leur nom, le temps dans cet état, leur modèle atténué et leur effort en couleur), interlocuteurs d'abord, puis les agents de travail, et « + Nouvel agent » en dessous.
 - **À droite**, la fiche du membre choisi : un réglage par ligne, et à droite de chacun, atténué, d'où vient sa valeur. Sous la fiche, une ligne dit ce que donne « défaut » et quand un changement prend effet.
 - **En bas**, le résultat du dernier changement, puis les actions d'équipe, chacune avec sa touche.

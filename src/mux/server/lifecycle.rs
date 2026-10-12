@@ -218,6 +218,8 @@ fn prepare(state: &Path, session: &str) -> Result<Ready> {
     accept(listener, tx.clone(), Arc::clone(&welcome))?;
     let server = Server::new(state, session, (path, socket_id), tx.clone(), welcome);
     watch_looks(state.to_path_buf(), tx, Arc::clone(&server.auto.watched))?;
+    // After `block_signals`: its thread takes none of the server's signals.
+    crate::update::check_in_background();
     Ok((server, rx, lock))
 }
 

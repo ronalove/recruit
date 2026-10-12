@@ -240,3 +240,77 @@ fn slash_recruit_opens_the_menu() {
     checks.done();
     team.stop();
 }
+
+/// What the menu's top line shows of the version: « recruit X.Y.Z » and, when the cache of the last check
+/// (`$XDG_CACHE_HOME/recruit/update.json`, written here as the server's thread would) names a newer one, the arrow
+/// after it, in green (palette 114 on dark). One team, the menu opened four times: it reads the cache at each opening,
+/// so the cache is rewritten between two. `RECRUIT_NO_UPDATE_CHECK` is set by the test team: nothing goes to the
+/// network, and nothing is written when there is no cache.
+#[test]
+fn the_menu_shows_the_version_and_the_update_arrow() {
+    let version = env!("CARGO_PKG_VERSION");
+    let mut team = Team::new("upd", &tables("upd", &["lead"], &[("dev", None)], ""));
+    let file = team.root.join("cache/recruit/update.json");
+    team.launch(&["lead", "dev"]);
+    let mut term = client(&team, "lead");
+    let mut checks = Checks::default();
+    // (label, cache `latest` written before the opening, `None` for no cache, whether the arrow is expected)
+    for (label, latest, arrow) in [
+        ("none", None, false),
+        ("newer", Some("9.9.9"), true),
+        ("same", Some(version), false),
+        ("none again", None, false),
+    ] {
+        match latest {
+            Some(latest) => {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(&file, format!(r#"{{"checked": {now}, "latest": "{latest}"}}"#)).unwrap();
+            }
+            None => {
+                let _ = std::fs::remove_file(&file);
+            }
+        }
+        let keys = alt(&term, 'r');
+        term.send(&keys);
+        let open = wait(Duration::from_secs(8), || shown(&term).contains("Nouvel agent"));
+        checks.check(&format!("{label}: the menu opens"), open, || shown(&term));
+        let top = shown(&term).lines().find(|l| l.contains("recruit ")).map(str::to_string);
+        let top_text = top.unwrap_or_default();
+        eprintln!("{label}: {}", top_text.trim_matches(['│', ' ']));
+        checks.check(&format!("{label}: the version"), top_text.contains(&format!("recruit {version}")), || {
+            format!("{top_text:?}\n{}", shown(&term))
+        });
+        // The arrow on the menu's top line only: the bar below has arrows of its own.
+        let at = term.screen().iter().enumerate().find_map(|(row, line)| {
+            let start = line.find(&format!("recruit {version}"))?;
+            let arrow = start + line[start..].find('↑')?;
+            Some((unicode_width::UnicodeWidthStr::width(&line[..arrow]), row))
+        });
+        checks.check(&format!("{label}: the arrow"), at.is_some() == arrow, || format!("{at:?}\n{top_text:?}"));
+        if let Some(at) = at {
+            let (text, fg, _) = term.cell(at.0, at.1);
+            checks
+                .check(&format!("{label}: the arrow is palette 114"), fg == "Indexed(114)", || format!("{text} {fg}"));
+            checks.check(
+                &format!("{label}: the arrow follows the version"),
+                top_text.contains(&format!("{version} ↑")),
+                || top_text.clone(),
+            );
+        }
+        if let Some(latest) = latest {
+            let kept = std::fs::read_to_string(&file).unwrap_or_default();
+            checks.check(&format!("{label}: the cache is left as written"), kept.contains(latest), || kept);
+        } else {
+            // Give a stray thread time to write, then look.
+            std::thread::sleep(Duration::from_secs(1));
+            checks.check(&format!("{label}: no update.json written"), !file.exists(), || {
+                format!("{} exists", file.display())
+            });
+        }
+        checks.check(&format!("{label}: the menu closes"), close_menu(&team, &mut term), || shown(&term));
+    }
+    drop(term);
+    team.stop();
+    checks.done();
+}

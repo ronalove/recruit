@@ -191,7 +191,7 @@ impl TestTerm {
         for key in SCRUB {
             command.env_remove(key);
         }
-        command.env("TERM", "xterm-256color").env("COLORTERM", "truecolor");
+        command.env("TERM", "xterm-256color").env("COLORTERM", "truecolor").env("RECRUIT_NO_UPDATE_CHECK", "1");
         for (key, value) in env {
             command.env(key, value);
         }

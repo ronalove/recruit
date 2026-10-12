@@ -223,13 +223,7 @@ impl Drawer<'_> {
     }
 
     fn header(&mut self, width: usize) {
-        let x = self.c.put(1, 0, "recruit", Style::PLAIN.bold());
-        let team = if self.wide {
-            t!(" · équipe « {} »", " · team \"{}\"", self.sheet.team.name)
-        } else {
-            t!(" · « {} »", " · \"{}\"", self.sheet.team.name)
-        };
-        self.c.put(x, 0, &team, Style::PLAIN);
+        // The right side first: the team's name, the last on the left, gives way to it.
         let mut end = width - 1;
         if self.wide {
             let close = t!(" ferme", " closes");
@@ -251,17 +245,29 @@ impl Drawer<'_> {
                 counts.push((state, n));
             }
         }
-        if self.sheet.states.is_empty() {
-            return;
+        if !self.sheet.states.is_empty() {
+            for (state, n) in counts.into_iter().rev() {
+                let number = format!(" {n}");
+                let start = self.c.put_right(end, 0, &number, Style::PLAIN);
+                // Turning only while someone works: a frame sends only what changed.
+                let frame = if n > 0 { self.look.frame } else { 0 };
+                let icon = state.badge(self.look.glyphs, frame).to_string();
+                end = self.c.put_right(start, 0, &icon, Style::fg(state.color())) - 3;
+            }
         }
-        for (state, n) in counts.into_iter().rev() {
-            let number = format!(" {n}");
-            let start = self.c.put_right(end, 0, &number, Style::PLAIN);
-            // Turning only while someone works: a frame sends only what changed.
-            let frame = if n > 0 { self.look.frame } else { 0 };
-            let icon = state.badge(self.look.glyphs, frame).to_string();
-            end = self.c.put_right(start, 0, &icon, Style::fg(state.color())) - 3;
+        // « recruit 2.3.1 ↑ · team "x" »: the version dimmed, the arrow green when a newer one is out.
+        let mut x = self.c.put(1, 0, "recruit", Style::PLAIN.bold());
+        x = self.c.put(x, 0, &format!(" {}", self.sheet.version), muted());
+        if self.sheet.update.is_some() {
+            x = self.c.put(x, 0, " ", Style::PLAIN);
+            x = self.c.put(x, 0, &self.look.glyphs.upgrade().to_string(), Style::fg(look::palette().update));
         }
+        let team = if self.wide {
+            t!(" · équipe « {} »", " · team \"{}\"", self.sheet.team.name)
+        } else {
+            t!(" · « {} »", " · \"{}\"", self.sheet.team.name)
+        };
+        self.c.put(x, 0, &fit(&team, end.saturating_sub(x)), Style::PLAIN);
     }
 }
 
