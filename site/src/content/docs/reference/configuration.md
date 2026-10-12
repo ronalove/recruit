@@ -68,10 +68,6 @@ Applies to every team of the file.
 | `command` | string | `"claude"` | The Claude Code executable, a name looked up in the `PATH` or a path. |
 | `config_dir` | string | the environment's | The Claude Code profile the team uses: its configuration folder, given to the members as `CLAUDE_CONFIG_DIR`. An absolute path, or one that starts with `~/`. The folder must exist. See [Claude Code profile](/recruit/guides/claude-code/#claude-code-profile). |
 
-## `[tmux]`
-
-Ignored. recruit 1 ran its teams in tmux, and this section set up tmux. Since recruit 2, teams draw their own [screen](/recruit/guides/screen/), with nothing to set up: the section is still read, so that an older file keeps working, and launching says that it has no effect. Its keys are those of recruit 1 (`socket`, `mouse`, `user_config`, `options`), and another one is refused. recruit 2 still uses `socket` to find a team that recruit 1 left running. Remove the section from the file to silence the warning.
-
 ## Teams
 
 `[teams.<team>]`: one table per team. The team's name is the key: letters (accents included) and digits, `-` and `_`, 40 characters at most, not starting with `-`, and not one of recruit's commands. See [Names](/recruit/guides/teams/#names).
@@ -85,7 +81,7 @@ Ignored. recruit 1 ran its teams in tmux, and this section set up tmux. Since re
 | `model` | string | Claude Code's | Claude model of every member: an alias (`opus`, `sonnet`, `haiku`, `fable`) or a full model name. |
 | `effort` | string | Claude Code's | Effort of every member: `low`, `medium`, `high`, `xhigh` or `max`. recruit shows `xhigh` as "extra", as Claude Code does. |
 | `args` | list of strings | `[]` | Extra arguments given to `claude` for every member. |
-| `layout` | `"auto"`, `"focus"` or `"tabs"` | `"auto"` | `auto`: contacts in a first tab, then the working agents in tabs of `columns × rows` at most, each tab a grid. `focus`: the same tabs, but those of working agents show one member large on the left and the best placed on the right. `tabs`: one tab per member. See [Tabs](/recruit/guides/contacts-and-agents/#tabs) and [Focus](/recruit/guides/contacts-and-agents/#focus). |
+| `layout` | `"auto"` (or `"grid"`), `"focus"` or `"tabs"` | `"auto"` | `auto`, written `grid` by the menu: contacts in a first tab, then the working agents in tabs of `columns × rows` at most, each tab a grid. `focus`: the same tabs, but those of working agents show one member large on the left and the best placed on the right. `tabs`: one tab per member. See [Tabs](/recruit/guides/contacts-and-agents/#tabs) and [Focus](/recruit/guides/contacts-and-agents/#focus). |
 | `columns` | integer | `3` | Most columns in a tab. |
 | `rows` | integer | `2` | Most rows in a tab. |
 | `dashboard` | boolean | `true` | The [dashboard and the journal](/recruit/guides/dashboard/), on the right of the contacts. With `false`, the contacts sit side by side. |

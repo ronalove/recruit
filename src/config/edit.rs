@@ -8,9 +8,9 @@
 //! permission mode, then recruit's or Claude Code's default. A change goes into the file that gives the value now:
 //! the personal file if it has the key, else the shared one if it has it, else the member's file, the shared one
 //! first. When the value asked is what the layers under that file give, the key leaves the file, and a table left
-//! empty goes with it; otherwise the value is written there. No other file is touched. The team's `dashboard` goes
-//! the same way, the team's file in place of the member's. Renaming and removing a member act on every file that
-//! defines it.
+//! empty goes with it; otherwise the value is written there. No other file is touched. The team's own settings
+//! (`dashboard`, `auto_compact`, `columns` and `rows`, `layout`) go the same way, the team's file in place of the
+//! member's. Renaming and removing a member act on every file that defines it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,8 +19,9 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use toml_edit::{DocumentMut, InlineTable, Item, Key, Table, TableLike, Value};
 
-use super::{Found, LOCAL_DIR, Member, Origin, SETTINGS, SETTINGS_LOCAL, Team, merge_local, parse_settings, tilde};
-use super::{validate_member_name, write_atomic, write_temporary};
+use super::validate_member_name;
+use super::{Found, LOCAL_DIR, Member, Origin, Team, merge_local, parse_settings};
+use crate::sys::{tilde, write_atomic, write_temporary};
 use crate::t;
 
 /// A member's setting and the value asked for it. `None` (and `false` for `Contact`) asks for the default: what the
@@ -40,8 +41,8 @@ pub enum Field {
 
 /// A change to a team, as `edit` takes them; in JSON for `recruit _edit`: `{"set": {"member": "dev", "field":
 /// {"model": "opus"}}}`, `{"rename": {"from": "a", "to": "b"}}`, `{"add": {"name": "x", "member": {"role": "…"}}}`,
-/// `{"remove": "dev"}`, `{"dashboard": false}`, `{"auto_compact": 80}` (`null` turns it off), `{"grid": {"columns": 2,
-/// "rows": 2}}`.
+/// `{"remove": "dev"}`, `{"dashboard": false}`, `{"auto_compact": 80}` (`null` turns it off), `{"layout": "focus"}`,
+/// `{"grid": {"columns": 2, "rows": 2}}`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Edit {
@@ -154,13 +155,6 @@ pub fn member_layers(origin: &Origin, team: &str, member: &str) -> Result<Member
     })
 }
 
-/// Whether the team has its dashboard, where that comes from, and what its default would be.
-#[cfg(test)]
-pub fn dashboard_layers(origin: &Origin, team: &str) -> Result<Layered<bool>> {
-    let files = Files::read(origin)?;
-    Ok(files.layered(team, &Spot::Team, Kind::Dashboard)?.map(|v| v != Some(Plain::Bool(false))))
-}
-
 /// The team's own settings, as the menu shows them: where each comes from, and what its default would be.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TeamLayers {
@@ -227,7 +221,7 @@ enum Plain {
     Int(i64),
 }
 
-/// A layout as a file writes it: "grid", from 0.1, is the default one.
+/// A layout as a file writes it: "grid", which the menu writes, is the default one.
 fn layout_of(value: Option<&Plain>) -> super::Layout {
     match value {
         Some(Plain::Text(text)) if text == "tabs" => super::Layout::Tabs,
@@ -302,7 +296,7 @@ impl Kind {
     /// Whether two values of this setting come to the same: a tab of "Agents" is the default group, as no tab;
     /// `auto_compact = true` is the default share.
     fn same(self, a: Option<&Plain>, b: Option<&Plain>) -> bool {
-        let agents = Plain::Text("Agents".into());
+        let agents = Plain::Text(super::AGENTS.into());
         let plain = |v: Option<&Plain>| match v {
             Some(v) if self == Kind::Tab && *v == agents => None,
             Some(Plain::Bool(true)) if self == Kind::AutoCompact => Some(Plain::Int(super::AUTO_COMPACT_AT.into())),
@@ -318,8 +312,8 @@ impl Kind {
             Kind::Contact => Some(Plain::Bool(false)),
             Kind::Dashboard => Some(Plain::Bool(true)),
             Kind::AutoCompact => Some(Plain::Int(super::AUTO_COMPACT_AT.into())),
-            Kind::Columns => Some(Plain::Int(3)),
-            Kind::Rows => Some(Plain::Int(2)),
+            Kind::Columns => Some(Plain::Int(super::COLUMNS as i64)),
+            Kind::Rows => Some(Plain::Int(super::ROWS as i64)),
             Kind::Layout => Some(Plain::Text("auto".into())),
             _ => None,
         }
@@ -377,8 +371,8 @@ impl Files {
     fn read(origin: &Origin) -> Result<Files> {
         let candidates = match origin {
             Origin::Local { root } => {
-                let dir = root.join(LOCAL_DIR);
-                vec![(dir.join(SETTINGS), Source::Shared), (dir.join(SETTINGS_LOCAL), Source::Personal)]
+                let [shared, personal] = super::local_files(root);
+                vec![(shared, Source::Shared), (personal, Source::Personal)]
             }
             Origin::Global { file } => vec![(file.clone(), Source::Shared)],
         };
@@ -850,6 +844,7 @@ fn add_member(team: &mut dyn TableLike, name: &str, member: &Member) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{SETTINGS, SETTINGS_LOCAL};
 
     /// A project with its shared file and, if given, its personal one.
     fn project(shared: &str, personal: Option<&str>) -> (tempfile::TempDir, Origin) {
@@ -952,14 +947,14 @@ role = "Seul"
         assert_eq!(shared(dir.path()), TEAM.replace("contact = true\n", ""));
         // The dashboard back on.
         let (dir, origin) = project(&TEAM.replace("model = \"opus\" # pour tous\n", "dashboard = false\n"), None);
-        assert!(!dashboard_layers(&origin, "web").unwrap().value);
+        assert!(!team_layers(&origin, "web").unwrap().dashboard.value);
         edit(&origin, "web", &[Edit::Dashboard(true)]).unwrap();
         assert!(!shared(dir.path()).contains("dashboard"));
         edit(&origin, "web", &[Edit::Dashboard(false)]).unwrap();
         assert!(shared(dir.path()).contains("[teams.web]\ndashboard = false\n"), "{}", shared(dir.path()));
     }
 
-    /// The team's own settings of 2026-10-11: automatic compaction and the grid of a tab.
+    /// The team's own settings: automatic compaction, the grid of a tab and the layout.
     #[test]
     fn auto_compaction_and_grid() {
         let (dir, origin) = project(TEAM, None);
@@ -990,7 +985,7 @@ role = "Seul"
         assert_eq!(layers.columns.fallback, Some((3, Source::Default)));
         edit(&origin, "web", &[Edit::Grid { columns: 3, rows: 2 }]).unwrap();
         assert_eq!(shared(dir.path()), TEAM);
-        // « focus », then the grid again: the key goes; "grid", from 0.1, is the default.
+        // « focus », then the grid again: the key goes; "grid" is the default.
         let found = edit(&origin, "web", &[Edit::Layout(super::super::Layout::Focus)]).unwrap();
         assert_eq!(found.team.layout, Some(super::super::Layout::Focus));
         assert!(shared(dir.path()).contains("layout = \"focus\"\n"));
@@ -1003,7 +998,7 @@ role = "Seul"
         assert_eq!(shared(dir.path()), TEAM);
     }
 
-    /// The rule settled on 2026-10-07: the file that gives the value now, compared with the layers under it.
+    /// The file that gives the value now, compared with the layers under it.
     #[test]
     fn personal_file_over_the_shared_one() {
         let personal_model = "[teams.web.members.dev]\nmodel = \"sonnet\"\n";
@@ -1077,7 +1072,7 @@ role = "Seul"
         let found = edit(&origin, "web", &[set("qa", Field::Tab(Some("Agents".into())))]).unwrap();
         assert_eq!(personal(dir.path()), "[teams.web.members.qa]\ntab = \"Agents\"\n");
         assert_eq!(shared(dir.path()), revue);
-        let tabs = crate::layout::tabs(&found.team);
+        let tabs = crate::team::layout::tabs(&found.team);
         assert!(tabs.iter().any(|t| t.title == "Agents" && t.members.contains(&"qa".to_string())), "{tabs:?}");
         // The default, then "Revue" again: the personal key goes.
         edit(&origin, "web", &[set("qa", Field::Tab(Some("Revue".into())))]).unwrap();
@@ -1110,7 +1105,7 @@ role = "Seul"
             Layered { value: false, source: Source::Default, fallback: Some((false, Source::Default)) }
         );
         assert!(member_layers(&origin, "web", "inconnu").is_err());
-        assert!(dashboard_layers(&origin, "web").unwrap().value);
+        assert!(team_layers(&origin, "web").unwrap().dashboard.value);
     }
 
     #[test]

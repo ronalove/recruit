@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! The multiplexer's own keys (spec §5.4): no prefix, ⌥ only (Alt elsewhere than macOS), so that every Ctrl key
-//! reaches Claude Code. A table without state: a key in, what to do out; the server's loop does it.
-//!
-//! Owner: dev-saisie.
+//! The multiplexer's own keys: no prefix, ⌥ only (Alt elsewhere than macOS), so that every Ctrl key reaches Claude
+//! Code. A table without state: a key in, what to do out; the server's loop does it.
 
 use super::input::{Key, KeyCode, KeyKind, Mods};
 
@@ -21,7 +19,7 @@ pub(crate) enum Action {
     Journal,
     /// ⌥r: the menu.
     Menu,
-    /// ⌥q: detach, quit or cancel (the menu itself at step 1).
+    /// ⌥q: detach, quit or cancel.
     Quit,
     /// ⌥z: the focused pane over the whole tab, or the grid back.
     Zoom,
@@ -63,6 +61,23 @@ pub(crate) fn shortcut(key: &Key) -> Option<Shortcut> {
         KeyKind::Repeat if repeats => Shortcut::Run(action),
         KeyKind::Repeat | KeyKind::Release => Shortcut::Swallow,
     })
+}
+
+/// What a key does to a pane's history, if it scrolls it: Shift with Page Up, Page Down (a screen less a line),
+/// Home (the oldest line), End (the live screen); `rows` the pane's. Not on the alternate screen, which has no
+/// history: the key goes to the program.
+pub(crate) fn scroll_key(key: &Key, rows: usize, alt_screen: bool) -> Option<isize> {
+    if key.mods != Mods::SHIFT || alt_screen || !key.is_press() {
+        return None;
+    }
+    let page = rows.saturating_sub(1).max(1) as isize;
+    match key.code {
+        KeyCode::PageUp => Some(page),
+        KeyCode::PageDown => Some(-page),
+        KeyCode::Home => Some(isize::MAX),
+        KeyCode::End => Some(isize::MIN),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -220,5 +235,18 @@ mod tests {
         for (bytes, action) in table {
             assert_eq!(shortcut(&read(bytes)), action.map(Shortcut::Run), "{bytes:?}");
         }
+    }
+
+    #[test]
+    fn keys_that_scroll() {
+        let shift = |code| Key::new(code, Mods::SHIFT);
+        assert_eq!(scroll_key(&shift(KeyCode::PageUp), 20, false), Some(19));
+        assert_eq!(scroll_key(&shift(KeyCode::PageDown), 20, false), Some(-19));
+        assert_eq!(scroll_key(&shift(KeyCode::Home), 20, false), Some(isize::MAX));
+        assert_eq!(scroll_key(&shift(KeyCode::End), 20, false), Some(isize::MIN));
+        assert_eq!(scroll_key(&shift(KeyCode::PageUp), 1, false), Some(1));
+        // Without Shift, or on the alternate screen: the program's.
+        assert_eq!(scroll_key(&Key::new(KeyCode::PageUp, Mods::NONE), 20, false), None);
+        assert_eq!(scroll_key(&shift(KeyCode::PageUp), 20, true), None);
     }
 }

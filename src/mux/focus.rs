@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! A tab of members in « focus » (decision of 2026-10-11, maquette https://claude.ai/artifact/H4tpNaZ2RAnxHErZHyztYe,
-//! direction B « Rangs »): the main member on the left; on the right, the best placed of the others (waiting, then
-//! failed, then at work, then the most recently at rest); the rest as cards. Places change slowly: a member that
-//! starts waiting or fails its turn comes in at once, in the place of the least well placed, whatever its guard, but
-//! never in that of a pane that itself waits or failed; one that starts working comes in after [`ENTER_AFTER`], in the
-//! place of the least well placed that has stayed [`STAY_AT_LEAST`] (the guard against coming and going); nothing
-//! moves while the server holds the tab (the pointer over it, a key typed, a click less than [`HOLD_AFTER_CLICK`]
-//! ago), which comes before everything. No terminal, no clock of its own: the server gives
-//! the time, the states and the room (`layout::focus_room`), and lays out the places (`layout::focus_rects`).
+//! A tab of members in the « focus » layout (`Layout::Focus`; not the pane that has the keyboard focus): the main
+//! member on the left; on the right, the best placed of the others (waiting, then failed, then at work, then the most
+//! recently at rest); the rest as cards. Places change slowly: a member that starts waiting or fails its turn comes
+//! in at once, in the place of the least well placed, whatever its guard, but never in that of a pane that itself
+//! waits or failed; one that starts working comes in after [`ENTER_AFTER`], in the place of the least well placed
+//! that has stayed [`STAY_AT_LEAST`] (the guard against coming and going); nothing moves while the server holds the
+//! tab (the pointer over it, a key typed, a click less than [`HOLD_AFTER_CLICK`] ago), which comes before everything.
+//! No terminal, no clock of its own: the server gives the time, the states and the room (`layout::focus_room`), and
+//! lays out the places (`layout::focus_rects`).
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -196,7 +196,7 @@ impl Focus {
 
     /// When the pane `id` on the right, ranked `pane`, can give its place to a card ranked `card`: none while it is
     /// ranked better; at once for a card that waits or failed, and never if the pane itself waits or failed (attention
-    /// comes before the minute's guard, decision of 2026-10-11); else once it has stayed [`STAY_AT_LEAST`].
+    /// comes before the minute's guard); else once it has stayed [`STAY_AT_LEAST`].
     fn free_at(&self, id: &str, pane: &Rank, card: &Rank) -> Option<Instant> {
         if pane <= card {
             return None;
@@ -337,7 +337,7 @@ mod tests {
         list.iter().map(|&(id, standing, since)| Seen { id: id.into(), standing, since: secs(base, since) }).collect()
     }
 
-    /// The tab of the maquette: a at work on the left, b waiting, c at work, d at rest for 2 minutes, e and f at
+    /// A tab: a at work on the left, b waiting, c at work, d at rest for 2 minutes, e and f at
     /// rest longer.
     fn opening(base: Instant) -> (Focus, Vec<Seen>) {
         let all = panes(

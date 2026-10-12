@@ -3,25 +3,21 @@
 //! What a pane draws, as the real terminal gets it through the native multiplexer (grid `R`, `Co`, `U`, `T`, `F`,
 //! `M`): a server of the test's own, the fake `script` in its panes writing known sequences and logging what it
 //! reads, a real client on the test's terminal, whose cells, colors and cursor are compared. Part of `cargo test`.
-//!
-//! Owner: testeur.
 
 mod common;
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use common::client::{find, thick};
 use common::pty::{Profile, TestTerm};
 use common::server::Server;
+use common::team::wait;
 
 #[test]
 #[ignore = "started by the other tests only"]
 fn child() {
-    match common::role().as_deref() {
-        Some(role) if common::fakes::run(role) => {}
-        Some(other) => panic!("unknown child role {other}"),
-        None => {}
-    }
+    common::child_main();
 }
 
 /// Bytes as `script` takes them (`SCRIPT_HEX`).
@@ -49,20 +45,6 @@ fn count(haystack: &[u8], needle: &[u8]) -> usize {
     haystack.windows(needle.len()).filter(|w| *w == needle).count()
 }
 
-/// Waits until `check` holds, `timeout` at most.
-fn wait(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if check() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// How many SGR mouse reports in `bytes` are presses (`CSI < … M`; a release ends in `m`).
 fn sgr_presses(bytes: &[u8]) -> usize {
     let mut presses = 0;
@@ -78,24 +60,6 @@ fn sgr_presses(bytes: &[u8]) -> usize {
         }
     }
     presses
-}
-
-/// Whether the frame whose header (in `top`, the screen's first row) names `name` is the thick one, the focused
-/// pane's: the corner on the name's left is `┏`, not `╭`, whatever stands between (the state's icon…).
-fn thick(top: &str, name: &str) -> bool {
-    let chars: Vec<char> = top.chars().collect();
-    let name: Vec<char> = format!(" {name} ").chars().collect();
-    (0..chars.len().saturating_sub(name.len() - 1))
-        .filter(|&i| chars[i..i + name.len()] == name[..])
-        .any(|i| chars[..i].iter().rev().find(|c| matches!(c, '┏' | '╭' | '┓' | '╮')).is_some_and(|c| *c == '┏'))
-}
-
-/// Where `text` first shows on the screen of `term`: column (in cells) and row.
-fn find(term: &TestTerm, text: &str) -> Option<(usize, usize)> {
-    term.screen().iter().enumerate().find_map(|(row, line)| {
-        let at = line.find(text)?;
-        Some((unicode_width::UnicodeWidthStr::width(&line[..at]), row))
-    })
 }
 
 fn shown(term: &TestTerm) -> String {

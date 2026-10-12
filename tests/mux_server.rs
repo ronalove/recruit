@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! The native multiplexer's server and client (step 1; grid `specs/multiplexeur-compat.md`, lines Sv): a server of
+//! The native multiplexer's server and client (grid `specs/multiplexeur-compat.md`, lines Sv): a server of
 //! the test's own (`common::server`), fake programs in its panes, real clients on test terminals. Part of
 //! `cargo test`, and so of the CI; `ssh_attach` and `attach_existing` are ignored: by hand, on a team already
 //! running.
-//!
-//! Owner: testeur.
 
 mod common;
 
@@ -18,11 +16,7 @@ use common::server::{NOT_RUNNING, Server, UNKNOWN_PANE, leftovers};
 #[test]
 #[ignore = "started by the other tests only"]
 fn child() {
-    match common::role().as_deref() {
-        Some(role) if common::fakes::run(role) => {}
-        Some(other) => panic!("unknown child role {other}"),
-        None => {}
-    }
+    common::child_main();
 }
 
 /// What a client's terminal shows, and the end of what it was sent, for a failed check.

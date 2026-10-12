@@ -22,7 +22,7 @@
 # demo's conversations are removed from it. An image that shows the account's plan or a home folder is not kept.
 #
 # Needs vhs (brew install vhs), ffmpeg, jq, python3 and claude. What it asks of the multiplexer is in
-# scripts/shots-backend.sh.
+# scripts/shots-ctl.sh.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -95,13 +95,12 @@ mkdir -p "$tmp/bin"
 ln -sf "$RECRUIT_BIN" "$tmp/bin/recruit"
 export PATH=$tmp/bin:$PATH
 OWN_RECRUIT=$tmp/bin/recruit
-# Short: the server's socket lives there (a path of 100 characters at most). RECRUIT_BACKEND: a recruit that still
-# has tmux needs it; one that has not ignores it.
-export RECRUIT_BACKEND=native RECRUIT_TMPDIR=$tmp/run
+# Short: the server's socket lives there (a path of 100 characters at most).
+export RECRUIT_TMPDIR=$tmp/run
 mkdir -p "$RECRUIT_TMPDIR"
 # What is asked of the multiplexer.
-# shellcheck source=scripts/shots-backend.sh
-source "$ROOT/scripts/shots-backend.sh"
+# shellcheck source=scripts/shots-ctl.sh
+source "$ROOT/scripts/shots-ctl.sh"
 # The dashboard leaves out the usage of the account, the user's and not the demo's.
 export RECRUIT_NO_USAGE=1
 started=$(date +%s)
@@ -436,8 +435,8 @@ EOF
   fi
 
   # The journal in full (reduced at launch: hidden, then full), cut out of the first tab.
-  recruit _panel toggle "$state" >/dev/null
-  recruit _panel toggle "$state" >/dev/null
+  ctl key alt+j
+  ctl key alt+j
   VIEW="first"
   film_clean full "$TEAM_SIZE" "$sfx" "$tmp/full.png" <<EOF &&
 Hide

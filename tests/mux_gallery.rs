@@ -7,25 +7,20 @@
 //! draws the PNG files.
 //!
 //! Run by hand, in a pty of its own, no window: `cargo test --test mux_gallery -- --ignored --nocapture`.
-//!
-//! Owner: testeur.
 
 mod common;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
+use common::client::{alt, click, find, find_in_header, hover, report, says};
 use common::pty::{Profile, TestTerm};
 use common::team::{Team, wait};
 
 #[test]
 #[ignore = "started by the other tests only"]
 fn child() {
-    match common::role().as_deref() {
-        Some(role) if common::fakes::run(role) => {}
-        Some(other) => panic!("unknown child role {other}"),
-        None => {}
-    }
+    common::child_main();
 }
 
 fn out_dir() -> PathBuf {
@@ -34,53 +29,6 @@ fn out_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/night/gallery"));
     std::fs::create_dir_all(&dir).expect("gallery folder");
     dir
-}
-
-fn alt(term: &TestTerm, key: char) -> Vec<u8> {
-    if term.kitty_keyboard() {
-        format!("\x1b[{};3u", key as u32).into_bytes()
-    } else {
-        format!("\x1b{key}").into_bytes()
-    }
-}
-
-/// Where `text` first shows: column (in cells) and row.
-fn find(term: &TestTerm, text: &str) -> Option<(usize, usize)> {
-    term.screen().iter().enumerate().find_map(|(row, line)| {
-        let at = line.find(text)?;
-        Some((unicode_width::UnicodeWidthStr::width(&line[..at]), row))
-    })
-}
-
-/// Where `text` first shows on a row that is a pane's top border (a header), not the dashboard's cards.
-fn find_in_header(term: &TestTerm, text: &str) -> Option<(usize, usize)> {
-    term.screen().iter().enumerate().find_map(|(row, line)| {
-        if !line.chars().any(|c| matches!(c, '┏' | '╭')) {
-            return None;
-        }
-        let at = line.find(text)?;
-        Some((unicode_width::UnicodeWidthStr::width(&line[..at]), row))
-    })
-}
-
-/// The pointer at `(col, row)`, no button (SGR motion).
-fn hover(term: &mut TestTerm, (col, row): (usize, usize)) {
-    term.send(format!("\x1b[<35;{};{}M", col + 1, row + 1).as_bytes());
-}
-
-fn report(team: &Team, member: &str, model: &str, effort: &str, percent: f64) {
-    let dir = team.state().join("members");
-    std::fs::create_dir_all(&dir).expect("members folder");
-    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let report = serde_json::json!({
-        "session": "s", "model": model, "own": {"model": model, "effort": effort},
-        "context": {"percent": percent, "tokens": (percent * 2000.0) as u64, "window": 200000}, "at": at,
-    });
-    std::fs::write(dir.join(format!("{member}.json")), report.to_string()).expect("report");
-}
-
-fn says(team: &Team, member: &str, state: &str) {
-    team.ctl(["send", "--pane", member, &format!("osc {state}\\r")]);
 }
 
 struct Gallery {
@@ -327,24 +275,11 @@ fn gallery_narrow() {
     team.stop();
 }
 
-/// Standard base64, for the `msg` of an error state.
-fn base64(text: &str) -> String {
-    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in text.as_bytes().chunks(3) {
-        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
-        for i in 0..4 {
-            out.push(if i <= chunk.len() { DIGITS[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
-        }
-    }
-    out
-}
-
 /// The member's turn failed, as Claude Code 2.1.296 says it (`state=error:app=claude-code:msg=<base64>`).
 fn fails(team: &Team, member: &str) {
     let message =
         "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}";
-    says(team, member, &format!("error:app=claude-code:msg={}", base64(message)));
+    common::client::fails(team, member, message);
 }
 
 /// A failed turn (« tour raté ») for the design review, at 140 × 40 and at 64 × 19 (the mock-up's): the first tab with
@@ -398,11 +333,6 @@ fn gallery_failed_turn() {
     }
     std::fs::write(gallery.dir.join("INDEX-failed.txt"), gallery.shots.join("\n") + "\n").expect("index");
     team.stop();
-}
-
-/// A click (press and release, SGR) on the cell `(col, row)`.
-fn click(term: &mut TestTerm, (col, row): (usize, usize)) {
-    term.send(format!("\x1b[<0;{};{}M\x1b[<0;{};{}m", col + 1, row + 1, col + 1, row + 1).as_bytes());
 }
 
 /// Waits for the menu's pane (a list or the menu), then lets it settle.
@@ -601,7 +531,7 @@ fn report_extra(team: &Team, member: &str, model: &str, effort: &str, percent: f
 }
 
 fn now_secs() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+    common::now_secs() as i64
 }
 
 /// The compaction traces and the agents a session started, as the mod would report them, on the design's team.

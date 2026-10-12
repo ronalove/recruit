@@ -15,7 +15,7 @@ use crossterm::{cursor, queue, terminal};
 use unicode_width::UnicodeWidthStr;
 
 use super::Cancelled;
-use crate::canvas::PanicGuard;
+use super::terminal::PanicGuard;
 use crate::t;
 
 /// Choices on screen at once, at most.
@@ -451,11 +451,11 @@ fn frame(rows: &[Row], cols: usize, up: usize) -> io::Result<Vec<u8>> {
     if up > 0 {
         queue!(out, cursor::MoveUp(up.min(u16::MAX as usize) as u16))?;
     }
-    // Cleared whole, the rows of the frame before lose the mark tmux leaves on a row it broke in two when the
-    // terminal got narrower: only written over, they would be joined again when it gets wider, the frame shorter
-    // than counted, and the lines above it erased. The first row is cleared alone, and the rest once it is
-    // written: cleared from the top left corner, the whole screen would go into tmux's history (scroll-on-clear),
-    // once more at each key.
+    // Cleared whole, the rows of the frame before lose the mark a terminal leaves on a row it broke in two when it
+    // got narrower: only written over, they would be joined again when it gets wider, the frame shorter than
+    // counted, and the lines above it erased. The first row is cleared alone, and the rest once it is written:
+    // cleared from the top left corner, the whole screen would go into the history of a multiplexer around recruit
+    // (tmux's scroll-on-clear), once more at each key.
     queue!(out, terminal::Clear(terminal::ClearType::CurrentLine))?;
     // The first row filling its last line leaves the cursor on its last cell, the wrap pending: ED would erase
     // that cell (xterm, Ghostty and recruit's own multiplexer do). Cleared from the start of the next line instead.
@@ -495,7 +495,7 @@ pub(super) fn run(mut list: List, message: &str, help: &str) -> Result<Vec<usize
     if list.labels.is_empty() {
         bail!("{}", t!("Aucun choix possible.", "Nothing to choose from."));
     }
-    let mut screen = Screen::open()?;
+    let mut screen = Inline::open()?;
     loop {
         let (cols, lines) = size();
         let below = screen.top.map_or(lines, |top| lines.saturating_sub(top));
@@ -538,9 +538,10 @@ fn size() -> (usize, usize) {
     terminal::size().map_or((80, 24), |(cols, lines)| (cols as usize, lines as usize))
 }
 
-/// The terminal while a list is on it: raw, without its cursor. Dropping it gives the cursor back, and the terminal's
-/// modes, however the list ends (an answer, Esc, an error); a panic does it before its message.
-struct Screen {
+/// The terminal while a list is on it, drawn in place below what is already there: raw, without its cursor. Dropping
+/// it gives the cursor back, and the terminal's modes, however the list ends (an answer, Esc, an error); a panic does
+/// it before its message.
+struct Inline {
     out: Stderr,
     /// How wide each row of the frame on screen is; the cursor is at the end of the last one.
     drawn: Vec<usize>,
@@ -549,12 +550,12 @@ struct Screen {
     _panic: PanicGuard,
 }
 
-impl Screen {
+impl Inline {
     fn open() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         // From here, Drop puts the terminal back.
         let mut screen =
-            Screen { out: io::stderr(), drawn: Vec::new(), top: None, _panic: PanicGuard::install(restore) };
+            Inline { out: io::stderr(), drawn: Vec::new(), top: None, _panic: PanicGuard::install(restore) };
         queue!(screen.out, cursor::Hide, event::EnableBracketedPaste)?;
         screen.out.flush()?;
         screen.top = cursor_row();
@@ -586,7 +587,7 @@ impl Screen {
     }
 }
 
-impl Drop for Screen {
+impl Drop for Inline {
     fn drop(&mut self) {
         // A panic: its hook did it already.
         if std::thread::panicking() {

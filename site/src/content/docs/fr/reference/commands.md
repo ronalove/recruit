@@ -73,7 +73,7 @@ Une équipe créée avec `--member` seul reçoit les règles communes de recruit
 recruit list [--json]
 ```
 
-Liste les équipes du projet et tes équipes globales, chacune avec son nombre de membres et son état : arrêtée, en cours, en cours et attachée, essai en cours (`--dry-run`), ou en cours sous recruit 1 (tmux), pour une équipe que recruit 1 a laissée tourner (voir [la FAQ](/recruit/fr/faq/#une-équipe-tourne-encore-sous-recruit-1)). Un `*` marque l'équipe `default` du projet. Les équipes en cours qui ne sont à aucune d'elles viennent en dernier.
+Liste les équipes du projet et tes équipes globales, chacune avec son nombre de membres et son état : arrêtée, en cours, en cours et attachée, ou essai en cours (`--dry-run`). Un `*` marque l'équipe `default` du projet. Les équipes en cours qui ne sont à aucune d'elles viennent en dernier.
 
 ```
 Équipes de ce projet (~/code/mon-app/.recruit)
@@ -83,7 +83,7 @@ Liste les équipes du projet et tes équipes globales, chacune avec son nombre d
     outils    2 membres  arrêtée
 ```
 
-`--json` affiche un objet par équipe : `name`, `scope` (`local` ou `global`), `file`, `members`, `running`, `attached`, `dir`, le dossier où elle tourne, et `tmux`, vrai pour une équipe qui tourne encore sous recruit 1.
+`--json` affiche un objet par équipe : `name`, `scope` (`local` ou `global`), `file`, `members`, `running`, `attached`, et `dir`, le dossier où elle tourne.
 
 ## `recruit attach`
 

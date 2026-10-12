@@ -111,19 +111,6 @@ Two members whose names differ only by case get "differs from … by case only".
 
 Without a terminal to ask in, recruit cannot choose. Name the team (`recruit <team>`), or set `default` at the top of `.recruit/settings.toml`.
 
-### "The [tmux] section … has no effect any more"
-
-recruit 2 no longer uses tmux: teams draw their own screen. The `[tmux]` section of an older file is read and ignored. Remove it from the team's file, and the warning goes with it.
-
-### A team still runs under recruit 1
-
-recruit 1 ran teams in tmux, and such a team keeps running after an upgrade. `recruit` (or `recruit <team>`) finds it, and offers to stop it and start it again on the new screen, each member resuming its conversation. Without a terminal to ask in, it stops there; then:
-
-```sh
-recruit stop <team>          # stops it, tmux or not, after confirmation
-recruit <team> --resume
-```
-
 ### Copying a selection does nothing
 
 The copy goes through your terminal. iTerm2 asks you to allow it once, and Terminal.app cannot take it: see [Select and copy](/recruit/guides/screen/#select-and-copy) for what to do.

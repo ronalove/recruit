@@ -111,19 +111,6 @@ Deux membres dont les noms ne diffèrent que par la casse donnent « ne diffère
 
 Sans terminal pour demander, recruit ne peut pas choisir. Nomme l'équipe (`recruit <équipe>`), ou fixe `default` en tête de `.recruit/settings.toml`.
 
-### « La section [tmux] … n'a plus d'effet »
-
-recruit 2 n'utilise plus tmux : les équipes dessinent leur propre écran. La section `[tmux]` d'un fichier plus ancien est lue, puis ignorée. Retire-la du fichier de l'équipe, et l'avertissement part avec.
-
-### Une équipe tourne encore sous recruit 1
-
-recruit 1 faisait tourner les équipes dans tmux, et une telle équipe continue de tourner après la mise à jour. `recruit` (ou `recruit <équipe>`) la trouve, et propose de l'arrêter et de la relancer sur le nouvel écran, chaque membre reprenant sa conversation. Sans terminal pour demander, il s'arrête là ; alors :
-
-```sh
-recruit stop <équipe>          # l'arrête, sous tmux ou non, après confirmation
-recruit <équipe> --resume
-```
-
 ### Copier une sélection ne fait rien
 
 La copie passe par ton terminal. iTerm2 demande de l'autoriser une fois, et Terminal.app ne peut pas la recevoir : voir [Sélectionner et copier](/recruit/fr/guides/screen/#sélectionner-et-copier) pour quoi faire.

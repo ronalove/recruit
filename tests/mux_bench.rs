@@ -9,8 +9,6 @@
 //!
 //! Each measure runs in a child process of its own (this binary started again, see `common::child`), so that one
 //! measure's allocations never weigh on the next. Each prints a markdown table, for `specs/multiplexeur-compat.md`.
-//!
-//! Owner: testeur.
 
 mod common;
 
@@ -211,7 +209,7 @@ fn tmux_memory(cols: usize, panes: usize, full: bool) -> Memory {
     }
 }
 
-/// Memory per pane with 100 000 lines of history (spec §8, step 0's measures): alacritty's engine alone, and
+/// Memory per pane with 100 000 lines of history: alacritty's engine alone, and
 /// tmux, for 80, 120 and 200 columns, lines of spread lengths ("typical") and full lines. Per pane: the slope
 /// between 1 and 10 panes, so that what a process costs once does not count.
 #[test]
@@ -523,7 +521,7 @@ fn latency(setup: &Setup, key: Key, profile: Profile, dir: &std::path::Path, ext
     out
 }
 
-/// Latency added to a key (spec §8, step 0's measures): typed on the outer terminal, echoed by a fake in the
+/// Latency added to a key: typed on the outer terminal, echoed by a fake in the
 /// focused pane, read back on the outer screen. The reference is the fake alone on the test's terminal; the
 /// multiplexer and tmux each with 1 pane, then 10 (9 of them flooding). Then Escape alone, which a terminal
 /// reader might hold back to see whether a sequence follows.
@@ -678,7 +676,7 @@ fn claude_at_rest(mux: bool, dir: &std::path::Path, secs: u64) -> Cost {
     c
 }
 
-/// CPU at rest and in a flood (spec §8, step 0's measures), the multiplexer against tmux:
+/// CPU at rest and in a flood, the multiplexer against tmux:
 /// - at rest: 2 real Claude Code, then 10 fakes (`CPU_SECS` seconds, 60 by default, after 5 s to settle);
 /// - at Claude's pace: 1 and 10 panes writing 20 KB/s each, in synchronized slices every 16 ms;
 /// - flat out: 1 and 10 panes as fast as they can, with what they really wrote (the floods count it), and the CPU

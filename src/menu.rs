@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
 //! The menu of a running team (`recruit _menu <state> [--client <id>] [--nerd] [--member <m> [--field <f>]]`), in a
-//! layer over the team opened by `/recruit`, ⌥r, the bar's button or a click on a header: the members on the left as on the dashboard, the chosen one's sheet on the
-//! right, the team's actions at the bottom (direction A of the mockups). Every change is written to the team's files
-//! and applied at once to the running team.
+//! layer over the team opened by `/recruit`, ⌥r, the bar's button or a click on a header: the members on the left as
+//! on the dashboard, the chosen one's sheet on the right, the team's actions at the bottom. Every change is written
+//! to the team's files and applied at once to the running team.
 //!
 //! What it is quick to show comes first: nothing slow before the first frame (no `claude`, no question to the
 //! multiplexer), the members'
@@ -26,19 +26,20 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::terminal;
 
 use crate::board;
-use crate::canvas::{Features, Painter, Session};
-use crate::config::{self, Edit, Member, Origin};
-use crate::live::Running;
-use crate::look::{self, Glyphs, State, family};
-use crate::state::Snapshot;
-use crate::templates::Templates;
-use crate::{bridge, claude, generate, layout, t};
+use crate::config::{self, Edit, Member};
+use crate::create::templates::Templates;
+use crate::team::live::Running;
+use crate::team::state::Snapshot;
+use crate::ui::canvas::{Features, Painter};
+use crate::ui::look::{self, Glyphs, State};
+use crate::ui::terminal::Session;
+use crate::{claude, claude::bridge, create::compose, t, team::layout};
 use draw::{Drawn, Look};
 use sheet::{Done, Effect, Env, Key, Person, Said, Sheet, Team};
 
 /// The menu of the team whose folder is `state`, on `member`'s sheet if given (else the first member's), its `field`
 /// focused: `name`, `model` or `effort`; another word is left out.
-/// With `list`, only the list of `field`'s values for `member`, under its pane's header (lot of 2026-10-11, direction A):
+/// With `list`, only the list of `field`'s values for `member`, under its pane's header:
 /// its size told to the server by `CSI 8 ; rows ; cols t` (`Relay::Resize`), at its start and at each change.
 pub fn run(
     state: &Path,
@@ -52,7 +53,7 @@ pub fn run(
     let mut sheet = Sheet::new(load(&running, client.is_some()));
     // What the dashboard saw, if it still looks: a small file, read before the first frame (and before choosing the
     // member's row: one whose turn failed opens on « Reprendre »).
-    if let Some((states, errors)) = fresh_states(state, board::now()) {
+    if let Some((states, errors)) = fresh_states(state, crate::sys::now()) {
         sheet.seen(Some(states));
         sheet.failed(errors);
     }
@@ -123,6 +124,23 @@ fn fresh_states(state: &Path, now: i64) -> Option<(States, Errors)> {
     Some((states.members.into_iter().map(|(name, m)| (name, (m.state, m.since))).collect(), errors))
 }
 
+/// The members' states as `claude agents` says them, with since when as this menu has seen them (`seen`, kept for the
+/// next time); none when `claude agents` cannot be asked.
+fn asked_states(snapshot: &Snapshot, seen: &mut States, now: i64) -> Option<(States, Errors)> {
+    let running = claude::running(&snapshot.claude, snapshot.config_dir.as_deref()).ok()?;
+    let mut states = States::new();
+    for (name, session) in board::members_of(snapshot, running) {
+        let st = State::of(session.status.as_deref().unwrap_or_default());
+        let since = match seen.get(&name) {
+            Some((before, since)) if *before == st => *since,
+            _ => now,
+        };
+        states.insert(name, (st, since));
+    }
+    *seen = states.clone();
+    Some((states, Errors::new()))
+}
+
 /// Keeps the members' states up to date for the menu, on the side: what the dashboard writes, read every half second,
 /// or else `claude agents --json` every two seconds, with since when as this menu has seen them. None when they
 /// cannot be seen: not shown as they were.
@@ -131,7 +149,7 @@ fn watch(state: PathBuf, mut snapshot: Snapshot, send: Sender<Option<(States, Er
     let mut seen: States = HashMap::new();
     let mut asked: Option<Instant> = None;
     loop {
-        let now = board::now();
+        let now = crate::sys::now();
         let states = match fresh_states(&state, now) {
             Some(states) => Some(Some(states)),
             None if asked.is_none_or(|at| at.elapsed() >= ASK_EVERY) => {
@@ -139,25 +157,7 @@ fn watch(state: PathBuf, mut snapshot: Snapshot, send: Sender<Option<(States, Er
                 if let Ok(again) = Snapshot::read(&state) {
                     snapshot = again;
                 }
-                let running = claude::running(&snapshot.claude, snapshot.config_dir.as_deref()).ok();
-                Some(running.map(|running| {
-                    let mut states = HashMap::new();
-                    for member in &snapshot.members {
-                        let session = running.iter().find(|r| {
-                            r.name.as_deref() == Some(member.name.as_str())
-                                && r.cwd.as_deref().map(Path::new) == Some(snapshot.dir.as_path())
-                        });
-                        let Some(session) = session else { continue };
-                        let st = State::of(session.status.as_deref().unwrap_or_default());
-                        let since = match seen.get(&member.name) {
-                            Some((before, since)) if *before == st => *since,
-                            _ => now,
-                        };
-                        states.insert(member.name.clone(), (st, since));
-                    }
-                    seen = states.clone();
-                    (states, Errors::new())
-                }))
+                Some(asked_states(&snapshot, &mut seen, now))
             }
             None => None,
         };
@@ -178,15 +178,15 @@ fn watch(state: PathBuf, mut snapshot: Snapshot, send: Sender<Option<(States, Er
 fn load(running: &Running, detach: bool) -> Team {
     let s = &running.snapshot;
     let live = s.plugin_dir.is_some();
-    let person = |i: usize, m: &crate::state::MemberInfo| {
-        let (model, effort) = bridge::model_and_effort(&running.state, m);
+    let person = |i: usize, m: &crate::team::state::MemberInfo| {
+        let (model, effort) = look::shown(bridge::model_and_effort(&running.state, m));
         Person {
             name: m.name.clone(),
             contact: m.contact,
             color: look::member_color(i),
             gone: false,
-            model: model.map(|m| family(&m)),
-            effort: effort.filter(|e| bridge::EFFORTS.contains(&e.as_str())),
+            model,
+            effort,
             role: m.role.clone(),
             layers: None,
             tab_now: None,
@@ -202,7 +202,7 @@ fn load(running: &Running, detach: bool) -> Team {
                 .map(|m| (m.name.clone(), Member { role: m.role.clone(), contact: m.contact, ..Default::default() }));
             return Team {
                 name: s.team.clone(),
-                origin: s.origin.clone().unwrap_or(Origin::Local { root: s.dir.clone() }),
+                origin: s.origin.clone(),
                 people: s.members.iter().enumerate().map(|(i, m)| person(i, m)).collect(),
                 config: config::Team { members: members.collect(), ..Default::default() },
                 dashboard: !s.dashboard.is_empty(),
@@ -237,9 +237,9 @@ fn load(running: &Running, detach: bool) -> Team {
     let dashboard = layers.as_ref().map_or(!s.dashboard.is_empty(), |layers| layers.dashboard.value);
     let file = match &found.root {
         Some(root) => {
-            found.file.strip_prefix(root).map_or_else(|_| config::tilde(&found.file), |p| p.display().to_string())
+            found.file.strip_prefix(root).map_or_else(|_| crate::sys::tilde(&found.file), |p| p.display().to_string())
         }
-        None => config::tilde(&found.file),
+        None => crate::sys::tilde(&found.file),
     };
     Team {
         name: found.name.clone(),
@@ -264,7 +264,7 @@ impl Env for Live<'_> {
         self.running.restarts(edits)
     }
 
-    /// As `member.rs` decides: the session noted for it, and its conversation file, not empty.
+    /// As `team/member.rs` decides: the session noted for it, and its conversation file, not empty.
     fn has_conversation(&self, member: &str) -> bool {
         let s = &self.running.snapshot;
         let noted = fs::read_to_string(self.running.state.join("sessions").join(member)).unwrap_or_default();
@@ -342,7 +342,7 @@ impl Menu<'_> {
         let look = Look {
             glyphs: self.glyphs,
             frame: look::frame(self.start.elapsed()),
-            now: board::now(),
+            now: crate::sys::now(),
             option: cfg!(target_os = "macos"),
         };
         let drawn = if sheet.quick.is_some() {
@@ -498,7 +498,7 @@ impl Menu<'_> {
         let state = self.running.state.clone();
         let send = self.news.0.clone();
         std::thread::spawn(move || {
-            let asked = board::now();
+            let asked = crate::sys::now();
             let how = match bridge::request_resume(&state, &member) {
                 Err(error) => sheet::Resuming::Failed(format!("{error:#}")),
                 Ok(()) => {
@@ -548,7 +548,7 @@ impl Menu<'_> {
             };
             let mut claude = claude::command(&s.claude, s.config_dir.as_deref());
             claude.current_dir(&s.dir);
-            let result = generate::compose_member(claude, &s.team, &team, &request, &templates, &mut tell)
+            let result = compose::compose_member(claude, &s.team, &team, &request, &templates, &mut tell)
                 .map_err(|error| format!("{error:#}"));
             let _ = send.send(News::Composed(id, result));
         });
@@ -737,6 +737,55 @@ mod tests {
         assert!(fresh_states(dir.path(), 104).is_none(), "older than 3 s");
         assert!(fresh_states(dir.path(), 97).is_some(), "a little ahead: the clocks of two processes");
         assert!(fresh_states(dir.path(), 96).is_none(), "further ahead than 3 s");
+    }
+
+    /// With the dashboard off, the menu asks `claude agents` itself: the members open in the team's folder, and since
+    /// when they are in their state as this menu has seen it.
+    #[test]
+    fn states_asked_to_claude_agents() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A fake `claude`, written once: what it says is in a file beside it, and it fails when `fail` is there.
+        let claude = dir.path().join("claude");
+        fs::write(
+            &claude,
+            "#!/bin/sh\ndir=$(dirname \"$0\")\n[ -e \"$dir/fail\" ] && exit 1\ncat \"$dir/agents.json\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+        let says = |json: &str| fs::write(dir.path().join("agents.json"), json).unwrap();
+        let member = |name: &str| crate::team::state::MemberInfo { name: name.into(), ..Default::default() };
+        let snapshot = Snapshot {
+            dir: "/tmp/web".into(),
+            claude: claude.clone(),
+            members: vec![member("dev"), member("ops")],
+            ..Default::default()
+        };
+        let mut seen = States::new();
+        // dev here at work; ops only in another folder; a session of no member.
+        says(
+            r#"[{"name":"dev","cwd":"/tmp/web","status":"busy"},{"name":"ops","cwd":"/tmp/other","status":"idle"},
+            {"name":"stranger","cwd":"/tmp/web","status":"idle"}]"#,
+        );
+        // The first run, again for a moment while Linux says the file is busy (another test's fork holds it open).
+        let mut asked = None;
+        for _ in 0..40 {
+            asked = asked_states(&snapshot, &mut seen, 100);
+            if asked.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (states, errors) = asked.unwrap();
+        assert_eq!(states, States::from([("dev".into(), (State::Working, 100))]));
+        assert!(errors.is_empty());
+        // The same state later: since when it was first seen; another state: from now.
+        assert_eq!(asked_states(&snapshot, &mut seen, 130).unwrap().0["dev"], (State::Working, 100));
+        says(r#"[{"name":"dev","cwd":"/tmp/web","status":"idle"}]"#);
+        assert_eq!(asked_states(&snapshot, &mut seen, 160).unwrap().0["dev"], (State::Idle, 160));
+        // `claude agents` failing: nothing is known.
+        fs::write(dir.path().join("fail"), "").unwrap();
+        assert!(asked_states(&snapshot, &mut seen, 190).is_none());
     }
 
     #[test]

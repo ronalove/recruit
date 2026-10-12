@@ -215,8 +215,16 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
 }
 
+fn event(event: Event) -> Parsed {
+    Parsed::Token(Token::Event(event))
+}
+
 fn key(code: KeyCode, mods: Mods) -> Parsed {
-    Parsed::Token(Token::Event(Event::Key(Key::new(code, mods))))
+    event(Event::Key(Key::new(code, mods)))
+}
+
+fn key_with(code: KeyCode, mods: Mods, kind: KeyKind) -> Parsed {
+    event(Event::Key(Key { code, mods, kind }))
 }
 
 fn reply(reply: Reply) -> Parsed {
@@ -279,7 +287,7 @@ fn escape(buf: &[u8]) -> Step {
             Step::More => Step::More,
             Step::Read(n, Parsed::Token(Token::Event(Event::Key(mut key)))) => {
                 key.mods = key.mods | Mods::ALT;
-                Step::Read(n + 1, Parsed::Token(Token::Event(Event::Key(key))))
+                Step::Read(n + 1, event(Event::Key(key)))
             }
             Step::Read(n, other) => Step::Read(n + 1, other),
         },
@@ -400,12 +408,12 @@ fn csi_body(body: &[u8], fin: u8) -> Parsed {
     }
     let params = params(body);
     match fin {
-        b'I' if body.is_empty() => Parsed::Token(Token::Event(Event::Focus(true))),
-        b'O' if body.is_empty() => Parsed::Token(Token::Event(Event::Focus(false))),
+        b'I' if body.is_empty() => event(Event::Focus(true)),
+        b'O' if body.is_empty() => event(Event::Focus(false)),
         b'u' => {
             let Some(code) = get(&params, 0, 0).and_then(kitty_code) else { return Parsed::Nothing };
             let (mods, kind) = mods_kind(&params, 1);
-            Parsed::Token(Token::Event(Event::Key(Key { code, mods, kind })))
+            key_with(code, mods, kind)
         }
         b'~' => {
             let n = get(&params, 0, 0).unwrap_or(0);
@@ -416,7 +424,7 @@ fn csi_body(body: &[u8], fin: u8) -> Parsed {
                 // modifyOtherKeys: `CSI 27 ; mods ; code ~`.
                 let Some(code) = get(&params, 2, 0).and_then(kitty_code) else { return Parsed::Nothing };
                 let (mods, kind) = mods_kind(&params, 1);
-                return Parsed::Token(Token::Event(Event::Key(Key { code, mods, kind })));
+                return key_with(code, mods, kind);
             }
             let code = match n {
                 1 | 7 => KeyCode::Home,
@@ -433,9 +441,9 @@ fn csi_body(body: &[u8], fin: u8) -> Parsed {
                 _ => return Parsed::Nothing,
             };
             let (mods, kind) = mods_kind(&params, 1);
-            Parsed::Token(Token::Event(Event::Key(Key { code, mods, kind })))
+            key_with(code, mods, kind)
         }
-        // A cursor position report, which nobody asked for any more; `CSI 1 ; mods R` is F3.
+        // A cursor position report, which no query asks for: dropped if one comes; `CSI 1 ; mods R` is F3.
         b'R' if get(&params, 0, 0).is_some_and(|row| row != 1) => reply(Reply::Other),
         _ => {
             let code = match fin {
@@ -450,7 +458,7 @@ fn csi_body(body: &[u8], fin: u8) -> Parsed {
                 _ => return Parsed::Nothing,
             };
             let (mods, kind) = mods_kind(&params, 1);
-            Parsed::Token(Token::Event(Event::Key(Key { code, mods, kind })))
+            key_with(code, mods, kind)
         }
     }
 }
@@ -509,7 +517,7 @@ fn mouse(cb: u32, col: u16, row: u16, release: bool) -> Parsed {
         // X10 says which button went up only as "a button".
         button.map_or(MouseKind::Up(Button::Left), MouseKind::Down)
     };
-    Parsed::Token(Token::Event(Event::Mouse(Mouse { kind, col, row, mods })))
+    event(Event::Mouse(Mouse { kind, col, row, mods }))
 }
 
 #[cfg(test)]

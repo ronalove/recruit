@@ -15,7 +15,7 @@ cp target/debug/recruit "$T/recruit"
 export XDG_CONFIG_HOME="$T/config" XDG_CACHE_HOME="$T/cache" RECRUIT_TMPDIR="$R"
 mkdir -p "$T/proj/.recruit" && cd "$T/proj"   # une équipe de test (settings.toml), git init
 shasum ~/.claude/settings.json > "$T/settings.before"
-RECRUIT_BACKEND=native "$T/recruit" --detach   # l'équipe en natif ; puis recruit attach, list, stop
+"$T/recruit" --detach   # l'équipe ; puis recruit attach, list, stop
 # … vérifications : recruit _ctl <état> capture|send|key|clients|stats, un client sur le terminal …
 "$T/recruit" stop <équipe>
 shasum -c "$T/settings.before"      # S1 : doit dire OK
@@ -180,7 +180,7 @@ Chiffres du banc (voir « Banc de performance » ci-dessous), reportés à chaqu
 
 ### Sv : serveur et client (à partir de l'étape 1)
 
-Équipe de test lancée par `RECRUIT_BACKEND=native` sur une copie du binaire, `XDG_*` et `RECRUIT_TMPDIR` temporaires, dans un dossier de test ; jamais une équipe de l'utilisateur. Les membres de test sont de vrais Claude, nommés, avec des demandes simples.
+Équipe de test lancée sur une copie du binaire, `XDG_*` et `RECRUIT_TMPDIR` temporaires, dans un dossier de test ; jamais une équipe de l'utilisateur. Les membres de test sont de vrais Claude, nommés, avec des demandes simples.
 
 | ID | Vérification | Reproduire |
 |---|---|---|
@@ -355,9 +355,32 @@ Fin de l'étape 1, avant la journée de travail. Prototype retiré. Vraies sessi
 
 Performance : voir « Campagne 2 » sous « Banc de performance ».
 
+### Campagne 3 : rejouée après la refactorisation, Claude Code 2.1.296 (2026-10-12, 1 h 26 à 1 h 40)
+
+Accord de l'utilisateur pour la journée : `tests/mux_claude.rs` seulement (`CLAUDE_SESSIONS=2026-10-12` et le nom du test), ni frappes (`mux_keys`) ni captures de fenêtres (`screenshots`). Claude Code passe de 2.1.295 à **2.1.296**. Arbre : HEAD 0c1cc80 plus la refactorisation en cours (lots B, C, D), construit en release sans LTO, copie du binaire (`recruit 2.2.0`, empreinte a5f0e126) et de l'exécutable de test lancés à part (`RECRUIT_BIN`), `TMPDIR` à eux ; sessions de 5 s à 2 min dans un dossier temporaire, charge de la machine 4 à 10. `~/.claude/settings.json` (SHA-256 40b3982c…) **inchangé** avant et après chaque test ; `CLAUDE_CONFIG_DIR` n'est pas posé.
+
+| Test | Sessions | Résultat |
+|---|---|---|
+| `claude_modes` | 10 Claude seuls (5 terminaux annoncés × défaut et plein écran), 54 s | ok : 10 invites affichées |
+| `claude_through_mux` | 2 Claude × 7 variantes, vrai client, 122 s | ok : **77 sur 77**, comme en campagne 2 |
+| `claude_mouse_native` | 2 Claude (plein écran et classique), 12 s | ok : **3 sur 3** (Maj+glisser copié par OSC 52, molette au plein écran, molette de l'historique), après correction du test (ci-dessous) |
+| `claude_mod_report` | 1 Claude (Haiku), 20 s | ok : rapport du mod complet (modèle, effort, contexte 4 %, usage 5 h) |
+| `claude_header_against_card` | 2 Claude (Haiku), 99 s | ok : l'en-tête et la carte du tableau de bord suivent le même état ; 11 + 15 images sur 324 + 378 divergent, jamais plus de 4 images de suite (~0,8 s), seulement aux changements d'état (trace : `target/night/real-states.csv`, 521 lignes) |
+| `claude_auto_compaction` | 2 Claude (Haiku), 130 s, binaire reconstruit à 1 h 38 (aeabbb1b) | ok : trois compactions automatiques de `dev` (la 1re au repos, la 2e avec un message tapé pendant elle : tour lancé à la fin de la compaction, 14 lignes sur 14 « au travail » pendant le tour puis 21 sur 21 « au repos » après), `/compact` tapé dans `lead` tracé (« ⟳ lead compacted · 4 → 4% »), `report.last_compacted` correct (`auto` vrai ou absent), 6 entrées de compaction dans la conversation, le mot de contrôle repris après chacune, aucune entrée de rapport illisible (`input_error` nul), pas de « does not read » dans `server.log` |
+
+Non rejoués (pas d'accord) : `mux_keys` (frappes), `screenshots` (fenêtres). Leurs lignes de la grille gardent le résultat des campagnes 1 et 2.
+
+**Ce que Claude 2.1.296 demande seul** (`claude_modes`, 120×40, terminal de test avec kitty) : identique à la campagne 1 pour kitty (drapeaux 5, `CSI ? u` une fois), 1049 seulement en plein écran, souris 1000/1002/1003/1006 seulement en plein écran, OSC 7501 une fois, jamais OSC 11 ni DECRQM 2026 sans réponse XTVERSION du terminal ; BSU posés seulement avec `TERM_PROGRAM=ghostty`. Pas de changement de comportement relevé entre 2.1.295 et 2.1.296 pour la grille. Dans le multiplexeur, le moteur répond XTVERSION : Claude demande DECRQM 2026 et pose ses BSU (`claude_through_mux`, pas de séquence perdue à l'écran dans aucune variante).
+
+**Terminal annoncé (T1, T2)** : recruit, aucun, ghostty, ghostty 1.2.3, tmux (`TERM=tmux-256color`), plus plein écran pour recruit et ghostty : les 11 contrôles passent dans les 7.
+
+**Pièges et corrections du banc.**
+- `claude_mouse_native` attendait « 80 » dans le panneau avant de chercher « FINI-TEST » : « 80 » est dans l'écho de la question, présent tout de suite, donc le test continuait 3 s plus tard sans la réponse de Claude (il ne passait qu'à la faveur du temps de réponse). Il attend maintenant une ligne qui est exactement « FINI-TEST ». Il cherchait aussi le mot à droite de la colonne du titre du cadre (`find` rend la colonne du nom, 5 cases à droite du bord) : une réponse alignée à gauche n'était pas vue. Corrigé dans `tests/mux_claude.rs` (marge de 8 cases, message d'échec avec l'écran et la capture).
+- Sessions laissées par les tests sous `~/.claude/projects` (3 dossiers du dossier temporaire de cette campagne : `…claude-campaign-tmp-recruit-testeur-claude`, `…-tmplN2DMw-proj`, `…-tmpxOQM80-proj`), à retirer quand aucun Claude ne tourne ; `~/.claude.json` non touché par moi.
+
 ## Parité (§7.1 de la spec) : vérifications de l'étape 2
 
-À cocher en natif (`RECRUIT_BACKEND=native`), en français et en anglais, sous macOS et, pour ce qui n'a pas besoin d'une fenêtre, sous Linux (Alpine). Chaque ligne dit sa preuve :
+À cocher en natif, en français et en anglais, sous macOS et, pour ce qui n'a pas besoin d'une fenêtre, sous Linux (Alpine). Chaque ligne dit sa preuve :
 - **T** : un test sans fenêtre, dans `cargo test`, existant ou à écrire. Les tests d'équipe (`tests/mux_team.rs`, à écrire) lancent une vraie équipe native par `recruit` avec un faux `claude` dans le `PATH` (factice des tests : `--version`, `agents --json`, une invite, une sortie sur commande, `-r <session>` noté), `XDG_*` et `RECRUIT_TMPDIR` temporaires, un client sur le terminal de test.
 - **C** : une capture de `scripts/screenshots.sh` adapté au natif, comparée à celle de tmux.
 - **M** : un essai à la main, sur une équipe de test (faux `claude`, ou vrais Claude courts), noté avec sa date.
@@ -385,7 +408,7 @@ Performance : voir « Campagne 2 » sous « Banc de performance ».
 | L1 | Fichiers d'équipe illisibles : menu en lecture seule (membres tels que lancés, détacher, arrêter) | T : `mux_team`, `settings.toml` cassé après le lancement, ⌥r : le menu le dit et ne propose que détacher et arrêter ; C | ok (2026-10-10, `unreadable_files_open_a_read_only_menu` : message de lecture seule nommant le fichier, membres tels que lancés, seulement Détacher et Quitter, Échap ferme, Quitter arrête l'équipe ; la confirmation ne parlait à tort que de « session tmux » : corrigé par dev-interface, contrôlé) |
 | L2 | `--dry-run` en natif : le plan, des panneaux sans Claude, sans shell de connexion à la fin | T : `mux_team` (aucun processus `claude` lancé, texte des panneaux lu) | ok (2026-10-10, `dry_run_starts_no_claude` : essai `<équipe>-dry-run` à part, panneaux qui montrent la commande et « Claude n'est pas lancé », aucun Claude lancé, `recruit list` dit « essai en cours », `recruit stop` le ferme sans reste) |
 | L3 | `recruit list`, `attach`, `stop` en natif | T : `mux_team` (déjà vu à la main, Sv8) ; `stop` sans reste | `list` et `stop` ok (`mux_team`, chaque test s'arrête par `recruit stop` sans reste) ; `attach` à venir avec les tests du client |
-| C1 | `scripts/screenshots.sh` produit les mêmes captures en natif (mêmes fichiers, même cadrage ; sans forfait, `/Users/` ni `$HOME`) | C : les deux jeux côte à côte ; M : relecture des captures | script prêt (2026-10-10) : `scripts/screenshots.sh --backend native` (le défaut reste tmux), questions au multiplexeur dans `scripts/shots-backend.sh`, vérifiées sans vhs ni Claude par `mux_team::screenshots_backend_native` (ignoré : bash, jq, python3) ; reste le passage réel (vhs, vrais Claude), à faire de jour avec le go de l'utilisateur |
+| C1 | `scripts/screenshots.sh` produit les mêmes captures en natif (mêmes fichiers, même cadrage ; sans forfait, `/Users/` ni `$HOME`) | C : les deux jeux côte à côte ; M : relecture des captures | script prêt (2026-10-10) : `scripts/screenshots.sh` (le multiplexeur natif est le seul), questions au multiplexeur dans `scripts/shots-ctl.sh`, vérifiées sans vhs ni Claude par `mux_team::screenshots_script_asks_of_the_multiplexer` (ignoré : bash, jq, python3) ; reste le passage réel (vhs, vrais Claude), à faire de jour avec le go de l'utilisateur |
 
 ## Étape 3 (F1 à F8) : vérifications de la nuit du 2026-10-10
 

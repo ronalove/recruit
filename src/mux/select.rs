@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! A pane's text selected with the mouse, and copied (spec §5.5): a press starts it, a drag extends it, a double
-//! click takes a word, a triple click a line; the release copies it (OSC 52, by `Relay::Clipboard`). The selection
-//! stays shown until the next press or key. And the history scrolled with the keyboard.
+//! A pane's text selected with the mouse, and copied: a press starts it, a drag extends it, a double click takes a
+//! word, a triple click a line; the release copies it (OSC 52, by `Relay::Clipboard`). The selection stays shown until
+//! the next press or key. And the history scrolled with the keyboard.
 //!
 //! The server holds one selection for the screen, and routes the mouse to it when the pane's program does not take
 //! the mouse, or with Shift. It clears it on a press elsewhere, a key sent to the pane, a resize (the text is wrapped
 //! anew), a switch to or from the alternate screen. Points count lines from the first line the pane had
-//! ([`Engine::top`]): they stay on their text while the program writes and the view scrolls.
-//!
-//! Owner: dev-rendu.
+//! ([`Surface::top`]): they stay on their text while the program writes and the view scrolls.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use super::Rect;
-use super::engine::{Engine, Line, Relay};
-use super::input::{Key, KeyCode, Mods};
+use super::engine::{Line, Relay, Surface};
+use crate::ui::Rect;
 
 /// A cell of a pane's whole text, history included.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -70,7 +67,7 @@ fn kind(cell: &str) -> Kind {
 
 /// The point under the screen's cell `col`, `row`, in a pane whose cells are `cells`: brought within the pane when
 /// outside (a drag past its edge).
-pub(crate) fn point(engine: &dyn Engine, cells: Rect, col: usize, row: usize) -> Point {
+pub(crate) fn point(engine: &dyn Surface, cells: Rect, col: usize, row: usize) -> Point {
     let col = col.clamp(cells.x, cells.x + cells.width.saturating_sub(1)) - cells.x;
     let row = row.clamp(cells.y, cells.y + cells.height.saturating_sub(1)) - cells.y;
     Point { line: engine.top() + row as u64, col }
@@ -84,23 +81,6 @@ pub(crate) fn edge(cells: Rect, row: usize) -> isize {
         -1
     } else {
         0
-    }
-}
-
-/// What a key does to a pane's history, if it scrolls it: Shift with Page Up, Page Down (a screen less a line),
-/// Home (the oldest line), End (the live screen); `rows` the pane's. Not on the alternate screen, which has no
-/// history: the key goes to the program.
-pub(crate) fn scroll_key(key: &Key, rows: usize, alt_screen: bool) -> Option<isize> {
-    if key.mods != Mods::SHIFT || alt_screen || !key.is_press() {
-        return None;
-    }
-    let page = rows.saturating_sub(1).max(1) as isize;
-    match key.code {
-        KeyCode::PageUp => Some(page),
-        KeyCode::PageDown => Some(-page),
-        KeyCode::Home => Some(isize::MAX),
-        KeyCode::End => Some(isize::MIN),
-        _ => None,
     }
 }
 
@@ -141,12 +121,12 @@ fn kinds(line: &Line) -> Vec<Kind> {
 
 /// Lines read from an engine, by number, kept while a selection is worked out.
 struct Text<'a> {
-    engine: &'a dyn Engine,
+    engine: &'a dyn Surface,
     lines: HashMap<u64, Option<Line>>,
 }
 
 impl<'a> Text<'a> {
-    fn new(engine: &'a dyn Engine) -> Self {
+    fn new(engine: &'a dyn Surface) -> Self {
         Text { engine, lines: HashMap::new() }
     }
 
@@ -227,7 +207,7 @@ impl Selection {
         pane: &str,
         at: Point,
         now: Instant,
-        engine: &dyn Engine,
+        engine: &dyn Surface,
     ) -> Selection {
         // On the same cell or the one beside it: a hand that clicks twice moves a little.
         let near = |anchor: Point| anchor.line == at.line && anchor.col.abs_diff(at.col) <= 1;
@@ -253,7 +233,7 @@ impl Selection {
     }
 
     /// The pointer dragged to `at`, the button down.
-    pub(crate) fn drag(&mut self, at: Point, engine: &dyn Engine) {
+    pub(crate) fn drag(&mut self, at: Point, engine: &dyn Surface) {
         if at != self.head {
             self.head = at;
             // A press after a drag starts anew, however close.
@@ -262,7 +242,7 @@ impl Selection {
         }
     }
 
-    fn extend(&mut self, engine: &dyn Engine) {
+    fn extend(&mut self, engine: &dyn Surface) {
         let (low, high) = (self.anchor.min(self.head), self.anchor.max(self.head));
         let mut text = Text::new(engine);
         self.range = match self.unit {
@@ -284,13 +264,13 @@ impl Selection {
     }
 
     /// Whether its text is still kept: lines past the history's limit are gone.
-    pub(crate) fn kept(&self, engine: &dyn Engine) -> bool {
+    pub(crate) fn kept(&self, engine: &dyn Surface) -> bool {
         self.range.is_none_or(|(start, _)| start.line >= engine.oldest())
     }
 
     /// The selected text: blanks at the ends of lines left out, a wrapped line joined to the next, the others ended
     /// by a new line; empty for a click.
-    pub(crate) fn text(&self, engine: &dyn Engine) -> String {
+    pub(crate) fn text(&self, engine: &dyn Surface) -> String {
         let Some((start, end)) = self.range else { return String::new() };
         let mut out = String::new();
         for number in start.line.max(engine.oldest())..=end.line {
@@ -322,7 +302,7 @@ impl Selection {
 
     /// What the release of the button copies: the selected text, for the real terminal's clipboard; nothing for a
     /// click.
-    pub(crate) fn copy(&self, engine: &dyn Engine) -> Option<Relay> {
+    pub(crate) fn copy(&self, engine: &dyn Surface) -> Option<Relay> {
         let text = self.text(engine);
         (!text.is_empty()).then_some(Relay::Clipboard(text))
     }
@@ -331,9 +311,7 @@ impl Selection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canvas::{Canvas, Cursor};
-    use crate::mux::Rgb;
-    use crate::mux::engine::Modes;
+    use crate::ui::canvas::Canvas;
 
     /// A pane's text: lines of `width` cells at least, those ending in `\` wrapped into the next (and as wide as
     /// their text); the first `dropped` gone from the history, the view `top`.
@@ -350,31 +328,8 @@ mod tests {
         }
     }
 
-    impl Engine for Fake {
-        fn feed(&mut self, _: &[u8], _: &mut Vec<u8>) {}
-        fn deadline(&self) -> Option<Instant> {
-            None
-        }
-        fn expire(&mut self, _: Instant, _: &mut Vec<u8>) -> bool {
-            false
-        }
-        fn relays(&mut self, _: &mut Vec<Relay>) {}
-        fn resize(&mut self, _: u16, _: u16) {}
-        fn set_colors(&mut self, _: Option<Rgb>, _: Option<Rgb>) {}
-        fn modes(&self) -> Modes {
-            Modes::default()
-        }
+    impl Surface for Fake {
         fn draw(&self, _: &mut Canvas, _: Rect) {}
-        fn cursor(&self) -> Option<Cursor> {
-            None
-        }
-        fn history(&self) -> usize {
-            0
-        }
-        fn scroll(&mut self, _: isize) {}
-        fn scrolled(&self) -> usize {
-            0
-        }
         fn top(&self) -> u64 {
             self.top
         }
@@ -519,18 +474,5 @@ mod tests {
         fake.dropped = 1;
         assert!(!selection.kept(&fake));
         assert_eq!(selection.text(&fake), "one\ntwo");
-    }
-
-    #[test]
-    fn keys_that_scroll() {
-        let shift = |code| Key::new(code, Mods::SHIFT);
-        assert_eq!(scroll_key(&shift(KeyCode::PageUp), 20, false), Some(19));
-        assert_eq!(scroll_key(&shift(KeyCode::PageDown), 20, false), Some(-19));
-        assert_eq!(scroll_key(&shift(KeyCode::Home), 20, false), Some(isize::MAX));
-        assert_eq!(scroll_key(&shift(KeyCode::End), 20, false), Some(isize::MIN));
-        assert_eq!(scroll_key(&shift(KeyCode::PageUp), 1, false), Some(1));
-        // Without Shift, or on the alternate screen: the program's.
-        assert_eq!(scroll_key(&Key::new(KeyCode::PageUp, Mods::NONE), 20, false), None);
-        assert_eq!(scroll_key(&shift(KeyCode::PageUp), 20, true), None);
     }
 }

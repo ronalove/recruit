@@ -2,13 +2,11 @@
 // Copyright (C) 2026 Ronan Lamour
 //! A choice open over the team (the quit choice of ⌥q, the confirmation of a compaction): what each key and each
 //! click does to it, without the screen. While one is open, nothing reaches the panes.
-//!
-//! Owner: dev-serveur.
 
-use crate::mux::Rect;
 use crate::mux::chrome::Choice;
 use crate::mux::engine::Modes;
 use crate::mux::input::{self, Button, Key, KeyCode, Mods, Mouse, MouseKind};
+use crate::ui::Rect;
 
 /// What the choice is for: what its options do.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -3,8 +3,6 @@
 //! The native multiplexer's integration tests without a window (spec §9): a server of the test's own
 //! (`common::server`), a fake program in its pane (`common::fakes`), a real client on the test's terminal
 //! (`common::pty`); what reaches that terminal is checked. Part of `cargo test`, and so of the CI.
-//!
-//! Owner: testeur.
 
 mod common;
 
@@ -21,11 +19,7 @@ use common::server::{Server, Staller};
 #[test]
 #[ignore = "started by the other tests only"]
 fn child() {
-    match common::role().as_deref() {
-        Some(role) if common::fakes::run(role) => {}
-        Some(other) => panic!("unknown child role {other}"),
-        None => {}
-    }
+    common::child_main();
 }
 
 /// A server of the test's own in `dir`, a real client attached on a test terminal of `cols` × `rows` (answering

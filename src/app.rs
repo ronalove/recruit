@@ -15,14 +15,15 @@ use std::process::Command as Process;
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 
-use crate::backend::{self, Backend};
 use crate::cli::{Cli, Command, NewArgs};
-use crate::config::{self, Catalog, Found, Member, Scope, Team, tilde, validate_member_name, validate_team_name};
-use crate::launch::{self, Options};
-use crate::templates::Templates;
+use crate::config::{self, Catalog, Found, Scope, validate_team_name};
+use crate::create::templates::Templates;
+use crate::mux::Mux;
+use crate::sys::tilde;
+use crate::team::launch::{self, Options};
 
 use crate::ui::{self, Choice};
-use crate::{board, bridge, claude, generate, i18n, live, member, menu, mux, t, wizard};
+use crate::{board, claude::bridge, create, i18n, menu, mux, t, team::live, team::member};
 
 pub fn run(cli: Cli) -> Result<()> {
     let cwd = std::env::current_dir().context("current directory")?;
@@ -45,7 +46,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Command::Ctl { state, action }) => mux::ctl::run(&state, action),
         Some(Command::Member { state, member, resume }) => member::run(&state, &member, resume),
         Some(Command::Menu { state, client, nerd, light, member, field, list }) => {
-            crate::look::set_light(light);
+            crate::ui::look::set_light(light);
             menu::run(&state, client.as_deref(), nerd, member.as_deref(), field.as_deref(), list)
         }
         Some(Command::EditRunning { state, edits, restart, fresh, restart_all, dismiss }) => {
@@ -146,7 +147,7 @@ fn default(cwd: &Path, options: &Options) -> Result<()> {
 }
 
 fn create(cwd: &Path, catalog: &Catalog, prefill: Option<&str>, options: &Options) -> Result<()> {
-    let outcome = wizard::run(cwd, catalog, prefill)?;
+    let outcome = create::run(cwd, catalog, prefill)?;
     if !outcome.launch {
         return Ok(());
     }
@@ -179,69 +180,8 @@ fn new(cwd: &Path, args: NewArgs) -> Result<()> {
         return create(cwd, &catalog, args.name.as_deref(), &Options::default());
     }
 
-    let name = args.name.clone().context(t!(
-        "le nom de l'équipe manque : recruit new <nom> …",
-        "the team name is missing: recruit new <name> …"
-    ))?;
-    validate_team_name(&name).map_err(anyhow::Error::msg)?;
-    let templates = Templates::load();
-    let catalog = Catalog::load(cwd)?;
-    let root = catalog.local.as_ref().map_or_else(|| cwd.to_path_buf(), |(root, _)| root.clone());
-
-    let mut team = if let Some(kind) = &args.template {
-        templates.build(kind, args.size.as_deref().unwrap_or("small"))?
-    } else if let Some(description) = &args.describe {
-        let settings = catalog.local.as_ref().map(|(_, s)| s.claude.clone()).unwrap_or_default();
-        let claude = claude::require(settings.command())?;
-        generate::compose(
-            &claude,
-            settings.config_dir().as_deref(),
-            &root,
-            description,
-            args.size.as_deref(),
-            &templates,
-        )?
-    } else {
-        Team {
-            lang: Some(i18n::lang()),
-            instructions: Some(templates.team_instructions().trim().to_string()),
-            ..Default::default()
-        }
-    };
-    for spec in &args.members {
-        let (member, role) =
-            spec.split_once(':').map(|(n, r)| (n.trim(), r.trim())).filter(|(_, r)| !r.is_empty()).with_context(
-                || t!("--member attend « nom:rôle », pas « {} »", "--member expects \"name:role\", not \"{}\"", spec),
-            )?;
-        validate_member_name(member).map_err(|e| anyhow::anyhow!("{member}: {e}"))?;
-        team.members.entry(member.to_string()).or_insert_with(Member::default).role = role.to_string();
-    }
-    if team.members.is_empty() {
-        bail!(t!("l'équipe n'a aucun membre", "the team has no members"));
-    }
-    if args.contacts.len() > config::MAX_CONTACTS {
-        bail!(t!("--contact : {} interlocuteurs au plus", "--contact: {} contacts at most", config::MAX_CONTACTS));
-    }
-    if !args.contacts.is_empty() {
-        if let Some(unknown) = args.contacts.iter().find(|c| !team.members.contains_key(*c)) {
-            bail!(t!("--contact : aucun membre « {} »", "--contact: no member \"{}\"", unknown));
-        }
-        for (name, member) in team.members.iter_mut() {
-            member.contact = args.contacts.contains(name);
-        }
-    }
-    team.permission_mode = args.permission_mode.or(team.permission_mode);
-    team.model = args.model.or(team.model);
-
-    let file = if args.global {
-        config::save_global(&name, &team, args.force)?
-    } else {
-        config::save_local(&root, &name, &team, args.force)?
-    };
-    println!("{}", t!("Équipe « {} » enregistrée dans {}.", "Team \"{}\" saved in {}.", name, tilde(&file)));
-    ui::print_team(&team);
+    let (name, scope) = create::new::make(cwd, &args)?;
     if args.launch {
-        let scope = if args.global { Scope::Global } else { Scope::Local };
         launch_created(cwd, &name, scope, &Options::default())?;
     }
     Ok(())
@@ -256,14 +196,9 @@ fn list(cwd: &Path, as_json: bool) -> Result<()> {
     let catalog = Catalog::load(cwd)?;
     let local = catalog.local_teams();
     let global = catalog.global_teams();
-    let running = backend::running();
-    let state = |name: &str| running.iter().find(|r| r.session == backend::session_name(name));
-    let trial =
-        |name: &str| running.iter().any(|r| r.session == format!("{}{}", backend::session_name(name), launch::DRY_RUN));
-    // A team still under recruit 1's tmux, after an upgrade: not stopped, `recruit <team>` takes it over.
-    let legacy = |f: &Found| {
-        state(&f.name).is_none() && launch::legacy::running(f.tmux.socket(), &backend::session_name(&f.name))
-    };
+    let running = mux::running();
+    let state = |name: &str| running.iter().find(|r| r.session == name);
+    let trial = |name: &str| running.iter().any(|r| r.session == launch::trial_session(name));
     let default = catalog.local.as_ref().and_then(|(_, s)| s.default.clone());
 
     if as_json {
@@ -280,7 +215,6 @@ fn list(cwd: &Path, as_json: bool) -> Result<()> {
                     "running": run.is_some(),
                     "attached": run.is_some_and(|r| r.attached),
                     "dir": run.map(|r| r.dir.clone()),
-                    "tmux": legacy(f),
                 })
             })
             .collect();
@@ -296,7 +230,6 @@ fn list(cwd: &Path, as_json: bool) -> Result<()> {
                 Some(r) if r.attached => t!("en cours, attachée", "running, attached"),
                 Some(_) => t!("en cours", "running"),
                 None if trial(&f.name) => t!("essai en cours (--dry-run)", "trial running (--dry-run)"),
-                None if legacy(f) => t!("en cours sous recruit 1 (tmux)", "running under recruit 1 (tmux)"),
                 None => t!("arrêtée", "stopped"),
             };
             let pad = " ".repeat(width - f.name.chars().count());
@@ -321,13 +254,8 @@ fn list(cwd: &Path, as_json: bool) -> Result<()> {
             t!("Aucune équipe. Tape recruit pour en créer une.", "No team yet. Type recruit to create one.")
         );
     }
-    let known: Vec<String> = local
-        .iter()
-        .chain(&global)
-        .flat_map(|f| {
-            [backend::session_name(&f.name), format!("{}{}", backend::session_name(&f.name), launch::DRY_RUN)]
-        })
-        .collect();
+    let known: Vec<String> =
+        local.iter().chain(&global).flat_map(|f| [f.name.clone(), launch::trial_session(&f.name)]).collect();
     let others: Vec<String> =
         running
             .iter()
@@ -346,30 +274,22 @@ fn list(cwd: &Path, as_json: bool) -> Result<()> {
     Ok(())
 }
 
-/// The session `attach` and `stop` act on, and what runs it: the named team, this project's team, or the only one
-/// running. A team still under recruit 1's tmux server is named in the error, with what to do.
-fn target(cwd: &Path, team: Option<&str>) -> Result<(Box<dyn Backend>, String, String)> {
+/// The team `attach` and `stop` act on, and its name: the named team (or its trial), this project's team, or the only
+/// one running.
+fn target(cwd: &Path, team: Option<&str>) -> Result<(Mux, String)> {
     let catalog = Catalog::load(cwd)?;
     let found = match team {
         Some(name) => catalog.find(name),
         None => catalog.default_local(),
     };
     if let Some(name) = team.or(found.as_ref().map(|f| f.name.as_str())) {
-        let session = backend::session_name(name);
-        let trial = format!("{session}{}", launch::DRY_RUN);
-        for session in [session.clone(), trial] {
-            let backend = backend::for_session(&session);
-            if backend.has_session(&session) {
-                return Ok((backend, session, name.to_string()));
+        let session = name.to_string();
+        let trial = launch::trial_session(&session);
+        for session in [session, trial] {
+            let mux = Mux::of(&session);
+            if mux.is_running() {
+                return Ok((mux, name.to_string()));
             }
-        }
-        let socket = found.as_ref().map(|f| f.tmux.socket().to_string()).unwrap_or_else(|| "recruit".into());
-        if launch::legacy::running(&socket, &session) {
-            bail!(t!(
-                "l'équipe « {0} » tourne encore sous tmux, lancée par recruit 1. « recruit {0} » propose de l'arrêter et de la relancer ici, chaque membre sur sa conversation.",
-                "team \"{0}\" still runs under tmux, launched by recruit 1. \"recruit {0}\" offers to stop it and launch it again here, each member on its conversation.",
-                name
-            ));
         }
         bail!(t!(
             "l'équipe « {} » ne tourne pas. Pour la lancer : recruit {}",
@@ -378,7 +298,7 @@ fn target(cwd: &Path, team: Option<&str>) -> Result<(Box<dyn Backend>, String, S
             name
         ));
     }
-    let mut running = backend::running();
+    let mut running = mux::running();
     let (session, team) = match running.len() {
         0 => bail!(t!("aucune équipe ne tourne", "no team is running")),
         1 => {
@@ -399,54 +319,16 @@ fn target(cwd: &Path, team: Option<&str>) -> Result<(Box<dyn Backend>, String, S
             ))
         }
     };
-    Ok((backend::for_session(&session), session, team))
-}
-
-/// `recruit stop` of a team that still runs under recruit 1's tmux server, and not here: stopped there, after the same
-/// question. The team's name when it was.
-fn stop_legacy(cwd: &Path, team: Option<&str>, yes: bool) -> Result<Option<String>> {
-    let catalog = Catalog::load(cwd)?;
-    let found = match team {
-        Some(name) => catalog.find(name),
-        None => catalog.default_local(),
-    };
-    let Some(name) = team.or(found.as_ref().map(|f| f.name.as_str())) else { return Ok(None) };
-    let session = backend::session_name(name);
-    let socket = found.as_ref().map(|f| f.tmux.socket().to_string()).unwrap_or_else(|| "recruit".into());
-    if backend::for_session(&session).has_session(&session) || !launch::legacy::running(&socket, &session) {
-        return Ok(None);
-    }
-    if !yes && ui::interactive() {
-        let sure = ui::confirm(
-            &t!(
-                "Arrêter l'équipe « {} », qui tourne encore sous tmux (recruit 1) ? Ses sessions Claude seront fermées (recruit {} --resume les reprendra).",
-                "Stop team \"{}\", still running under tmux (recruit 1)? Its Claude sessions will be closed (recruit {} --resume picks them up again).",
-                name,
-                name
-            ),
-            true,
-        )?;
-        if !sure {
-            return Err(ui::Cancelled.into());
-        }
-    }
-    if !launch::legacy::stop(&socket, &session) {
-        bail!(t!("tmux n'a pas arrêté l'équipe « {} »", "tmux did not stop team \"{}\"", name));
-    }
-    Ok(Some(name.to_string()))
+    Ok((Mux::of(&session), team))
 }
 
 fn attach(cwd: &Path, team: Option<&str>) -> Result<()> {
-    let (backend, session, _) = target(cwd, team)?;
-    backend.attach(&session)
+    let (mux, _) = target(cwd, team)?;
+    mux.attach()
 }
 
 fn stop(cwd: &Path, team: Option<&str>, yes: bool) -> Result<()> {
-    if let Some(stopped) = stop_legacy(cwd, team, yes)? {
-        println!("{}", t!("Équipe « {} » arrêtée.", "Team \"{}\" stopped.", stopped));
-        return Ok(());
-    }
-    let (backend, session, name) = target(cwd, team)?;
+    let (mux, name) = target(cwd, team)?;
     if !yes && ui::interactive() {
         let sure = ui::confirm(
             &t!(
@@ -461,7 +343,7 @@ fn stop(cwd: &Path, team: Option<&str>, yes: bool) -> Result<()> {
             return Ok(());
         }
     }
-    backend.stop(&session)?;
+    mux.stop()?;
     println!("{}", t!("Équipe « {} » arrêtée.", "Team \"{}\" stopped.", name));
     Ok(())
 }

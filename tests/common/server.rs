@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! A native multiplexer server of the test's own (step 1): `recruit _server <state>` on a copy of the binary, with
+//! A native multiplexer server of the test's own: `recruit _server <state>` on a copy of the binary, with
 //! `XDG_*` and `RECRUIT_TMPDIR` in a temporary folder; driven by `recruit _ctl <state> …` (where, spawn, capture,
 //! send, key, clients, kill, stop) and seen through real clients (`_ctl <state> attach`) on test terminals.
 //! Stopped, and checked to leave no process behind, when dropped.
-//!
-//! Owner: testeur.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -256,12 +254,12 @@ pub fn leftovers(root: &Path) -> Vec<String> {
     processes()
         .into_iter()
         .filter(|l| l.contains(root.as_ref()))
-        // An MCP server's sidecar of the user's (`ha_mcp`) leaves its Claude's process group and outlives it, under
-        // tmux as well (2026-10-09): said, not counted.
+        // An MCP server's sidecar of the user's (`ha_mcp`) leaves its Claude's process group and outlives it: said,
+        // not counted.
         .filter(|l| {
             let sidecar = l.contains("stdio_settings_sidecar");
             if sidecar {
-                println!("Ignored, outlives its Claude under tmux too: {}", l.chars().take(100).collect::<String>());
+                println!("Ignored, outlives its Claude: {}", l.chars().take(100).collect::<String>());
             }
             !sidecar
         })

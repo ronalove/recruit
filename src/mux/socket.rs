@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! Where a team's server is, and how to reach it (specs/multiplexeur-serveur.md §2).
+//! Where a team's server is, and how to reach it.
 //!
 //! The authority is the lock in the team's state folder, `server.lock`, held by the server all its life, never by
 //! anyone else for more than a look. Beside it, `server.json` says where its socket is; written by the server once
 //! it holds the lock, and removed when it stops. The socket lives in `${RECRUIT_TMPDIR:-/tmp}/recruit-<uid>/`,
 //! short enough for `sun_path`, the same from a graphical terminal and over SSH; its name binds it to the state
 //! folder, so that a test's server never takes the socket of the user's team.
-//!
-//! Owner: dev-serveur.
 
 use std::fs::{self, File};
 use std::io;
@@ -22,7 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::write_atomic;
+use crate::sys::{fnv64, write_atomic};
 use crate::t;
 
 /// The longest socket path: `sun_path` holds 104 bytes on macOS, its final NUL included (108 on Linux).
@@ -34,12 +32,12 @@ const NAME_MIN: usize = 24;
 
 /// The kernel buffers of a server's and a client's socket: macOS gives a Unix socket 8 KiB, which would cut a full
 /// frame into tens of writes.
-pub(crate) const BUFFER: usize = 256 << 10;
+const BUFFER: usize = 256 << 10;
 
 const LOCK: &str = "server.lock";
 const INFO: &str = "server.json";
 /// What `server.json` becomes when its server died without stopping: the launch that follows knows it crashed
-/// (`launch.rs`), whatever looked at the team in between.
+/// (`team/launch.rs`), whatever looked at the team in between.
 const CRASHED: &str = "crashed";
 
 /// How long a server that holds its lock without `server.json` yet is waited for: it is starting.
@@ -76,6 +74,19 @@ pub(crate) fn mark_crashed(state: &Path, info: &Info) {
 pub(crate) fn clean_stopped(state: &Path, info: &Info) {
     let _ = remove_stale(&info.socket);
     let _ = fs::remove_file(info_file(state));
+}
+
+/// Whether the server of `state` crashed (or the machine did): a server removes `server.json` when it stops, even when
+/// `stop` has to kill it; a dead one's is left, and becomes the `crashed` mark once cleaned. Dead, not slow: its lock
+/// is free.
+pub(crate) fn crashed(state: &Path) -> bool {
+    let left = read_info(state).is_some() || crashed_file(state).exists();
+    left && matches!(try_lock(state), Ok(Some(_)))
+}
+
+/// The team runs again: a crash before is no longer one.
+pub(crate) fn recovered(state: &Path) {
+    let _ = fs::remove_file(crashed_file(state));
 }
 
 pub(crate) fn read_info(state: &Path) -> Option<Info> {
@@ -129,16 +140,6 @@ fn check_dir(dir: &Path, uid: u32) -> Result<()> {
         return Ok(());
     };
     bail!(t!("dossier des sockets refusé, {} : {}", "sockets' directory refused, {}: {}", dir.display(), why))
-}
-
-/// FNV-1a, 64 bits: enough to tell names apart, without a dependency.
-fn fnv64(parts: &[&[u8]]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in parts.iter().flat_map(|part| part.iter()) {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    hash
 }
 
 /// A team's socket in `dir`: `<session>-<h>.sock`, where `h` names its state folder. A name too long for
@@ -197,9 +198,18 @@ pub(crate) fn same_user(stream: &impl AsRawFd) -> bool {
     peer_uid(stream).is_ok_and(|uid| uid == unsafe { libc::getuid() })
 }
 
-/// Sets a socket's send (`SO_SNDBUF`) or receive (`SO_RCVBUF`) buffer; the kernel may give less.
-pub(crate) fn set_buffer(stream: &impl AsRawFd, option: libc::c_int, size: usize) {
-    let size = size as libc::c_int;
+/// Enlarges a socket's send buffer, on the server's side of a client; the kernel may give less.
+pub(crate) fn enlarge_send_buffer(stream: &impl AsRawFd) {
+    set_buffer(stream, libc::SO_SNDBUF);
+}
+
+/// Enlarges a socket's receive buffer, on the client's side; the kernel may give less.
+fn enlarge_receive_buffer(stream: &impl AsRawFd) {
+    set_buffer(stream, libc::SO_RCVBUF);
+}
+
+fn set_buffer(stream: &impl AsRawFd, option: libc::c_int) {
+    let size = BUFFER as libc::c_int;
     // SAFETY: an integer option of the size given.
     unsafe {
         libc::setsockopt(
@@ -295,19 +305,12 @@ pub(crate) fn remove_own(path: &Path, id: FileId) {
     }
 }
 
-/// Where a team's server stands, from its state folder.
-pub(crate) enum Found {
-    /// Connected to it, and it is ours.
-    Running(UnixStream),
-    /// No server: whatever a dead one left was cleaned.
-    Gone,
-}
-
-/// Reaches the server of the team whose state folder is `state` (§2.4). The lock decides: free, no server runs,
+/// Reaches the server of the team whose state folder is `state`: a stream connected to it, and it is ours; `None`
+/// when no server runs, whatever a dead one left cleaned. The lock decides: free, no server runs,
 /// and what one left is removed (no signal: the pid it noted may be another process's by now); held without
 /// `server.json`, the server is starting, and is waited for; held with it, the pid is the holder's, and a socket
 /// gone from `/tmp` is asked for again by SIGURG.
-pub(crate) fn connect(state: &Path) -> Result<Found> {
+pub(crate) fn connect(state: &Path) -> Result<Option<UnixStream>> {
     let until = Instant::now() + STARTING;
     let mut nudged = false;
     loop {
@@ -316,8 +319,8 @@ pub(crate) fn connect(state: &Path) -> Result<Found> {
         if let Some(info) = &info {
             match UnixStream::connect(&info.socket) {
                 Ok(stream) if same_user(&stream) => {
-                    set_buffer(&stream, libc::SO_RCVBUF, BUFFER);
-                    return Ok(Found::Running(stream));
+                    enlarge_receive_buffer(&stream);
+                    return Ok(Some(stream));
                 }
                 Ok(_) => bail!(t!(
                     "le socket {} est tenu par un autre utilisateur",
@@ -334,7 +337,7 @@ pub(crate) fn connect(state: &Path) -> Result<Found> {
                 if let Some(info) = &info {
                     mark_crashed(state, info);
                 }
-                return Ok(Found::Gone);
+                return Ok(None);
             }
             None => {
                 if let Some(info) = &info
@@ -479,14 +482,14 @@ mod tests {
         write_info(state.path(), &info).unwrap();
         // A crash's mark, from an older one, is replaced.
         fs::write(crashed_file(state.path()), "old").unwrap();
-        assert!(matches!(connect(state.path()).unwrap(), Found::Gone));
+        assert!(connect(state.path()).unwrap().is_none());
         assert!(read_info(state.path()).is_none());
         assert!(!sock.exists());
         // The crash is marked: `server.json` as it was, for the next launch.
         let marked: Info = serde_json::from_slice(&fs::read(crashed_file(state.path())).unwrap()).unwrap();
         assert_eq!(marked, info);
         // A look after that changes nothing.
-        assert!(matches!(connect(state.path()).unwrap(), Found::Gone));
+        assert!(connect(state.path()).unwrap().is_none());
         assert!(crashed_file(state.path()).exists());
     }
 
@@ -511,6 +514,6 @@ mod tests {
         let (_listener, _) = listen(&sock).unwrap();
         let info = Info { pid: std::process::id(), socket: sock, proto: 1, version: "x".into(), started: 0 };
         write_info(state.path(), &info).unwrap();
-        assert!(matches!(connect(state.path()).unwrap(), Found::Running(_)));
+        assert!(connect(state.path()).unwrap().is_some());
     }
 }

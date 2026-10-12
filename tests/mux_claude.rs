@@ -18,8 +18,6 @@
 //!
 //! The sessions run in `$TMPDIR/recruit-testeur-claude`, a folder of the tester's own: Claude Code asks once
 //! whether to trust it, and the test answers yes.
-//!
-//! Owner: testeur.
 
 mod common;
 
@@ -32,11 +30,7 @@ use common::pty::{Profile, TestTerm};
 #[test]
 #[ignore = "started by the other tests only"]
 fn child() {
-    match common::role().as_deref() {
-        Some(role) if common::fakes::run(role) => {}
-        Some(other) => panic!("unknown child role {other}"),
-        None => {}
-    }
+    common::child_main();
 }
 
 /// The sessions' name: a named session opens on the conversation, as a member's does; an unnamed one may open on
@@ -94,7 +88,7 @@ const ANNOUNCED: &[Announced] = &[
 /// Each key of the answer is chosen from a screen that has been still for 500 ms, never sent blind: at startup
 /// Claude Code reads the first keys itself (`startCapturingEarlyInput`, 2.1.295) to fill its prompt, an Enter there
 /// turns into a space and arrows are dropped, and that reader races Ink's for about 0.1 s after the question shows
-/// (dev-terminal, under tmux and natively). A down arrow sent again after a lost Enter went round to « No, exit ».
+/// (dev-terminal, through the multiplexer). A down arrow sent again after a lost Enter went round to « No, exit ».
 fn wait_prompt(term: &mut TestTerm) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
@@ -535,12 +529,14 @@ fn claude_mouse_native() {
         std::thread::sleep(Duration::from_millis(300));
         server.ctl(["key", "--pane", member, "enter"]);
     }
+    // The answer's last line alone: "80" or "FINI-TEST" also sit in the echo of the question, which is on the
+    // screen at once (waiting for them let the test go on before the answer, 2026-10-12).
     for member in ["plein", "classique"] {
-        assert!(
-            server.wait_pane(member, "80", Duration::from_secs(60)),
-            "{member}: {:?}",
-            server.capture(Some(member))
-        );
+        let end = std::time::Instant::now() + Duration::from_secs(90);
+        while !server.capture(Some(member)).iter().any(|row| row.trim() == "FINI-TEST") {
+            assert!(std::time::Instant::now() < end, "{member}: {:?}", server.capture(Some(member)));
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
     std::thread::sleep(Duration::from_secs(3));
     let mut checks: Vec<(&str, Result<(), String>)> = Vec::new();
@@ -557,9 +553,16 @@ fn claude_mouse_native() {
         .find_map(|(r, line)| {
             let byte = line.find("FINI-TEST")?;
             let c = line[..byte].chars().count();
-            (c >= left && c < left + 98).then_some((r, c))
+            // `left` is the title's column, a few cells right of the frame's edge (the state sign and a space).
+            (c + 8 >= left && c < left + 98).then_some((r, c))
         })
-        .expect("FINI-TEST on the full-screen pane");
+        .unwrap_or_else(|| {
+            panic!(
+                "FINI-TEST on the full-screen pane (left {left}): {:#?}\n{:#?}",
+                term.screen(),
+                server.capture(Some("plein"))
+            )
+        });
     // Shift + press on its first letter, drag to its last, release (without Shift: the selection begun with it
     // holds): the multiplexer's own selection, copied by OSC 52.
     let raw_before = term.raw().len();

@@ -3,17 +3,16 @@
 //! The terminal a pane's program writes to: a VT engine behind [`Engine`], so that the rest of the code never sees
 //! which one (spec §5.2). The engine is libghostty-vt (`engine/ghostty.rs`, built by scripts/ghostty.sh), with a
 //! sniffer in front of it for what it lets pass (`engine/sniff.rs`).
-//!
-//! Owner: dev-terminal.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use anyhow::Result;
 
-use super::{Rect, Rgb};
-use crate::canvas::{Canvas, Cursor};
+use crate::ui::canvas::{Canvas, Cursor, is_direction_mark};
+use crate::ui::{Rect, Rgb};
 
+mod base64;
 mod ghostty;
 mod sniff;
 
@@ -22,12 +21,68 @@ pub(crate) fn new(cols: u16, rows: u16, history: usize) -> Result<Box<dyn Engine
     Ok(Box::new(ghostty::Ghostty::new(cols, rows, history)?))
 }
 
+/// What the screen and the selection read of a pane: its cells, its cursor and its text. An [`Engine`] is one; so
+/// are the cards the dashboard puts in a frame (`cards::Panel`), which only draw. What is not told is as for a screen
+/// with no cursor and no history.
+pub(crate) trait Surface {
+    /// Draws what the pane shows into `area` of `canvas`: the live screen, or the history where [`Engine::scroll`]
+    /// left it. Cells go one by one with the width the engine gave them (`Canvas::put_cell`): what the program
+    /// measured is what is drawn.
+    fn draw(&self, canvas: &mut Canvas, area: Rect);
+
+    /// What [`Surface::draw`] would draw, as a number: it changes when the cells drawn change (the screen, the view
+    /// moved into the history, the colors), and stays the same otherwise, whoever drew in between; so that the screen
+    /// can keep a pane's cells from one frame to the next (the area, the selection and the frame around them are the
+    /// screen's to compare). Not the cursor, which [`Surface::cursor`] gives up to date after this call. Unique to this
+    /// engine: no other engine of the process gives the same number ([`fresh_generation`]), a new engine for the same
+    /// pane included. Asked of every pane at every frame: nothing is read again when nothing changed. `None` for a
+    /// surface that does not tell: drawn every time.
+    fn generation(&self) -> Option<u64> {
+        None
+    }
+
+    /// The cursor, in the pane's cells, as the program left it; `None` when hidden.
+    fn cursor(&self) -> Option<Cursor> {
+        None
+    }
+
+    /// Lines kept above the screen.
+    fn history(&self) -> usize {
+        0
+    }
+
+    /// Lines the view is up into the history; 0 on the live screen.
+    fn scrolled(&self) -> usize {
+        0
+    }
+
+    /// The line on the pane's first row, scroll included, counted from the first line the pane ever had (history
+    /// included): a point of a selection (`select.rs`) stays on its text while the program writes. On the alternate
+    /// screen, its own lines, from 0.
+    fn top(&self) -> u64 {
+        0
+    }
+
+    /// The oldest line still kept.
+    fn oldest(&self) -> u64 {
+        0
+    }
+
+    /// Line `line`'s cells, one grapheme per column (see [`Line`]), and whether it goes on in the next one (soft
+    /// wrap); `None` when it is no longer kept, or not written yet (below the screen's last row).
+    fn line(&self, line: u64) -> Option<Line> {
+        let _ = line;
+        None
+    }
+}
+
 /// A pane's terminal. Fed from the PTY's reader thread and drawn from the screen's: an engine lives behind a mutex,
 /// and no call may wait on anything.
-pub(crate) trait Engine: Send {
+pub(crate) trait Engine: Surface + Send {
     /// Parses what the program wrote. What the terminal answers (DA1, DA2, DSR and CPR, DECRQM, XTVERSION, kitty
     /// keyboard query, OSC 10 and 11) is appended to `replies`, for the PTY. While the program holds a synchronized
-    /// update (mode 2026), what it writes is kept aside, and [`Engine::draw`] goes on showing the screen as before.
+    /// update (mode 2026), what it writes is read all the same, and [`Surface::draw`] goes on showing the frame as it
+    /// was, until the update ends or its deadline comes.
     fn feed(&mut self, bytes: &[u8], replies: &mut Vec<u8>);
 
     /// When the engine wants [`Engine::expire`] called, if it does: the end of a synchronized update that never got
@@ -36,7 +91,7 @@ pub(crate) trait Engine: Send {
 
     /// Does what was due by `now`: ends a synchronized update past its deadline, as terminals do, or a bounded step
     /// of spare work. Whether the screen changed.
-    fn expire(&mut self, now: Instant, replies: &mut Vec<u8>) -> bool;
+    fn expire(&mut self, now: Instant) -> bool;
 
     /// What the program asked to reach the real terminal, or the interface, since the last call (spec §5.6).
     fn relays(&mut self, out: &mut Vec<Relay>);
@@ -60,62 +115,18 @@ pub(crate) trait Engine: Send {
     /// The modes the program asked for, which decide how its input is encoded (`input.rs`).
     fn modes(&self) -> Modes;
 
-    /// Draws what the pane shows into `area` of `canvas`: the live screen, or the history where [`Engine::scroll`]
-    /// left it. Cells go one by one with the width the engine gave them (`Canvas::put_cell`): what the program
-    /// measured is what is drawn.
-    fn draw(&self, canvas: &mut Canvas, area: Rect);
-
-    /// What [`Engine::draw`] would draw, as a number: it changes when the cells drawn change (the screen, the view
-    /// moved into the history, the colors), and stays the same otherwise, whoever drew in between; so that the screen
-    /// can keep a pane's cells from one frame to the next (the area, the selection and the frame around them are the
-    /// screen's to compare). Not the cursor, which [`Engine::cursor`] gives up to date after this call. Unique to this
-    /// engine: no other engine of the process gives the same number ([`fresh_generation`]), a new engine for the same
-    /// pane included. Asked of every pane at every frame: nothing is read again when nothing changed. `None` for an
-    /// engine that does not tell: drawn every time.
-    fn generation(&self) -> Option<u64> {
-        None
-    }
-
-    /// The cursor, in the pane's cells, as the program left it; `None` when hidden.
-    fn cursor(&self) -> Option<Cursor>;
-
-    /// Lines kept above the screen.
-    fn history(&self) -> usize;
-
     /// Moves the view `lines` up into the history (down when negative), within it; `isize::MIN` goes back to the
     /// live screen. While the view is up, what the program writes keeps it on the same lines, as in terminals.
     fn scroll(&mut self, lines: isize);
-
-    /// Lines the view is up into the history; 0 on the live screen.
-    fn scrolled(&self) -> usize;
-
-    /// The line on the pane's first row, scroll included, counted from the first line the pane ever had (history
-    /// included): a point of a selection (`select.rs`) stays on its text while the program writes. On the alternate
-    /// screen, its own lines, from 0.
-    fn top(&self) -> u64 {
-        0
-    }
-
-    /// The oldest line still kept.
-    fn oldest(&self) -> u64 {
-        0
-    }
-
-    /// Line `line`'s cells, one grapheme per column (see [`Line`]), and whether it goes on in the next one (soft
-    /// wrap); `None` when it is no longer kept, or not written yet (below the screen's last row).
-    fn line(&self, line: u64) -> Option<Line> {
-        let _ = line;
-        None
-    }
 }
 
-/// A number for [`Engine::generation`] that no other call gives in this process.
+/// A number for [`Surface::generation`] that no other call gives in this process.
 fn fresh_generation() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// A line of a pane's text, for a selection: see [`Engine::line`]. Two allocations a line, rather than one a cell.
+/// A line of a pane's text, for a selection: see [`Surface::line`]. Two allocations a line, rather than one a cell.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Line {
     /// The cells' graphemes one after the other: a blank for an empty cell, nothing for the second column of a wide
@@ -162,8 +173,6 @@ impl Line {
 pub(crate) struct Modes {
     /// DECCKM: cursor keys sent as `ESC O A` rather than `ESC [ A`.
     pub app_cursor: bool,
-    /// DECKPAM: the keypad in application mode.
-    pub app_keypad: bool,
     /// 2004: pastes framed by `ESC [ 200 ~` and `ESC [ 201 ~`.
     pub bracketed_paste: bool,
     /// 1004: focus reported, `ESC [ I` and `ESC [ O`.
@@ -212,16 +221,10 @@ pub(crate) enum Relay {
     Resize { rows: u16, cols: u16 },
 }
 
-/// A program's status (OSC 7501: `state=…:app=…:id=…:kind=…:progress=…:title=…:msg=…`, title and message in
-/// base64).
+/// A program's status (OSC 7501: `state=…:app=…:id=…:msg=…`, the message in base64; its other keys are not read).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Status {
     pub state: State,
-    /// Why it is blocked: `permission`…
-    pub kind: Option<String>,
-    /// Percent.
-    pub progress: Option<u8>,
-    pub title: Option<String>,
     pub message: Option<String>,
     /// One of the program's tasks rather than the program (Claude Code 2.1.296: a sub-agent's, `clear` when it ends).
     pub id: Option<String>,
@@ -265,7 +268,7 @@ impl Relay {
     pub(crate) fn encode(&self) -> Option<Vec<u8>> {
         let osc = |body: String| Some(format!("\x1b]{body}\x07").into_bytes());
         match self {
-            Relay::Clipboard(text) => osc(format!("52;c;{}", sniff::base64_encode(text.as_bytes()))),
+            Relay::Clipboard(text) => osc(format!("52;c;{}", base64::encode(text.as_bytes()))),
             Relay::Title(title) => osc(format!("2;{}", printable(title))),
             Relay::Bell => Some(b"\x07".to_vec()),
             // OSC 9 (iTerm2, Ghostty, kitty, WezTerm), the most widely shown. A text that starts with a number
@@ -293,7 +296,26 @@ impl Relay {
     }
 }
 
-/// `text` without control characters: C0, DEL and C1.
+/// `text` without control characters (C0, DEL and C1) nor the marks that change the direction of the text after them
+/// (`is_direction_mark`): what a program writes must not act on the real terminal.
 fn printable(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control()).collect()
+    text.chars().filter(|&c| !c.is_control() && !is_direction_mark(c)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_for_the_real_terminal_has_no_control_nor_direction_mark() {
+        // C0, DEL, C1 (CSI), and the marks that turn the text after them (U+202A-202E, U+2066-2069).
+        let mean = "a\u{202e}b\u{2066}c\u{2069}d\x1b[2Je\u{9b}f\x7fg\u{202a}h";
+        let encoded = |relay: Relay| String::from_utf8(relay.encode().unwrap()).unwrap();
+        assert_eq!(encoded(Relay::Title(mean.into())), "\x1b]2;abcd[2Jefgh\x07");
+        let note = Relay::Notify { title: Some("T\u{202e}".into()), body: "x\u{2067}y".into() };
+        assert_eq!(encoded(note), "\x1b]9;T: xy\x07");
+        assert_eq!(encoded(Relay::Notify { title: None, body: mean.into() }), "\x1b]9;abcd[2Jefgh\x07");
+        // Other text is left as it is.
+        assert_eq!(encoded(Relay::Title("été ✓ עברית".into())), "\x1b]2;été ✓ עברית\x07");
+    }
 }

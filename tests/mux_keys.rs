@@ -39,8 +39,6 @@
 //! The clipboard (the pastes go through it) is saved first, every type of every item, and put back at the end,
 //! after a failure too, and on Ctrl-C. The saved copy is on disk, in clear, in the run's temporary folder, for the
 //! length of the run (kept afterwards only if it could not be put back).
-//!
-//! Owner: testeur.
 #![cfg(target_os = "macos")]
 
 mod common;
@@ -58,11 +56,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 #[test]
 #[ignore = "started by the other tests only"]
 fn child() {
-    match common::role().as_deref() {
-        Some(role) if common::fakes::run(role) => {}
-        Some(other) => panic!("unknown child role {other}"),
-        None => {}
-    }
+    common::child_main();
 }
 
 /// A key, as System Events types it, and whether it must reach the pane through the multiplexer.

@@ -3,12 +3,11 @@
 //! What the native multiplexer's integration tests and bench share: the test binary started again as a fake
 //! program or a measured child, what a process costs (memory, CPU, wakeups), the lines the fakes write, and the
 //! tester's own tmux server for the baselines (`-L rtest-testeur`, never the user's).
-//!
-//! Owner: testeur.
 
 // Each test crate uses its own part of this module.
 #![allow(dead_code)]
 
+pub mod client;
 pub mod fakes;
 pub mod pty;
 pub mod server;
@@ -45,6 +44,21 @@ pub fn child_words(role: &str, vars: &[(&str, String)]) -> Vec<OsString> {
 /// The role this process was started for, if any.
 pub fn role() -> Option<String> {
     std::env::var(CHILD).ok()
+}
+
+/// What the test `child` of every test crate does: hands over to the fake program `role` names, if any. The test
+/// binary is started again with `CHILD` set to run a fake in a pane (see [`child`]).
+pub fn child_main() {
+    match role().as_deref() {
+        Some(role) if fakes::run(role) => {}
+        Some(other) => panic!("unknown child role {other}"),
+        None => {}
+    }
+}
+
+/// Seconds since the Unix epoch.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// A number from the environment, or `default`.

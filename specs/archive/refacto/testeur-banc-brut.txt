@@ -1,0 +1,87 @@
+##### memory_per_pane 22:19:24 load: 10.72 7.94 8.32
+
+running 1 test
+test memory_per_pane ... 
+| Lines | Columns | Engine | 1 pane: footprint | 10 panes: footprint | Per pane: footprint | Per pane: resident | Per pane: virtual |
+|---|---|---|---|---|---|---|---|
+| typical | 80 | alacritty 0.26 | 200.5 Mio | 2005.0 Mio | 200.5 Mio | 147.4 Mio | 5.0 Mio |
+| typical | 80 | tmux | 53.5 Mio | 468.5 Mio | 46.1 Mio | 46.1 Mio | 57.6 Mio |
+| typical | 120 | alacritty 0.26 | 318.3 Mio | 3183.2 Mio | 318.3 Mio | 185.0 Mio | 5.5 Mio |
+| typical | 120 | tmux | 66.5 Mio | 672.2 Mio | 67.3 Mio | 67.3 Mio | 69.1 Mio |
+| typical | 200 | alacritty 0.26 | 506.8 Mio | 5068.4 Mio | 506.8 Mio | 106.2 Mio | 6.2 Mio |
+| typical | 200 | tmux | 326.4 Mio | 1522.5 Mio | 132.9 Mio | 121.6 Mio | 184.0 Mio |
+| full | 80 | alacritty 0.26 | 200.5 Mio | 2005.0 Mio | 200.5 Mio | 200.4 Mio | 5.0 Mio |
+| full | 80 | tmux | 79.1 Mio | 782.5 Mio | 78.2 Mio | 78.1 Mio | 81.6 Mio |
+| full | 120 | alacritty 0.26 | 318.4 Mio | 3183.3 Mio | 318.3 Mio | 189.5 Mio | 5.5 Mio |
+| full | 120 | tmux | 116.3 Mio | 1158.0 Mio | 115.8 Mio | 115.7 Mio | 140.7 Mio |
+| full | 200 | alacritty 0.26 | 506.8 Mio | 5067.4 Mio | 506.7 Mio | 170.9 Mio | 6.2 Mio |
+| full | 200 | tmux | 375.4 Mio | 2172.8 Mio | 199.7 Mio | 91.8 Mio | 270.7 Mio |
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 69.82s
+
+##### end memory_per_pane 22:20:34 load: 6.99 7.42 8.09
+##### memory_through_mux 22:20:34 load: 6.99 7.42 8.09
+
+running 1 test
+test memory_through_mux ... 
+| Pane columns | Empty pane | 100 000 lines | Per pane | Virtual, per pane |
+|---|---|---|---|---|
+| 80 | 6.0 Mio | 11.4 Mio | 5.4 Mio | 78.2 Mio |
+| 120 | 6.2 Mio | 13.0 Mio | 6.8 Mio | 123.9 Mio |
+| 200 | 7.2 Mio | 14.8 Mio | 7.5 Mio | 192.9 Mio |
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 72.92s
+
+##### end memory_through_mux 22:21:47 load: 6.67 7.25 7.97
+##### cpu_rest_and_flood 22:21:47 load: 6.67 7.25 7.97
+
+running 1 test
+test cpu_rest_and_flood ... 
+| Setup | Seconds | CPU | Wakeups/s | Bytes out | Frames/s | CPU per frame | Floods wrote | CPU per Mio |
+|---|---|---|---|---|---|---|---|---|
+Skipped: the line with real Claude Code sessions. Set CLAUDE_SESSIONS=2026-10-11 (today) once the user has said go.
+| recruit, 10 fakes at rest | 60 | 0.00 % | 0.5 | 0 | 0.0 | NaN µs | 0.00 Mio/s | NaN s |
+| recruit, 9 full histories at rest | 60 | 0.00 % | 0.5 | 0 | 0.0 | NaN µs | 0.00 Mio/s | NaN s |
+| recruit, 1 pane at 20 KB/s | 20 | 2.10 % | 1.6 | 5537924 | 53.7 | 392 µs | 0.02 Mio/s | 1.022 s |
+| recruit, 9 panes at 20 KB/s | 20 | 4.75 % | 56.1 | 10741627 | 61.3 | 775 µs | 0.18 Mio/s | 0.261 s |
+| recruit, 1 pane flat out | 20 | 74.44 % | 60.5 | 6115567 | 59.3 | 12556 µs | 67.06 Mio/s | 0.011 s |
+| recruit, 9 panes flat out | 20 | 242.08 % | 40.8 | 8738288 | 43.5 | 55662 µs | 120.17 Mio/s | 0.020 s |
+Skipped: the line with real Claude Code sessions. Set CLAUDE_SESSIONS=2026-10-11 (today) once the user has said go.
+| tmux, 10 fakes at rest | 60 | 0.00 % | 0.0 | 0 | 0.0 | NaN µs | 0.00 Mio/s | NaN s |
+| tmux, 9 full histories at rest | 60 | 0.00 % | 0.0 | 0 | 0.0 | NaN µs | 0.00 Mio/s | NaN s |
+| tmux, 1 pane at 20 KB/s | 20 | 0.97 % | 53.1 | 3104611 | 53.2 | 182 µs | 0.02 Mio/s | 0.484 s |
+| tmux, 9 panes at 20 KB/s | 20 | 3.60 % | 72.1 | 9665505 | 408.6 | 88 µs | 0.19 Mio/s | 0.194 s |
+| tmux, 1 pane flat out | 20 | 98.52 % | 2.0 | 23483044 | 907.0 | 1086 µs | 25.79 Mio/s | 0.038 s |
+| tmux, 9 panes flat out | 20 | 95.64 % | 0.3 | 53908136 | 396.0 | 2415 µs | 26.15 Mio/s | 0.037 s |
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 548.04s
+
+##### end cpu_rest_and_flood 22:30:55 load: 4.87 5.97 7.09
+##### latency_added 22:30:55 load: 4.87 5.97 7.09
+
+running 1 test
+test latency_added ... 
+| Setup | Key | Terminal | p50 | p95 | p99 | max | Missed | Added p50 | Added p99 | Out | Frames | CPU |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| direct | x | kitty | 0.08 ms | 0.14 ms | 0.22 ms | 2.02 ms | 0 | +0.00 ms | +0.00 ms | 0.00 Mio/s | 0/s | 0 % |
+| recruit, 1 pane | x | kitty | 0.29 ms | 0.51 ms | 2.02 ms | 8.14 ms | 0 | +0.21 ms | +1.80 ms | 0.00 Mio/s | 26/s | 1 % |
+| recruit, 10 panes, 9 flooding | x | kitty | 1.15 ms | 1.84 ms | 4.58 ms | 126.16 ms | 0 | +1.07 ms | +4.36 ms | 0.70 Mio/s | 72/s | 402 % |
+| recruit, 10 panes, 9 in 120 KB frames | x | kitty | 0.32 ms | 1.11 ms | 5.07 ms | 29.69 ms | 0 | +0.24 ms | +4.85 ms | 0.17 Mio/s | 58/s | 34 % |
+| tmux, 1 pane | x | kitty | 0.18 ms | 0.37 ms | 3.26 ms | 15.46 ms | 0 | +0.10 ms | +3.03 ms | 0.00 Mio/s | 0/s | 0 % |
+| tmux, 10 panes, 9 flooding | x | kitty | 9.11 ms | 35.33 ms | 81.63 ms | 180.31 ms | 0 | +9.03 ms | +81.41 ms | 2.01 Mio/s | 310/s | 83 % |
+| tmux, 10 panes, 9 in 120 KB frames | x | kitty | 0.46 ms | 44.90 ms | 106.90 ms | 292.76 ms | 0 | +0.38 ms | +106.68 ms | 0.09 Mio/s | 78/s | 41 % |
+| direct | Escape | legacy | 0.12 ms | 1.06 ms | 5.28 ms | 7.81 ms | 0 | +0.00 ms | +0.00 ms | 0.00 Mio/s | 0/s | 0 % |
+| recruit, 1 pane | Escape | legacy | 12.33 ms | 42.55 ms | 116.26 ms | 224.90 ms | 0 | +12.21 ms | +110.98 ms | 0.00 Mio/s | 17/s | 1 % |
+| recruit, 10 panes, 9 flooding | Escape | legacy | 13.85 ms | 537.57 ms | 847.57 ms | 1425.37 ms | 2 | +13.73 ms | +842.28 ms | 0.20 Mio/s | 23/s | 98 % |
+| recruit, 10 panes, 9 in 120 KB frames | Escape | legacy | 16.36 ms | 358.70 ms | 711.82 ms | 1173.11 ms | 0 | +16.24 ms | +706.54 ms | 0.07 Mio/s | 20/s | 16 % |
+| tmux, 1 pane | Escape | legacy | 502.19 ms | 515.63 ms | 608.01 ms | 864.72 ms | 0 | +502.07 ms | +602.72 ms | 0.00 Mio/s | 0/s | 0 % |
+| tmux, 10 panes, 9 flooding | Escape | legacy | 507.61 ms | 510.86 ms | 519.81 ms | 554.73 ms | 0 | +507.50 ms | +514.53 ms | 2.56 Mio/s | 396/s | 98 % |
+| tmux, 10 panes, 9 in 120 KB frames | Escape | legacy | 500.53 ms | 501.52 ms | 502.40 ms | 698.85 ms | 0 | +500.41 ms | +497.12 ms | 0.13 Mio/s | 119/s | 53 % |
+| direct | Escape | kitty | 0.09 ms | 0.13 ms | 0.18 ms | 0.29 ms | 0 | +0.00 ms | +0.00 ms | 0.00 Mio/s | 0/s | 0 % |
+| recruit, 1 pane | Escape | kitty | 0.32 ms | 0.48 ms | 0.69 ms | 1.25 ms | 0 | +0.23 ms | +0.51 ms | 0.00 Mio/s | 26/s | 1 % |
+| recruit, 10 panes, 9 flooding | Escape | kitty | 1.14 ms | 1.56 ms | 3.37 ms | 10.76 ms | 0 | +1.05 ms | +3.18 ms | 0.71 Mio/s | 73/s | 434 % |
+| recruit, 10 panes, 9 in 120 KB frames | Escape | kitty | 0.25 ms | 0.66 ms | 0.79 ms | 2.61 ms | 0 | +0.15 ms | +0.60 ms | 0.17 Mio/s | 59/s | 33 % |
+| tmux, 1 pane | Escape | kitty | 502.13 ms | 502.36 ms | 502.49 ms | 502.76 ms | 0 | +502.04 ms | +502.31 ms | 0.00 Mio/s | 0/s | 0 % |

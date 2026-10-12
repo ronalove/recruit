@@ -68,10 +68,6 @@ Vaut pour toutes les équipes du fichier.
 | `command` | texte | `"claude"` | L'exécutable de Claude Code, un nom cherché dans le `PATH` ou un chemin. |
 | `config_dir` | texte | celui de l'environnement | Le profil Claude Code de l'équipe : son dossier de configuration, donné aux membres comme `CLAUDE_CONFIG_DIR`. Un chemin absolu, ou qui commence par `~/`. Le dossier doit exister. Voir [Profil Claude Code](/recruit/fr/guides/claude-code/#profil-claude-code). |
 
-## `[tmux]`
-
-Ignorée. recruit 1 faisait tourner ses équipes dans tmux, et cette section réglait tmux. Depuis recruit 2, les équipes dessinent leur propre [écran](/recruit/fr/guides/screen/), sans rien à régler : la section est encore lue, pour qu'un fichier plus ancien marche toujours, et le lancement dit qu'elle n'a plus d'effet. Ses clés sont celles de recruit 1 (`socket`, `mouse`, `user_config`, `options`), et une autre est refusée. recruit 2 se sert encore de `socket` pour trouver une équipe que recruit 1 a laissée tourner. Retire la section du fichier pour faire taire l'avertissement.
-
 ## Équipes
 
 `[teams.<équipe>]` : une table par équipe. Le nom de l'équipe en est la clé : lettres (accents compris) et chiffres, `-` et `_`, 40 caractères au plus, sans `-` au début, et pas une commande de recruit. Voir [Noms](/recruit/fr/guides/teams/#noms).
@@ -85,7 +81,7 @@ Ignorée. recruit 1 faisait tourner ses équipes dans tmux, et cette section ré
 | `model` | texte | celui de Claude Code | Modèle de Claude de tous les membres : un alias (`opus`, `sonnet`, `haiku`, `fable`) ou un nom de modèle complet. |
 | `effort` | texte | celui de Claude Code | Effort de tous les membres : `low`, `medium`, `high`, `xhigh` ou `max`. recruit les affiche faible, moyen, élevé, extra et max, comme Claude Code nomme `xhigh` « Extra ». |
 | `args` | liste de textes | `[]` | Arguments donnés en plus à `claude` pour tous les membres. |
-| `layout` | `"auto"`, `"focus"` ou `"tabs"` | `"auto"` | `auto` : les interlocuteurs dans un premier onglet, puis les agents de travail dans des onglets de `columns × rows` au plus, chaque onglet en grille. `focus` : les mêmes onglets, mais ceux des agents de travail montrent un membre en grand à gauche et les mieux placés à droite. `tabs` : un onglet par membre. Voir [Onglets](/recruit/fr/guides/contacts-and-agents/#onglets) et [Focus](/recruit/fr/guides/contacts-and-agents/#focus). |
+| `layout` | `"auto"` (ou `"grid"`), `"focus"` ou `"tabs"` | `"auto"` | `auto`, que le menu écrit `grid` : les interlocuteurs dans un premier onglet, puis les agents de travail dans des onglets de `columns × rows` au plus, chaque onglet en grille. `focus` : les mêmes onglets, mais ceux des agents de travail montrent un membre en grand à gauche et les mieux placés à droite. `tabs` : un onglet par membre. Voir [Onglets](/recruit/fr/guides/contacts-and-agents/#onglets) et [Focus](/recruit/fr/guides/contacts-and-agents/#focus). |
 | `columns` | entier | `3` | Le nombre maximal de colonnes dans un onglet. |
 | `rows` | entier | `2` | Le nombre maximal de lignes dans un onglet. |
 | `dashboard` | booléen | `true` | Le [tableau de bord et le journal](/recruit/fr/guides/dashboard/), à droite des interlocuteurs. Avec `false`, les interlocuteurs sont côte à côte. |

@@ -1,27 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! The cards of the members left out of a tab in « focus » (maquette https://claude.ai/artifact/H4tpNaZ2RAnxHErZHyztYe,
-//! direction B): the dashboard's own cards (`board::card_lines`, one drawing), in a grey frame titled « others » with
-//! the members' counts by state. From 120 columns, one column of cards with what the member does, its curve and its
-//! context; narrower, two by two in their short form (title and curve). What does not fit gives way to « … and N more ».
+//! The cards of the members left out of a tab in « focus »: the dashboard's own cards (`board::card_lines`, one
+//! drawing), in a grey frame titled « others » with the members' counts by state. From 120 columns, one column of
+//! cards with what the member does, its curve and its context; narrower, two by two in their short form (title and
+//! curve). What does not fit gives way to « … and N more ».
 //!
 //! The frame is a pane's, drawn by the screen (`screen::View`, with [`title`] and [`counts`] in its header); the cards
 //! are what a [`Panel`] draws inside it, and [`place`] says where each one is, to draw it and to hit-test a click.
 //! No terminal, no files, no clock: the server gives the cards' data and the time.
-//!
-//! Owner: dev-rendu.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::time::Instant;
 
 use super::chrome::Hint;
-use super::engine::{Engine, Modes, Relay};
-use super::{Rect, Rgb};
+use super::engine::Surface;
 use crate::board::{CardData, Clock, card_lines, card_rows};
-use crate::canvas::{Canvas, Cursor, Style};
-use crate::look::State;
 use crate::t;
+use crate::ui::Rect;
+use crate::ui::canvas::{Canvas, Style};
+use crate::ui::look::State;
 
 /// Columns between two cards side by side.
 const GAP: usize = 2;
@@ -127,27 +124,14 @@ impl Panel<'_> {
             (&card.name, card.color, card.state as u8, card.since, card.shell).hash(&mut hasher);
             (card.context.map(f64::to_bits), card.pressure as u8, &card.model, &card.effort).hash(&mut hasher);
             (card.doing.as_ref().map(|task| (&task.now, &task.done)), &card.failed, card.compacted).hash(&mut hasher);
-            (card.activity.seen, card.activity.work.len(), card.activity.work.last()).hash(&mut hasher);
+            (card.activity.seen, card.activity.last, card.activity.work.len(), card.activity.work.last())
+                .hash(&mut hasher);
         }
         hasher.finish()
     }
 }
 
-impl Engine for Panel<'_> {
-    fn feed(&mut self, _: &[u8], _: &mut Vec<u8>) {}
-    fn deadline(&self) -> Option<Instant> {
-        None
-    }
-    fn expire(&mut self, _: Instant, _: &mut Vec<u8>) -> bool {
-        false
-    }
-    fn relays(&mut self, _: &mut Vec<Relay>) {}
-    fn resize(&mut self, _: u16, _: u16) {}
-    fn set_colors(&mut self, _: Option<Rgb>, _: Option<Rgb>) {}
-    fn modes(&self) -> Modes {
-        Modes::default()
-    }
-
+impl Surface for Panel<'_> {
     fn draw(&self, canvas: &mut Canvas, area: Rect) {
         let placed = place(area, self.cards, self.wide);
         // The cards of a column line up with each other, as on the dashboard: one call per column, over references.
@@ -175,23 +159,15 @@ impl Engine for Panel<'_> {
     fn generation(&self) -> Option<u64> {
         Some(self.fingerprint())
     }
-    fn cursor(&self) -> Option<Cursor> {
-        None
-    }
-    fn history(&self) -> usize {
-        0
-    }
-    fn scroll(&mut self, _: isize) {}
-    fn scrolled(&self) -> usize {
-        0
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::board::{Activity, Clock};
-    use crate::look::{Glyphs, Pressure};
+    use crate::ui::look::{Glyphs, Pressure};
     use crossterm::style::Color;
 
     fn card(name: &str, state: State) -> CardData {
@@ -300,6 +276,9 @@ mod tests {
         assert_ne!(panel(&cards, Clock { frame: 7, ..clock() }), working);
         // The window's width changes the cards' form.
         assert_ne!(Panel { cards: &cards, wide: false, clock: clock() }.generation(), working);
+        // The last second the dashboard noted bounds the curve: it is drawn again when it moves.
+        cards[0].activity.last = 999;
+        assert_ne!(panel(&cards, clock()), working);
     }
 
     #[test]

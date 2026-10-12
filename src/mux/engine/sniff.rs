@@ -1,25 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! What a program writes that an engine may let pass without a word, found in its output before the engine parses
-//! it: XTVERSION, the color scheme query (`CSI ? 996 n`) and the program status query (`OSC 7501 ; ?`), which want
-//! an answer; desktop notifications (OSC 9, 777, 99) and progress (OSC 9;4), which go to the real terminal and the
-//! interface; the program's status (OSC 7501) and the size it asks for (XTWINOPS 8), for the interface.
+//! What a program writes that the engine's library does not take care of, found in its output before the engine
+//! parses it: the program status query (`OSC 7501 ; ?`), which wants an answer; desktop notifications (OSC 9, 777,
+//! 99) and progress (OSC 9;4), which go to the real terminal and the interface; the program's status (OSC 7501), the
+//! size it asks for (XTWINOPS 8), RIS, the end of a synchronized update (mode 2026) and mode 2031 turned on, for the
+//! engine and the interface. What the library answers or reports itself (XTVERSION, the color scheme query, the
+//! clipboard, the title, the bell) is not looked for.
 //!
 //! Only escape sequences are looked at: text is skipped with `memchr`, the sequences that matter are kept, the
 //! others are followed without being stored (an OSC 52 of several megabytes costs nothing). A sequence may be cut
 //! between two reads.
-//!
-//! Owner: dev-terminal.
 
+use super::base64;
 use crate::mux::engine::{Progress, State, Status};
 
 /// What was found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Sniffed {
-    /// `CSI > q`, `CSI > 0 q`: the terminal's name and version.
-    Version,
-    /// `CSI ? 996 n`: dark or light.
-    ColorScheme,
     Notify {
         title: Option<String>,
         body: String,
@@ -81,6 +78,9 @@ pub(super) struct Sniffer {
     kept: Vec<u8>,
     /// The kitty notification being put together (OSC 99 with `d=0`): its id, title and body.
     kitty: Option<(String, String, String)>,
+    /// The byte just stepped on starts the next sequence (it followed the ESC that ended a string, and was not `\`):
+    /// [`Sniffer::scan`] reads it again, so that what ends there is found.
+    replay: bool,
 }
 
 impl Sniffer {
@@ -101,7 +101,11 @@ impl Sniffer {
             }
             let byte = bytes[at];
             at += 1;
-            if let Some(found) = self.step(byte) {
+            let found = self.step(byte);
+            if std::mem::take(&mut self.replay) {
+                at -= 1;
+            }
+            if let Some(found) = found {
                 return (at, Some(found));
             }
         }
@@ -140,8 +144,6 @@ impl Sniffer {
                 0x40..=0x7e => {
                     self.state = Scan::Ground;
                     return match (&self.kept[..], byte) {
-                        (b">" | b">0", b'q') => Some(Sniffed::Version),
-                        (b"?996", b'n') => Some(Sniffed::ColorScheme),
                         (kept, b'l') if lists_mode(kept, b"2026") => Some(Sniffed::SyncEnd),
                         (kept, b'h') if lists_mode(kept, b"2031") => Some(Sniffed::ThemeReports),
                         // A cut sequence may have lost the parameters that made it something else.
@@ -168,11 +170,7 @@ impl Sniffer {
             },
             Scan::OscEscape | Scan::OscSkipEscape => {
                 let found = self.end_osc();
-                self.state = Scan::Ground;
-                if byte != b'\\' {
-                    self.step(ESC);
-                    self.step(byte);
-                }
+                self.next_sequence(byte);
                 return found;
             }
             Scan::String => {
@@ -180,15 +178,20 @@ impl Sniffer {
                     self.state = Scan::StringEscape;
                 }
             }
-            Scan::StringEscape => {
-                self.state = Scan::Ground;
-                if byte != b'\\' {
-                    self.step(ESC);
-                    self.step(byte);
-                }
-            }
+            Scan::StringEscape => self.next_sequence(byte),
         }
         None
+    }
+
+    /// The ESC that ended a string was followed by `byte`: `\` ends it for good, anything else starts the next
+    /// sequence, which reads `byte` as its first.
+    fn next_sequence(&mut self, byte: u8) {
+        if byte == b'\\' {
+            self.state = Scan::Ground;
+        } else {
+            self.state = Scan::Escape;
+            self.replay = true;
+        }
     }
 
     /// Whether the OSC kept so far may still be 9, 777 or 99.
@@ -244,7 +247,7 @@ impl Sniffer {
             return None;
         }
         let payload =
-            if encoded { String::from_utf8_lossy(&base64_decode(payload)?).into_owned() } else { payload.into() };
+            if encoded { String::from_utf8_lossy(&base64::decode(payload)?).into_owned() } else { payload.into() };
         let mut note = match self.kitty.take() {
             Some(note) if note.0 == id => note,
             _ => (id.to_string(), String::new(), String::new()),
@@ -292,10 +295,9 @@ fn osc_7501(rest: &str) -> Option<Sniffed> {
     if rest.starts_with('?') {
         return Some(Sniffed::StatusQuery);
     }
-    let mut status =
-        Status { state: State::Clear, kind: None, progress: None, title: None, message: None, id: None, app: None };
+    let mut status = Status { state: State::Clear, message: None, id: None, app: None };
     let mut state = None;
-    let decoded = |text: &str| base64_decode(text).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    let decoded = |text: &str| base64::decode(text).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
     for field in rest.split(':') {
         let Some((key, value)) = field.split_once('=') else { continue };
         match key {
@@ -311,11 +313,8 @@ fn osc_7501(rest: &str) -> Option<Sniffed> {
                     _ => None,
                 }
             }
-            "kind" => status.kind = Some(value.to_string()),
             "id" => status.id = Some(value.to_string()),
             "app" => status.app = Some(value.to_string()),
-            "progress" => status.progress = value.parse::<u32>().ok().map(|p| p.min(100) as u8),
-            "title" => status.title = decoded(value),
             "msg" => status.message = decoded(value),
             _ => {}
         }
@@ -346,35 +345,6 @@ fn osc_9(rest: &str) -> Option<Sniffed> {
     (!rest.is_empty()).then(|| Sniffed::Notify { title: None, body: rest.to_string() })
 }
 
-const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-pub(super) fn base64_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
-        for i in 0..4 {
-            out.push(if i <= chunk.len() { BASE64[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
-        }
-    }
-    out
-}
-
-/// Standard base64, padded or not; `None` when it is not.
-pub(super) fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    let (mut bits, mut count) = (0u32, 0);
-    for byte in text.trim_end_matches('=').bytes() {
-        let value = BASE64.iter().position(|&b| b == byte)? as u32;
-        bits = bits << 6 | value;
-        count += 6;
-        if count >= 8 {
-            count -= 8;
-            out.push((bits >> count) as u8);
-        }
-    }
-    Some(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,13 +365,9 @@ mod tests {
     }
 
     #[test]
-    fn queries_are_found() {
-        assert_eq!(
-            sniff(&[b"text\x1b[>q more \x1b[>0q\x1b[?996n\x1b[>1q\x1b[q"]),
-            [Sniffed::Version, Sniffed::Version, Sniffed::ColorScheme]
-        );
-        // Cut anywhere.
-        assert_eq!(sniff(&[b"\x1b", b"[", b">", b"0", b"q"]), [Sniffed::Version]);
+    fn what_the_library_answers_is_not_looked_for() {
+        // XTVERSION and the color scheme query: answered by libghostty-vt's callbacks.
+        assert_eq!(sniff(&[b"text\x1b[>q more \x1b[>0q\x1b[?996n\x1b[>1q\x1b[q"]), []);
     }
 
     #[test]
@@ -469,7 +435,7 @@ mod tests {
         assert_eq!(sniff(&[long.as_bytes()]), []);
         // Aborted by CAN, or by another sequence: nothing; the other sequence still counts.
         assert_eq!(sniff(&[b"\x1b[8;24;\x1880t"]), []);
-        assert_eq!(sniff(&[b"\x1b[8;24;\x1b[>q"]), [Sniffed::Version]);
+        assert_eq!(sniff(&[b"\x1b[8;24;\x1b[?2031h"]), [Sniffed::ThemeReports]);
         // A C0 control inside it does not end it.
         assert_eq!(sniff(&[b"\x1b[8;24;\n80t"]), [size(24, 80)]);
     }
@@ -503,26 +469,20 @@ mod tests {
     fn program_statuses() {
         assert_eq!(sniff(&[b"\x1b]7501;?\x1b\\", b"\x1b]7501;?\x07"]), [Sniffed::StatusQuery, Sniffed::StatusQuery]);
         assert_eq!(sniff(&[b"text\x1bc", b"\x1b[c"]), [Sniffed::Reset]);
-        let msg = base64_encode("approve Write: /tmp/note.txt".as_bytes());
+        let msg = base64::encode("approve Write: /tmp/note.txt".as_bytes());
+        // Its other keys (`kind`, `progress`, `title`) are not read.
         let blocked = format!("\x1b]7501;state=blocked:app=claude-code:kind=permission:msg={msg}\x07");
         let working = b"\x1b]7501;state=working:app=claude-code:id=7:progress=140:title=Q2xhdWRl\x1b\\";
-        let status =
-            |state| Status { state, kind: None, progress: None, title: None, message: None, id: None, app: None };
+        let status = |state| Status { state, message: None, id: None, app: None };
         let claude = |state| Status { app: Some("claude-code".into()), ..status(state) };
         assert_eq!(
             sniff(&[blocked.as_bytes(), working, b"\x1b]7501;state=sleeping\x07\x1b]7501;state=clear\x07"]),
             [
                 Sniffed::Status(Status {
-                    kind: Some("permission".into()),
                     message: Some("approve Write: /tmp/note.txt".into()),
                     ..claude(State::Blocked)
                 }),
-                Sniffed::Status(Status {
-                    progress: Some(100),
-                    title: Some("Claude".into()),
-                    id: Some("7".into()),
-                    ..claude(State::Working)
-                }),
+                Sniffed::Status(Status { id: Some("7".into()), ..claude(State::Working) }),
                 Sniffed::Status(status(State::Clear)),
             ]
         );
@@ -540,7 +500,7 @@ mod tests {
             ]
         );
         // A turn that failed, its failure told; then the next turn.
-        let failed = format!("\x1b]7501;state=error:app=claude-code:msg={}\x1b\\", base64_encode(b"API Error: 529"));
+        let failed = format!("\x1b]7501;state=error:app=claude-code:msg={}\x1b\\", base64::encode(b"API Error: 529"));
         assert_eq!(
             sniff(&[failed.as_bytes(), b"\x1b]7501;state=working:app=claude-code\x1b\\"]),
             [
@@ -550,6 +510,31 @@ mod tests {
         );
     }
 
+    /// The ESC that ends a string (an OSC, a DCS, an APC…) and is not followed by `\` starts the next sequence: a reset
+    /// right after it is found all the same, wherever the reads are cut.
+    #[test]
+    fn a_reset_right_after_a_string_is_found() {
+        let note = Sniffed::Notify { title: None, body: "x".into() };
+        let strings: [(&[u8], &[Sniffed]); 5] = [
+            (b"\x1b]9;x", &[note]),
+            (b"\x1b]52;c;AAAA", &[]),
+            (b"\x1b]7501;?", &[Sniffed::StatusQuery]),
+            (b"\x1bPq", &[]),
+            (b"\x1b_x", &[]),
+        ];
+        for (string, before) in strings {
+            let bytes = [string, b"\x1bc"].concat();
+            let expected: Vec<Sniffed> = before.iter().cloned().chain([Sniffed::Reset]).collect();
+            assert_eq!(sniff(&[&bytes]), expected, "{bytes:?}");
+            // Cut after the ESC that ends the string, and before it.
+            for cut in [string.len(), string.len() + 1] {
+                assert_eq!(sniff(&[&bytes[..cut], &bytes[cut..]]), expected, "{bytes:?} cut at {cut}");
+            }
+        }
+        // Not a reset: the string is ended by `ESC \`, and the `c` after it is text.
+        assert_eq!(sniff(&[b"\x1bPq\x1b\\c", b"\x1b]9;x\x1b\\c"]), [Sniffed::Notify { title: None, body: "x".into() }]);
+    }
+
     #[test]
     fn other_sequences_are_followed_not_kept() {
         let mut sniffer = Sniffer::default();
@@ -557,21 +542,11 @@ mod tests {
         assert_eq!(sniffer.scan(&big), (big.len(), None));
         assert!(sniffer.kept.capacity() < 64);
         // A string's content is not read as sequences (BEL does not end it); an ESC ends it, as in vte.
-        assert_eq!(sniff(&[b"\x1bP]9;no\x07\x1b\\\x1b]2;title\x07\x1b_x\x1b[>q"]), [Sniffed::Version]);
+        assert_eq!(sniff(&[b"\x1bP]9;no\x07\x1b\\\x1b]2;title\x07\x1b_x\x1b[?2031h"]), [Sniffed::ThemeReports]);
         // An OSC ended by another sequence.
         assert_eq!(
-            sniff(&[b"\x1b]9;hi\x1b[>q"]),
-            [Sniffed::Notify { title: None, body: "hi".into() }, Sniffed::Version]
+            sniff(&[b"\x1b]9;hi\x1b[?2031h"]),
+            [Sniffed::Notify { title: None, body: "hi".into() }, Sniffed::ThemeReports]
         );
-    }
-
-    #[test]
-    fn base64_both_ways() {
-        for text in ["", "f", "fo", "foo", "foob", "fooba", "foobar", "été ✓"] {
-            assert_eq!(base64_decode(&base64_encode(text.as_bytes())).unwrap(), text.as_bytes());
-        }
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_decode("not base64!"), None);
     }
 }

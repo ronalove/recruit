@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! The thin client (specs/multiplexeur-serveur.md §5): the real terminal set up (`input::Terminal`), its events sent
-//! to the team's server, what the server sends written back. All the logic is the server's.
+//! The thin client: the real terminal set up (`input::Terminal`), its events sent to the team's server, what the
+//! server sends written back. All the logic is the server's.
 //!
 //! Threads: this one reads the socket and writes on the terminal; the terminal's reader sends the events; one waits
 //! for signals: SIGTERM detaches, SIGTSTP gives the terminal back and stops, SIGCONT sets it up again. The terminal is
 //! given back as it was when the client leaves, panic included.
-//!
-//! Owner: dev-serveur.
 
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -20,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use super::engine::MouseTracking;
 use super::input::{Event, Terminal};
 use super::proto::{self, Bye, ClientMsg, Frame, Hello, Kind, Refusal, Reply, Request, ServerMsg, Welcome};
-use super::socket::{self, Found};
+use super::socket;
 use crate::t;
 
 /// The size taken when the terminal does not say its own.
@@ -29,19 +27,12 @@ const DEFAULT_SIZE: (u16, u16) = (80, 24);
 /// Reaches the server of the team whose state is in `state`, and checks it speaks our protocol. `Welcome` comes
 /// whatever the protocols: `recruit list` reads it.
 pub(crate) fn hello(state: &Path, kind: Kind) -> Result<Option<(UnixStream, Welcome)>> {
-    let Found::Running(mut stream) = socket::connect(state)? else { return Ok(None) };
+    let Some(mut stream) = socket::connect(state)? else { return Ok(None) };
     // A server stopped (`kill -STOP`) or stuck must not hold `recruit list`.
     stream.set_read_timeout(Some(WELCOME)).context("socket")?;
     proto::send(&mut stream, &Hello::new(kind)).context("socket")?;
     let welcome: Welcome = proto::recv(&mut stream)
-        .map_err(|error| match error.kind() {
-            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => anyhow::anyhow!(t!(
-                "le serveur de l'équipe ne répond pas ({})",
-                "the team's server does not answer ({})",
-                state.display()
-            )),
-            _ => anyhow::Error::new(error).context("socket"),
-        })?
+        .map_err(|error| read_error(error, state))?
         .context(t!("le serveur de l'équipe a fermé la connexion", "the team's server closed the connection"))?;
     // A server of another protocol refuses an attach and closes at once: on a socket closed by the other side, macOS
     // refuses socket options (EINVAL). Its welcome says why, which the caller tells: the error here would hide it.
@@ -58,6 +49,11 @@ pub(crate) const ANSWER: Duration = Duration::from_secs(5);
 /// Sends `request` to the server of the team whose state is in `state`, and reads its answer within `wait`. `None`
 /// when no server runs. A server of another protocol takes only `Stop`.
 pub(crate) fn request(state: &Path, request: &Request, wait: Duration) -> Result<Option<Reply>> {
+    Ok(exchange(state, request, wait)?.map(|(_, reply)| reply))
+}
+
+/// [`request`], with the server's welcome besides (its pid, its version).
+pub(crate) fn exchange(state: &Path, request: &Request, wait: Duration) -> Result<Option<(Welcome, Reply)>> {
     let Some((mut stream, welcome)) = hello(state, Kind::Command)? else { return Ok(None) };
     if welcome.proto != proto::PROTO && *request != Request::Stop {
         return Err(other_protocol(&welcome));
@@ -66,17 +62,22 @@ pub(crate) fn request(state: &Path, request: &Request, wait: Duration) -> Result
     // the answer's read for good.
     stream.set_read_timeout(Some(wait)).context("socket")?;
     proto::send(&mut stream, request).context("socket")?;
-    let reply = proto::recv::<Reply>(&mut stream).map_err(|error| match error.kind() {
+    let reply = proto::recv::<Reply>(&mut stream).map_err(|error| read_error(error, state))?;
+    let reply =
+        reply.context(t!("le serveur de l'équipe a fermé la connexion", "the team's server closed the connection"))?;
+    Ok(Some((welcome, reply)))
+}
+
+/// A read from the server that failed: a delay passed, or the socket's own error.
+fn read_error(error: io::Error, state: &Path) -> anyhow::Error {
+    match error.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => anyhow::anyhow!(t!(
             "le serveur de l'équipe ne répond pas ({})",
             "the team's server does not answer ({})",
             state.display()
         )),
         _ => anyhow::Error::new(error).context("socket"),
-    })?;
-    Ok(Some(
-        reply.context(t!("le serveur de l'équipe a fermé la connexion", "the team's server closed the connection"))?,
-    ))
+    }
 }
 
 /// What to say when the server's protocol is not ours.
@@ -99,7 +100,7 @@ pub(crate) fn attach(state: &Path) -> Result<()> {
         bail!(t!(
             "tu es déjà dans cette équipe : détache-toi d'abord ({}q)",
             "you are already inside this team: detach first ({}q)",
-            crate::look::ALT
+            crate::ui::look::ALT
         ));
     }
     let Some((mut stream, welcome)) = hello(state, Kind::Attach)? else {
@@ -180,7 +181,6 @@ pub(crate) fn attach(state: &Path) -> Result<()> {
             );
             Ok(())
         }
-        Ok(End::Bye(Bye::Error(error))) => bail!(error),
         Ok(End::Bye(Bye::Other)) | Ok(End::Closed) => Ok(()),
         Ok(End::Refused(Refusal::Proto)) => Err(other_protocol(&welcome)),
         Ok(End::Refused(Refusal::Busy)) => bail!(t!(

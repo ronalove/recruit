@@ -5,8 +5,6 @@
 //! The PTY's reader feeds the engine slice by slice, behind its mutex, and tells the loop once per frame at most;
 //! the loop holds the `Gate` while it asks the engines anything, so that a flood never keeps it waiting. A panic of
 //! an engine marks it broken: the loop gives the pane a new one, and gives the pane up after three in 10 s.
-//!
-//! Owner: dev-serveur.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -20,9 +18,10 @@ use anyhow::{Context, Result};
 use super::Msg;
 use crate::mux::engine::{self, Engine, State};
 use crate::mux::pty::{Pty, PtyInput, Spawn};
-use crate::mux::{Caps, Rect, caught};
+use crate::mux::{Caps, caught};
+use crate::ui::Rect;
 
-/// Lines of history kept by each pane (spec §5.5).
+/// Lines of history kept by each pane.
 pub(super) const HISTORY: usize = 100_000;
 
 /// What a reader feeds its engine at once: the screen waits for one slice at most.
@@ -33,11 +32,8 @@ const FAILURES: usize = 3;
 const FAILURES_WITHIN: Duration = Duration::from_secs(10);
 
 /// What the real terminal, or a multiplexer, puts in the environment to say what it is: a pane's program must not
-/// believe it runs there (spec §5.2). `TERM`, `COLORTERM` and `TERM_PROGRAM` are set again. And `RECRUIT_BACKEND`,
-/// which chose the multiplexer before 2.0: nothing reads it any more, and a value left in the user's environment goes
-/// no further than the server.
+/// believe it runs there. `TERM`, `COLORTERM` and `TERM_PROGRAM` are set again.
 const SCRUB: &[&str] = &[
-    "RECRUIT_BACKEND",
     "TMUX",
     "TMUX_PANE",
     "STY",
@@ -87,7 +83,7 @@ const SCRUB: &[&str] = &[
     "CLAUDE_PID",
 ];
 
-/// What the panes' programs are told of their terminal (spec §11, step 0's findings in specs/multiplexeur-prototype.md).
+/// What the panes' programs are told of their terminal.
 const TERM: &str = "xterm-256color";
 
 /// What a pane runs, and where.
@@ -173,14 +169,44 @@ impl Drop for Held<'_> {
     }
 }
 
+/// What a pane is for: a member's program, or one of recruit's own panels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Role {
+    Member,
+    Dashboard,
+    Journal,
+    Menu,
+}
+
+impl Role {
+    /// From a `PaneSpec`'s `role`: empty for a member.
+    pub(super) fn of(name: &str) -> Role {
+        match name {
+            "dashboard" => Role::Dashboard,
+            "journal" => Role::Journal,
+            "menu" => Role::Menu,
+            _ => Role::Member,
+        }
+    }
+
+    /// As `PaneSpec` and `PaneInfo` write it: empty for a member.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Role::Member => "",
+            Role::Dashboard => "dashboard",
+            Role::Journal => "journal",
+            Role::Menu => "menu",
+        }
+    }
+}
+
 /// A pane of the team.
 pub(super) struct Pane {
     /// `p1`, `p2`…: never given twice in the server's life.
     pub id: String,
     /// The member's name, or the panel's title.
     pub member: String,
-    /// A panel's kind (`dashboard`, `journal`); empty for a member.
-    pub role: String,
+    pub role: Role,
     pub command: Command,
     pub engine: Arc<Mutex<Box<dyn Engine>>>,
     /// Set by the reader when it says the engine has news, cleared just before a frame: one message per pane and per
@@ -229,24 +255,27 @@ pub(super) struct Wires {
 }
 
 impl Pane {
+    /// A member's pane, not a panel's.
+    pub(super) fn is_member(&self) -> bool {
+        self.role == Role::Member
+    }
+
     /// Starts `command` in a new pane `id`, `size` cells, its engine told the real terminal's colors.
     pub(super) fn open(
         id: String,
         member: String,
-        role: String,
+        role: Role,
         command: Command,
         size: (u16, u16),
         caps: &Caps,
         wires: &Wires,
     ) -> Result<Pane> {
-        let (cols, rows) = size;
         let engine = new_engine(size, caps)?;
         let engine = Arc::new(Mutex::new(engine));
         let (told, broken) = (Arc::new(AtomicBool::new(false)), Arc::new(Broken::default()));
         let read = Arc::new(AtomicU64::new(0));
         let pty = start(&id, &command, size, (&engine, &told, &broken, &read), wires)?;
         let input = pty.input();
-        let _ = (cols, rows);
         Ok(Pane {
             id,
             member,
@@ -451,10 +480,35 @@ mod tests {
         let command = Command { argv: vec!["/bin/sh".into()], cwd: "/".into(), env: Vec::new() };
         let spawn = spawn_of(&command, (80, 24)).unwrap();
         let removed = |name: &str| spawn.env_remove.iter().any(|removed| removed == name);
-        assert!(removed("RECRUIT_BACKEND"), "a value from before 2.0 goes no further");
         assert!(removed("TMUX") && removed("TMUX_PANE"));
         // What the members need to reach their team stays.
         assert!(!removed("RECRUIT_TMPDIR") && !removed("RECRUIT_STATE"));
         assert!(spawn_of(&Command::default(), (80, 24)).is_none());
+    }
+
+    #[test]
+    fn a_pane_whose_engine_breaks_three_times_in_ten_seconds_is_given_up() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wires = Wires { tx, gate: Arc::new(Gate::default()) };
+        let command = Command { argv: vec!["/bin/sleep".into(), "30".into()], cwd: "/".into(), env: Vec::new() };
+        let caps = Caps::default();
+        let mut pane = Pane::open("p1".into(), "dev".into(), Role::Member, command, (80, 24), &caps, &wires).unwrap();
+        let ended = |wait: Duration| loop {
+            match rx.recv_timeout(wait) {
+                Ok(Msg::Exited(..)) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        };
+        for _ in 0..2 {
+            pane.broken.mark("boom".into());
+            pane.repair(&caps).unwrap();
+            assert!(!pane.broken.is() && !pane.broken.dead.load(Ordering::Acquire));
+        }
+        assert!(!ended(Duration::from_millis(300)), "its program runs on");
+        pane.broken.mark("boom".into());
+        pane.repair(&caps).unwrap();
+        assert!(pane.broken.dead.load(Ordering::Acquire), "given up");
+        assert!(ended(Duration::from_secs(5)), "its program is stopped");
     }
 }

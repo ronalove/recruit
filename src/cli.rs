@@ -8,7 +8,7 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::i18n::{self, Lang};
 use crate::t;
-use crate::{board, bridge, launch};
+use crate::{board, claude::bridge, team::launch};
 
 /// Launch a team of Claude Code agents, or create one.
 #[derive(Parser, Debug)]
@@ -123,7 +123,7 @@ pub enum Command {
         /// The field of its sheet to focus: name, model or effort
         #[arg(long, requires = "member")]
         field: Option<String>,
-        /// Only the list of the field's values, under a pane's header: a model or an effort (lot of 2026-10-11)
+        /// Only the list of the field's values, under a pane's header: a model or an effort
         #[arg(long, requires = "field")]
         list: bool,
     },
@@ -306,29 +306,6 @@ fn french(command: clap::Command) -> clap::Command {
                 .mut_arg("local", |a| a.help("Ouvrir plutôt le fichier personnel .recruit/settings.local.toml"))
         })
         .mut_subcommand("templates", |c| c.about("Lister les types de projet et les tailles intégrés"))
-        .mut_subcommand("_edit", |c| {
-            c.about("Interne : modifie une équipe lancée comme son menu, sans le menu : pour les scripts et les tests")
-                .mut_arg("state", |a| a.help("Le dossier de l'équipe, sous ~/.cache/recruit/teams/"))
-                .mut_arg("edits", |a| a.help("Les modifications, en liste JSON (voir l'aide en anglais)"))
-                .mut_arg("restart", |a| a.help("Puis relancer ce membre, sur sa conversation").value_name("MEMBRE"))
-                .mut_arg("fresh", |a| a.help("Avec --restart : sur une nouvelle conversation"))
-                .mut_arg("restart_all", |a| a.help("Puis relancer tous les membres sur une nouvelle conversation"))
-                .mut_arg("dismiss", |a| {
-                    a.help("Fermer le panneau d'un membre lancé que les fichiers de l'équipe n'ont plus").value_name("MEMBRE")
-                })
-        })
-        .mut_subcommand("_menu", |c| {
-            c.about(format!(
-                "Interne : le menu d'une équipe lancée, en calque sur l'équipe, ouvert par /recruit, {}r ou le bouton de la barre",
-                crate::look::ALT
-            ))
-                .mut_arg("state", |a| a.help("Le dossier de l'équipe, sous ~/.cache/recruit/teams/"))
-                .mut_arg("client", |a| a.help("Le client où s'affiche le menu, pour le détacher"))
-                .mut_arg("nerd", |a| a.help("Le terminal du client embarque les symboles Nerd Font"))
-                .mut_arg("light", |a| a.help("Le terminal du client a un fond clair : la palette claire"))
-                .mut_arg("member", |a| a.help("Ouvrir sur la fiche de ce membre").value_name("MEMBRE"))
-                .mut_arg("field", |a| a.help("Le champ de sa fiche à mettre en avant : name, model ou effort").value_name("CHAMP"))
-        })
 }
 
 /// What clap writes itself, in French: the help and version flags, the help command, the possible values and the

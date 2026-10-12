@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
 //! The test's own terminal: a PTY whose master the test holds, a program on its slave (the multiplexer, a fake, a
-//! tmux client), and an alacritty `Term` that reads what the program writes, answers its queries as a terminal
+//! terminal client), and an alacritty `Term` that reads what the program writes, answers its queries as a terminal
 //! would (DA1, DSR and CPR, `CSI ? u`, OSC 10 and 11) and gives the screen back as text. A reader thread feeds it,
 //! so the program is never held back by the test; it notes when a text it is told to watch for shows up.
-//!
-//! Owner: testeur.
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -361,7 +359,7 @@ impl TestTerm {
         (point.column.0, point.line.0 as usize, shown, shape)
     }
 
-    /// The whole screen with its styles, as JSON for `tests/gallery.py`: `rows` of cells `[text, fg, bg, flags]`, a
+    /// The whole screen with its styles, as JSON for `tests/tools/gallery.py`: `rows` of cells `[text, fg, bg, flags]`, a
     /// color written `rgb:r,g,b`, `idx:n` or `named:Name`, the flags a string of `b`old, `d`im, `i`talic, `u`nderline,
     /// `r`everse, `s`trike.
     pub fn styled(&self) -> String {

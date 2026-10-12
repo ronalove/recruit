@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! The menu as a list only (`recruit _menu … --member m --field model|effort --list`, direction A of the mockups of
-//! 2026-10-11): the values of one field under its pane's header, in a frame of the text's color; « default: … » first,
-//! « current » on the value in place, ↻ on a value that starts the member again, a question under the values when the
-//! member is at work, a text typed in place for another model. The pane is exactly its size, which the menu tells the
-//! server (`CSI 8 ; rows ; columns t`) whenever it changes.
+//! The menu as a list only (`recruit _menu … --member m --field model|effort --list`): the values of one field under
+//! its pane's header, in a frame of the text's color; « default: … » first, « current » on the value in place, ↻ on a
+//! value that starts the member again, a question under the values when the member is at work, a text typed in place
+//! for another model. The pane is exactly its size, which the menu tells the server (`CSI 8 ; rows ; columns t`)
+//! whenever it changes.
 
 use super::draw::{Drawn, Look, Zone, button, input, muted, put_effort_text, selected, wrap};
 use super::sheet::{Confirm, Dropdown, Overlay, Said, Sheet, Target, Typing};
-use crate::canvas::{Canvas, Style, columns, fit};
 use crate::t;
+use crate::ui::canvas::{Canvas, Style, columns, fit};
 use crossterm::style::Color;
 
 /// The narrowest inside of the frame, and the one with a question or a refusal in it.
@@ -92,11 +92,16 @@ fn question(confirm: &Confirm, inside: usize, look: &Look) -> Vec<(String, Style
 
 /// A path or any word too long for a row, cut from its start (« …/settings.toml »): its end is what tells.
 fn shorten(word: &str, room: usize) -> String {
-    let chars: Vec<char> = word.chars().collect();
-    if chars.len() <= room || room < 2 {
+    if columns(word) <= room || room < 2 {
         return word.to_string();
     }
-    format!("…{}", chars[chars.len() - (room - 1)..].iter().collect::<String>())
+    // As many of its last characters as `room - 1` columns hold.
+    let mut used = 0;
+    let kept = word.chars().rev().take_while(|c| {
+        used += columns(c.encode_utf8(&mut [0; 4]));
+        used < room
+    });
+    format!("…{}", kept.collect::<Vec<char>>().into_iter().rev().collect::<String>())
 }
 
 /// A write refused, as the last rows of the frame (three at most): a long word cut from its start, a long text from
@@ -286,7 +291,7 @@ mod tests {
     use super::super::sheet::fixture::{Fake, team};
     use super::super::sheet::{Effect, Fid, Key};
     use super::*;
-    use crate::look::{Glyphs, State};
+    use crate::ui::look::{Glyphs, State};
 
     fn look() -> Look {
         Look { glyphs: Glyphs::Unicode, frame: 0, now: 1000, option: true }
@@ -316,12 +321,12 @@ mod tests {
                 && rows[1].contains(&t!(
                     "défaut : {} (Claude Code)",
                     "default: {} (Claude Code)",
-                    crate::look::effort_label("high")
+                    crate::ui::look::effort_label("high")
                 ))
         );
         assert!(rows[1].contains(&t!("actuel", "current")), "the value in place: {}", rows[1]);
         for (row, level) in rows[2..].iter().zip(["low", "medium", "high", "xhigh", "max"]) {
-            assert!(row.contains(&crate::look::effort_label(level)), "{row}");
+            assert!(row.contains(&crate::ui::look::effort_label(level)), "{row}");
         }
         // Nothing else: no help, no title.
         assert_eq!(rows.len(), 2 + 6);
@@ -338,8 +343,8 @@ mod tests {
         // « ● high »: the sign and the word in the same color.
         let line = (0..rows).find(|y| drawn.canvas.row(*y).contains('●')).unwrap();
         let sign = drawn.canvas.row(line).chars().position(|c| c == '●').unwrap();
-        assert_eq!(drawn.canvas.style(sign, line).fg, crate::look::effort_color("high"));
-        assert_eq!(drawn.canvas.style(sign + 2, line).fg, crate::look::effort_color("high"));
+        assert_eq!(drawn.canvas.style(sign, line).fg, crate::ui::look::effort_color("high"));
+        assert_eq!(drawn.canvas.style(sign + 2, line).fg, crate::ui::look::effort_color("high"));
     }
 
     #[test]
@@ -387,7 +392,7 @@ mod tests {
         assert!(s.key(Key::Enter, &env).is_empty());
         let rows = text(&s, false);
         // The values still there, the question under them, the answers with their keys.
-        assert!(rows.iter().any(|r| r.contains(&crate::look::effort_name("high"))), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains(&crate::ui::look::effort_name("high"))), "{rows:#?}");
         assert!(rows.iter().any(|r| r.contains(&t!("Relancer « dev » ?", "Restart \"dev\"?"))), "{rows:#?}");
         // One note, not the menu's two.
         let note = t!("Il est au travail", "It is at work");
@@ -513,9 +518,9 @@ mod tests {
     fn the_cursor_line_in_the_light_palette() {
         let s = opened(Fid::Effort, &Fake::quiet());
         let (rows, cols) = size(&s, &look(), false).unwrap();
-        crate::look::set_light(true);
+        crate::ui::look::set_light(true);
         let drawn = draw(&s, &look(), false, cols, rows);
-        crate::look::set_light(false);
+        crate::ui::look::set_light(false);
         assert_eq!(drawn.canvas.style(3, 1).bg, Some(Color::AnsiValue(253)));
     }
 
@@ -531,9 +536,19 @@ mod tests {
             for x in 1..cols - 1 {
                 assert_eq!(drawn.canvas.style(x, y).bg, Some(selected()), "column {x}: {}", drawn.canvas.row(y));
             }
-            assert!(drawn.canvas.row(y).contains(&crate::look::effort_name("low")));
+            assert!(drawn.canvas.row(y).contains(&crate::ui::look::effort_name("low")));
         }
         // The line above it, not.
         assert!((1..cols - 1).all(|x| drawn.canvas.style(x, 1).bg.is_none()));
+    }
+
+    /// A word cut from its start keeps the columns it can hold: wide characters count two.
+    #[test]
+    fn a_long_word_cut_by_columns() {
+        assert_eq!(shorten("/chemin/settings.toml", 15), "…/settings.toml");
+        assert_eq!(shorten("short", 14), "short");
+        // Seven columns: the ellipsis and three wide characters.
+        assert_eq!(shorten("設定ファイルです", 7), "…ルです");
+        assert_eq!(columns(&shorten("設定ファイルです", 7)), 7);
     }
 }

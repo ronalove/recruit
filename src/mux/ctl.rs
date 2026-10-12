@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
 //! `recruit _ctl <state> …` (hidden): a team's server observed and driven without a terminal, for the test bench,
-//! the captures and the step-by-step checks (specs/multiplexeur-serveur.md §3.5). What `tmux capture-pane`,
-//! `send-keys` and `run-shell` did.
+//! the captures and the step-by-step checks.
 //!
 //! Exit codes: 0 done; 2 the team is not running; 3 no such pane; 1 anything else, its message on stderr. `--json`
 //! output is never translated.
-//!
-//! Owner: dev-serveur.
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +12,7 @@ use anyhow::{Context, Result, bail};
 
 use super::client;
 use super::input::{Event, Key, KeyCode, Mods};
-use super::proto::{self, Captured, ClientInfo, Kind, PaneInfo, Reply, ReplyError, Request, Stats};
+use super::proto::{Captured, ClientInfo, Kind, PaneInfo, Reply, Request, Stats};
 use super::socket;
 use crate::t;
 
@@ -142,14 +139,14 @@ fn act(state: &Path, action: Action) -> Result<(), Failure> {
             };
             let cwd = cwd.canonicalize().with_context(|| cwd.display().to_string())?;
             let request = Request::Spawn { member, argv: command, env, cwd: cwd.to_string_lossy().into_owned(), tab };
-            let id: String = value(request_to(state, request)?)?;
+            let id: String = request_to(state, request)?.value()?;
             println!("{id}");
         }
         Action::Capture { pane, history, json } => {
             if let Some(pane) = &pane {
                 known(state, pane)?;
             }
-            let captured: Captured = value(request_to(state, Request::Capture { pane, styles: false, history })?)?;
+            let captured: Captured = request_to(state, Request::Capture { pane, history })?.value()?;
             if json {
                 println!("{}", serde_json::to_string(&captured).context("json")?);
             } else {
@@ -161,17 +158,17 @@ fn act(state: &Path, action: Action) -> Result<(), Failure> {
         Action::Send { pane, bytes } => {
             known(state, &pane)?;
             let bytes = unescape(&bytes)?;
-            value::<()>(request_to(state, Request::Send { pane, bytes })?)?;
+            request_to(state, Request::Send { pane, bytes })?.value::<()>()?;
         }
         Action::Key { pane, key } => {
             if let Some(pane) = &pane {
                 known(state, pane)?;
             }
             let event = Event::Key(parse_key(&key)?);
-            value::<()>(request_to(state, Request::Key { pane, event })?)?;
+            request_to(state, Request::Key { pane, event })?.value::<()>()?;
         }
         Action::Stats { json } => {
-            let stats: Stats = value(request_to(state, Request::Stats)?)?;
+            let stats: Stats = request_to(state, Request::Stats)?.value()?;
             if json {
                 println!("{}", serde_json::to_string(&stats).context("json")?);
             } else {
@@ -185,7 +182,7 @@ fn act(state: &Path, action: Action) -> Result<(), Failure> {
             }
         }
         Action::Panes { json } => {
-            let panes: Vec<PaneInfo> = value(request_to(state, Request::Panes)?)?;
+            let panes: Vec<PaneInfo> = request_to(state, Request::Panes)?.value()?;
             if json {
                 println!("{}", serde_json::to_string(&panes).context("json")?);
             } else {
@@ -195,15 +192,10 @@ fn act(state: &Path, action: Action) -> Result<(), Failure> {
             }
         }
         Action::Clients { json } => {
-            let Some((mut stream, welcome)) = client::hello(state, Kind::Command)? else {
+            let Some((welcome, reply)) = client::exchange(state, &Request::Clients, client::ANSWER)? else {
                 return Err(Failure::NotRunning);
             };
-            if welcome.proto != proto::PROTO {
-                return Err(client::other_protocol(&welcome).into());
-            }
-            proto::send(&mut stream, &Request::Clients).context("socket")?;
-            let reply: Reply = proto::recv(&mut stream).context("socket")?.context("socket")?;
-            let clients: Vec<ClientInfo> = value(reply)?;
+            let clients: Vec<ClientInfo> = reply.value()?;
             if json {
                 let out = serde_json::json!({ "pid": welcome.pid, "clients": clients });
                 println!("{out}");
@@ -216,10 +208,10 @@ fn act(state: &Path, action: Action) -> Result<(), Failure> {
         }
         Action::Kill { pane } => {
             known(state, &pane)?;
-            value::<()>(request_to(state, Request::KillPane { id: pane })?)?;
+            request_to(state, Request::KillPane { id: pane })?.value::<()>()?;
         }
         Action::Stop => {
-            value::<()>(request_to(state, Request::Stop)?)?;
+            request_to(state, Request::Stop)?.value::<()>()?;
         }
         Action::Attach => client::attach(state)?,
     }
@@ -235,20 +227,9 @@ fn request_to(state: &Path, request: Request) -> Result<Reply, Failure> {
 /// How long `stop` waits: the panes have a few seconds to end.
 const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// An answer's value, or what went wrong.
-fn value<T: serde::de::DeserializeOwned>(reply: Reply) -> Result<T, Failure> {
-    reply.value().map_err(|error| {
-        Failure::Other(match error {
-            ReplyError::Failed(message) => anyhow::anyhow!(message),
-            ReplyError::Refused(refusal) => anyhow::anyhow!("refused: {refusal:?}"),
-            ReplyError::Invalid(why) => anyhow::anyhow!("answer: {why}"),
-        })
-    })
-}
-
 /// Fails with `NoPane` unless the team has `pane`, by its id or its member's name.
 fn known(state: &Path, pane: &str) -> Result<(), Failure> {
-    let panes: Vec<PaneInfo> = value(request_to(state, Request::Panes)?)?;
+    let panes: Vec<PaneInfo> = request_to(state, Request::Panes)?.value()?;
     // By its id, its member, or the role of a pane that is no member's (menu, dashboard, journal), as `find` does.
     let found = panes.iter().any(|p| p.id == pane || p.member == pane || (!p.role.is_empty() && p.role == pane));
     if found { Ok(()) } else { Err(Failure::NoPane(pane.to_string())) }

@@ -73,7 +73,7 @@ A team created with `--member` alone gets recruit's shared rules as its instruct
 recruit list [--json]
 ```
 
-Lists the project's teams and your global teams, each with its number of members and its state: stopped, running, running and attached, trial running (`--dry-run`), or running under recruit 1 (tmux), for a team that recruit 1 left running (see [the FAQ](/recruit/faq/#a-team-still-runs-under-recruit-1)). A `*` marks the project's `default` team. Running teams that belong to none of them come last.
+Lists the project's teams and your global teams, each with its number of members and its state: stopped, running, running and attached, or trial running (`--dry-run`). A `*` marks the project's `default` team. Running teams that belong to none of them come last.
 
 ```
 Teams of this project (~/code/my-app/.recruit)
@@ -83,7 +83,7 @@ Global teams (~/.config/recruit)
     tools    2 members  stopped
 ```
 
-`--json` prints one object per team: `name`, `scope` (`local` or `global`), `file`, `members`, `running`, `attached`, `dir`, the folder it runs in, and `tmux`, true for a team still running under recruit 1.
+`--json` prints one object per team: `name`, `scope` (`local` or `global`), `file`, `members`, `running`, `attached`, and `dir`, the folder it runs in.
 
 ## `recruit attach`
 

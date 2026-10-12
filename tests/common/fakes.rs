@@ -31,8 +31,6 @@
 //!   `sessionId`, `cwd`, `name`, `status`…, unless `fake/no-session-file` is there), and its command line
 //!   (`fake/argv.log`, `<name>\t<arguments>`); shows
 //!   `FAKE CLAUDE <name> <session>` and `❯`; then reads lines: `Q` ends it (0), `X` crashes it (1).
-//!
-//! Owner: testeur.
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};

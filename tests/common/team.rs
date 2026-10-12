@@ -6,8 +6,6 @@
 //! recruit approves the team's folder there, never in the user's `~/.claude.json`), `XDG_*` and `RECRUIT_TMPDIR`
 //! in temporary folders. Stopped by `recruit stop` when dropped, and checked to leave no process behind, and the
 //! user's `~/.claude.json` and `~/.claude/settings.json` untouched.
-//!
-//! Owner: testeur.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};

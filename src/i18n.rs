@@ -66,14 +66,27 @@ pub fn count(n: usize, fr: &str, en: &str) -> String {
     if n == 1 { format!("1 {word}") } else { format!("{n} {word}s") }
 }
 
-/// Picks the French or English text for the current language: `t!("Bonjour {name}", "Hello {name}")`.
+/// « a », « b » `last` « c »: the names quoted as `lang` quotes, the last two joined by `last` (« et », « ou »).
+pub fn joined(lang: Lang, names: &[impl AsRef<str>], last: &str) -> String {
+    let quoted: Vec<String> = names.iter().map(|n| crate::t!(in lang; "« {} »", "\"{}\"", n.as_ref())).collect();
+    match quoted.split_last() {
+        Some((end, rest)) if !rest.is_empty() => format!("{} {last} {end}", rest.join(", ")),
+        _ => quoted.concat(),
+    }
+}
+
+/// Picks the French or English text for the current language: `t!("Bonjour {name}", "Hello {name}")`; for a given
+/// one, `t!(in lang; "Bonjour {name}", "Hello {name}")`.
 #[macro_export]
 macro_rules! t {
-    ($fr:literal, $en:literal $(, $arg:expr)* $(,)?) => {
-        match $crate::i18n::lang() {
+    (in $lang:expr; $fr:literal, $en:literal $(, $arg:expr)* $(,)?) => {
+        match $lang {
             $crate::i18n::Lang::Fr => format!($fr $(, $arg)*),
             $crate::i18n::Lang::En => format!($en $(, $arg)*),
         }
+    };
+    ($fr:literal, $en:literal $(, $arg:expr)* $(,)?) => {
+        $crate::t!(in $crate::i18n::lang(); $fr, $en $(, $arg)*)
     };
 }
 
@@ -90,5 +103,17 @@ mod tests {
         assert_eq!(from_locale("C"), None);
         assert_eq!(from_locale("C.UTF-8"), None);
         assert_eq!(from_locale(""), None);
+    }
+
+    #[test]
+    fn names_joined() {
+        let none: [&str; 0] = [];
+        assert_eq!(joined(Lang::Fr, &none, "et"), "");
+        assert_eq!(joined(Lang::Fr, &["a"], "et"), "« a »");
+        assert_eq!(joined(Lang::Fr, &["a", "b"], "ou"), "« a » ou « b »");
+        assert_eq!(joined(Lang::Fr, &["a", "b", "c"], "et"), "« a », « b » et « c »");
+        assert_eq!(joined(Lang::En, &["a", "b", "c"], "and"), "\"a\", \"b\" and \"c\"");
+        assert_eq!(t!(in Lang::En; "x {}", "y {}", 1), "y 1");
+        assert_eq!(t!(in Lang::Fr; "x {}", "y {}", 1), "x 1");
     }
 }

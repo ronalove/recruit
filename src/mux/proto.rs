@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Ronan Lamour
-//! What a team's server and the processes that reach it say to each other (specs/multiplexeur-serveur.md §3).
+//! What a team's server and the processes that reach it say to each other.
 //!
 //! Frames: a length on 4 bytes (big-endian, counting the type byte and the payload), a type byte, the payload. Type
 //! 0 is a JSON message, both ways; type 1 is bytes for the real terminal (a frame of the screen, a relay), from the
@@ -11,8 +11,6 @@
 //! with `#[serde(default)]`, a catch-all variant where a newer recruit may send one we do not know. The rest of the
 //! protocol may change with [`PROTO`]; a test compares its JSON with a reference, so that a change cannot go
 //! unnoticed.
-//!
-//! Owner: dev-serveur.
 
 use std::io::{self, Read, Write};
 
@@ -191,20 +189,13 @@ pub(crate) enum Reply {
 
 impl Reply {
     /// The value of an `Ok`, read as `T`; an error for the others, with what to tell the user.
-    pub(crate) fn value<T: DeserializeOwned>(self) -> Result<T, ReplyError> {
+    pub(crate) fn value<T: DeserializeOwned>(self) -> anyhow::Result<T> {
         match self {
-            Reply::Ok(value) => serde_json::from_value(value).map_err(|e| ReplyError::Invalid(e.to_string())),
-            Reply::Err(message) => Err(ReplyError::Failed(message)),
-            Reply::Refused(refusal) => Err(ReplyError::Refused(refusal)),
+            Reply::Ok(value) => serde_json::from_value(value).map_err(|e| anyhow::anyhow!("answer: {e}")),
+            Reply::Err(message) => Err(anyhow::anyhow!(message)),
+            Reply::Refused(refusal) => Err(anyhow::anyhow!("refused: {refusal:?}")),
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ReplyError {
-    Failed(String),
-    Refused(Refusal),
-    Invalid(String),
 }
 
 /// What a command connection asks. `Stop` is frozen; the others follow [`PROTO`].
@@ -271,17 +262,14 @@ pub(crate) enum Request {
     RestoreDashboard {
         dashboard: PaneSpec,
     },
-    /// The journal to its next size (full, reduced, hidden): its new one, `full`, `reduced` or `hidden`. `journal`
-    /// opens it again once hidden.
+    /// The journal to its next size (full, reduced, hidden): its new one, a [`JournalSize`]. `journal` opens it again
+    /// once hidden.
     ToggleJournal {
         journal: PaneSpec,
     },
-    /// Gives the focus to a member's pane, in its tab: `bool`, false when it has none.
-    Focus {
-        member: String,
-    },
     /// Opens the team's menu: on the client that shows `member`, or on `client`. With `field`, on `member`'s sheet,
-    /// on that field (written only when there is one: the form of step 2 stays). `MenuOpened`.
+    /// on that field (written only when there is one, so that a request without one keeps its older form).
+    /// `MenuOpened`.
     OpenMenu {
         #[serde(default)]
         member: Option<String>,
@@ -295,20 +283,17 @@ pub(crate) enum Request {
     },
     /// The clients attached: `Vec<ClientInfo>`.
     Clients,
-    /// For tests and captures: a pane's text, or the whole screen as composed when `pane` is `None`; with its
-    /// styles as escape sequences when `styles`. A `String`.
+    /// For tests and captures: a pane's text, or the whole screen as composed when `pane` is `None`: `Captured`.
     Capture {
         #[serde(default)]
         pane: Option<String>,
-        #[serde(default)]
-        styles: bool,
         /// Lines of a pane's history above its screen, at most.
         #[serde(default)]
         history: usize,
     },
     /// For the bench: what each pane read, what the server sent. `Stats`.
     Stats,
-    /// For tests: bytes written as they are to a pane's program, as `tmux send-keys` does.
+    /// For tests: bytes written as they are to a pane's program.
     Send {
         pane: String,
         bytes: Vec<u8>,
@@ -371,9 +356,9 @@ pub(crate) struct PaneInfo {
     pub pid: u32,
     pub cols: u16,
     pub rows: u16,
-    /// What its program last said of its state (OSC 7501), by its [`crate::look::State::name`]: `working`, `waiting` or
-    /// `idle`; none while it says nothing, or no longer. For the dashboard, which then asks `claude agents` less often
-    /// (2.0.1). An optional field: older peers skip it, and get none from older servers.
+    /// What its program last said of its state (OSC 7501), by its [`crate::ui::look::State::name`]: `working`,
+    /// `waiting` or `idle`; none while it says nothing, or no longer. For the dashboard, which then asks `claude
+    /// agents` less often. An optional field: older peers skip it, and get none from older servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     /// Since when it is in that state, in seconds since the epoch.
@@ -489,13 +474,11 @@ pub(crate) enum Bye {
     Stopped,
     /// The team's last pane ended.
     Ended,
-    Error(String),
     #[serde(other)]
     Other,
 }
 
-/// The variables that follow the client, for the programs started from then on (spec §1.2, as tmux's
-/// `update-environment`).
+/// The variables that follow the client, for the programs started from then on (as tmux's `update-environment`).
 pub(crate) const UPDATE_ENV: &[&str] = &[
     "SSH_AUTH_SOCK",
     "SSH_AGENT_PID",
@@ -546,6 +529,17 @@ impl MenuField {
             MenuField::Other => None,
         }
     }
+}
+
+/// The journal's sizes, which `Alt+j` goes through in turn: the answer to [`Request::ToggleJournal`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum JournalSize {
+    /// Half of the panels' column.
+    Full,
+    /// Its last messages only, the rest of the column to the dashboard. The journal opens so.
+    Reduced,
+    Hidden,
 }
 
 /// The answer to [`Request::OpenMenu`].
@@ -658,12 +652,11 @@ mod tests {
             Request::KillPane { id: "p1".into() },
             Request::SetMember { id: "p1".into(), member: "dev".into() },
             Request::ClosePanels,
-            Request::Focus { member: "dev".into() },
             Request::OpenMenu { member: Some("dev".into()), client: None, field: None },
             Request::OpenMenu { member: Some("dev".into()), client: None, field: Some(MenuField::Effort) },
             Request::Detach { client: "c1".into() },
             Request::Clients,
-            Request::Capture { pane: None, styles: true, history: 0 },
+            Request::Capture { pane: None, history: 0 },
             Request::Send { pane: "p2".into(), bytes: b"a\r".to_vec() },
             // « Focus » (2.1.0): optional, absent for the grid; an older client's request reads with the grid.
             Request::Arrange { tabs: vec![("1".into(), vec!["dev".into()])], columns: 3, focus: false },
@@ -688,12 +681,11 @@ mod tests {
                 r#"{"kill_pane":{"id":"p1"}}"#,
                 r#"{"set_member":{"id":"p1","member":"dev"}}"#,
                 r#""close_panels""#,
-                r#"{"focus":{"member":"dev"}}"#,
                 r#"{"open_menu":{"member":"dev","client":null}}"#,
                 r#"{"open_menu":{"member":"dev","client":null,"field":"effort"}}"#,
                 r#"{"detach":{"client":"c1"}}"#,
                 r#""clients""#,
-                r#"{"capture":{"pane":null,"styles":true,"history":0}}"#,
+                r#"{"capture":{"pane":null,"history":0}}"#,
                 r#"{"send":{"pane":"p2","bytes":[97,13]}}"#,
                 r#"{"arrange":{"tabs":[["1",["dev"]]],"columns":3}}"#,
                 r#"{"arrange":{"tabs":[["1",["dev"]]],"columns":3,"focus":true}}"#,
@@ -709,6 +701,10 @@ mod tests {
             ClientInfo { id: "c1".into(), term: "xterm-ghostty".into(), name: None, cols: 80, rows: 24, since: 0 };
         assert_eq!(json(&client), r#"{"id":"c1","term":"xterm-ghostty","name":null,"cols":80,"rows":24,"since":0}"#);
         assert_eq!(json(&MenuOpened::NoClient), r#""no_client""#);
+        assert_eq!(
+            json(&[JournalSize::Full, JournalSize::Reduced, JournalSize::Hidden]),
+            r#"["full","reduced","hidden"]"#
+        );
         // Its program's state (2.0.1): optional, absent while none; a 2.0.0 server's pane reads with none.
         let pane = PaneInfo {
             id: "p1".into(),
@@ -740,9 +736,10 @@ mod tests {
 
     #[test]
     fn a_reply_gives_its_value() {
-        assert_eq!(Reply::Ok(serde_json::json!(true)).value::<bool>(), Ok(true));
-        assert_eq!(Reply::Err("non".into()).value::<bool>(), Err(ReplyError::Failed("non".into())));
-        assert_eq!(Reply::Refused(Refusal::Proto).value::<()>(), Err(ReplyError::Refused(Refusal::Proto)));
-        assert!(matches!(Reply::Ok(serde_json::json!("x")).value::<bool>(), Err(ReplyError::Invalid(_))));
+        let said = |reply: Reply| reply.value::<bool>().unwrap_err().to_string();
+        assert!(Reply::Ok(serde_json::json!(true)).value::<bool>().unwrap());
+        assert_eq!(said(Reply::Err("non".into())), "non");
+        assert_eq!(said(Reply::Refused(Refusal::Proto)), "refused: Proto");
+        assert!(said(Reply::Ok(serde_json::json!("x"))).starts_with("answer: "));
     }
 }
